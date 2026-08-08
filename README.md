@@ -120,3 +120,21 @@ The routes, templates, login, timer, scoring and exam logic are the same in both
 ## Important
 
 V2 is dual-deploy, not yet a seamless offline-to-cloud synchronization engine. If Internet disappears during an online exam, the online server becomes unreachable unless the college switches students to a separately running LAN server. Automatic merging/synchronization between offline SQLite and online PostgreSQL should be implemented as a later version because it requires conflict-resolution and exam-integrity rules.
+
+## Bulk student import
+
+Faculty can create hundreds of student logins from **CSV** or **Excel (.xlsx)** on the Students page.
+
+Required columns:
+
+```text
+roll_no,name,password
+```
+
+- Downloadable CSV and Excel templates are available inside the admin Students page.
+- Existing roll numbers are skipped instead of overwritten.
+- Blank/incomplete rows are skipped and reported after import.
+- Passwords are hashed before being stored.
+
+Sample files are included as `sample_students.csv` and `sample_students.xlsx`.
+

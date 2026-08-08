@@ -21,5 +21,9 @@
 {% with msgs=get_flashed_messages(with_categories=true) %}{% for category,m in msgs %}<div class="flash {{ 'error' if category=='error' else '' }}">{{ m }}</div>{% endfor %}{% endwith %}
 {% block content %}{% endblock %}
 {% if not login_page %}</div>{% endif %}</main>
-<footer class="site-footer"><div class="container footer-grid"><span><span class="footer-brand">Learn with Hemant</span> · Practical learning tools</span>
+<footer class="site-footer">
+  <div class="container footer-grid">
+    <span><span class="footer-brand">Learn with Hemant</span> · Practical learning tools</span>
+  </div>
+</footer>
 </body></html>

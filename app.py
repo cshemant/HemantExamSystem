@@ -4,13 +4,15 @@ from datetime import datetime, timedelta
 from functools import wraps
 from urllib.parse import urlparse
 
-from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort
+from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, UniqueConstraint, select, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, scoped_session, sessionmaker, joinedload
 from sqlalchemy.exc import IntegrityError
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font
 
 BASE_DIR=Path(__file__).resolve().parent
 load_dotenv(BASE_DIR/'.env')
@@ -180,6 +182,150 @@ def students():
             try:s.add(Student(roll_no=roll,name=name,password_hash=generate_password_hash(pw),created_at=now_iso()));s.commit();flash('Student added.')
             except IntegrityError:s.rollback();flash('Roll number already exists.','error')
     rows=s.scalars(select(Student).order_by(Student.roll_no)).all();return render_template('students.html',students=rows)
+
+
+def _student_cell_text(value):
+    if value is None:
+        return ''
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _canonical_student_header(value):
+    key=_student_cell_text(value).lower().replace('-', '_').replace(' ', '_')
+    while '__' in key:
+        key=key.replace('__','_')
+    aliases={
+        'roll':'roll_no','rollno':'roll_no','roll_number':'roll_no','student_id':'roll_no',
+        'registration_no':'roll_no','registration_number':'roll_no','enrollment_no':'roll_no','enrollment_number':'roll_no',
+        'student_name':'name','full_name':'name','candidate_name':'name',
+        'pass':'password','login_password':'password','student_password':'password'
+    }
+    return aliases.get(key,key)
+
+
+def _student_rows_from_upload(upload):
+    filename=(upload.filename or '').lower()
+    raw=upload.read()
+    if not raw:
+        raise ValueError('The uploaded file is empty.')
+
+    if filename.endswith('.csv'):
+        try:
+            text=raw.decode('utf-8-sig')
+        except UnicodeDecodeError as exc:
+            raise ValueError('CSV must be UTF-8 encoded.') from exc
+        reader=csv.reader(io.StringIO(text))
+        all_rows=list(reader)
+    elif filename.endswith('.xlsx'):
+        try:
+            wb=load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
+            ws=wb.active
+            all_rows=[list(r) for r in ws.iter_rows(values_only=True)]
+        except Exception as exc:
+            raise ValueError('The Excel file could not be read. Please upload a valid .xlsx file.') from exc
+    else:
+        raise ValueError('Please upload a CSV or Excel (.xlsx) file.')
+
+    if not all_rows:
+        raise ValueError('The uploaded file has no rows.')
+
+    headers=[_canonical_student_header(v) for v in all_rows[0]]
+    required={'roll_no','name','password'}
+    if not required.issubset(set(headers)):
+        raise ValueError('Required columns are: roll_no, name, password.')
+
+    index={name:headers.index(name) for name in required}
+    rows=[]
+    for row_number,row in enumerate(all_rows[1:],start=2):
+        values={}
+        for key,col in index.items():
+            values[key]=_student_cell_text(row[col] if col < len(row) else '')
+        if not any(values.values()):
+            continue
+        values['row_number']=row_number
+        rows.append(values)
+    return rows
+
+
+@app.route('/admin/students/import',methods=['POST'])
+@admin_required
+def import_students():
+    upload=request.files.get('student_file')
+    if not upload or not upload.filename:
+        flash('Choose a CSV or Excel (.xlsx) file.','error')
+        return redirect(url_for('students'))
+
+    try:
+        rows=_student_rows_from_upload(upload)
+    except ValueError as exc:
+        flash(str(exc),'error')
+        return redirect(url_for('students'))
+
+    s=DB()
+    existing=set(s.scalars(select(Student.roll_no)).all())
+    seen=set()
+    added=0
+    duplicates=0
+    invalid=0
+
+    for row in rows:
+        roll=row['roll_no'].strip()
+        name=row['name'].strip()
+        password=row['password']
+        if not roll or not name or not password:
+            invalid+=1
+            continue
+        if roll in existing or roll in seen:
+            duplicates+=1
+            continue
+        s.add(Student(
+            roll_no=roll,
+            name=name,
+            password_hash=generate_password_hash(password),
+            created_at=now_iso()
+        ))
+        seen.add(roll)
+        added+=1
+
+    try:
+        s.commit()
+    except IntegrityError:
+        s.rollback()
+        flash('Import could not be completed because one or more roll numbers conflict with existing students.','error')
+        return redirect(url_for('students'))
+
+    parts=[f'Imported {added} student login' + ('' if added==1 else 's') + '.']
+    if duplicates: parts.append(f'Skipped {duplicates} duplicate roll number' + ('' if duplicates==1 else 's') + '.')
+    if invalid: parts.append(f'Skipped {invalid} incomplete row' + ('' if invalid==1 else 's') + '.')
+    flash(' '.join(parts))
+    return redirect(url_for('students'))
+
+
+@app.route('/admin/students/template/<fmt>')
+@admin_required
+def student_import_template(fmt):
+    headers=['roll_no','name','password']
+    if fmt=='csv':
+        out=io.StringIO(newline='')
+        writer=csv.writer(out)
+        writer.writerow(headers)
+        data=io.BytesIO(out.getvalue().encode('utf-8-sig'))
+        return send_file(data,mimetype='text/csv',as_attachment=True,download_name='student_import_template.csv')
+    if fmt=='xlsx':
+        wb=Workbook()
+        ws=wb.active
+        ws.title='Students'
+        ws.append(headers)
+        for cell in ws[1]: cell.font=Font(bold=True)
+        ws.column_dimensions['A'].width=18
+        ws.column_dimensions['B'].width=28
+        ws.column_dimensions['C'].width=22
+        data=io.BytesIO(); wb.save(data); data.seek(0)
+        return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name='student_import_template.xlsx')
+    abort(404)
+
 
 @app.route('/admin/exams',methods=['GET','POST'])
 @admin_required
