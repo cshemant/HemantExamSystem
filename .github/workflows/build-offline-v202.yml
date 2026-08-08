@@ -1,0 +1,81 @@
+name: Build Offline Exam V2.02
+
+on:
+  push:
+    tags:
+      - 'v2.02'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-offline-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-offline-build.txt
+
+      - name: Compile protected one-click Windows executable
+        shell: pwsh
+        run: |
+          python -m nuitka `
+            --onefile `
+            --assume-yes-for-downloads `
+            --output-dir=build-offline `
+            --output-filename=LearnWithHemantOfflineExam.exe `
+            --include-data-dir=templates=templates `
+            --include-data-dir=static=static `
+            --company-name="Learn with Hemant" `
+            --product-name="Learn with Hemant Offline Exam" `
+            --file-description="Offline LAN Examination System" `
+            --file-version=2.0.2.0 `
+            --product-version=2.0.2.0 `
+            offline_launcher.py
+
+      - name: Prepare V2.02 download package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item build-offline\LearnWithHemantOfflineExam.exe release\LearnWithHemantOfflineExam.exe
+          Copy-Item OFFLINE_V2.02_README.txt release\README.txt
+          Compress-Archive -Path release\LearnWithHemantOfflineExam.exe,release\README.txt -DestinationPath LearnWithHemant_Offline_Exam_V2.02_Windows.zip -Force
+          $hash = (Get-FileHash LearnWithHemant_Offline_Exam_V2.02_Windows.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  LearnWithHemant_Offline_Exam_V2.02_Windows.zip" | Set-Content LearnWithHemant_Offline_Exam_V2.02_Windows.zip.sha256 -Encoding ascii
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LearnWithHemant-Offline-V2.02-Windows
+          path: |
+            LearnWithHemant_Offline_Exam_V2.02_Windows.zip
+            LearnWithHemant_Offline_Exam_V2.02_Windows.zip.sha256
+
+      - name: Publish permanent GitHub Release asset
+        if: startsWith(github.ref, 'refs/tags/v2.02')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Learn with Hemant Offline Exam V2.02
+          body: |
+            Offline/LAN Windows build for colleges and faculty.
+
+            - One-click launcher opens the login/setup page automatically.
+            - No Internet is required during the exam.
+            - SQLite data persists in the Windows user's LocalAppData folder.
+            - No default administrator password is included; first launch creates the admin account.
+            - SHA-256 checksum is included for integrity verification.
+          files: |
+            LearnWithHemant_Offline_Exam_V2.02_Windows.zip
+            LearnWithHemant_Offline_Exam_V2.02_Windows.zip.sha256
