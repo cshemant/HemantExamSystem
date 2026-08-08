@@ -72,8 +72,18 @@ def init_db():
     s=DB()
     username=os.getenv('ADMIN_USERNAME','admin').strip() or 'admin'
     try:
-        if not s.scalar(select(Admin).where(Admin.username==username)):
-            s.add(Admin(username=username,password_hash=generate_password_hash(admin_password))); s.commit()
+        admin = s.scalar(select(Admin).where(Admin.username == username))
+
+        if not admin:
+            s.add(Admin(
+                username=username,
+                password_hash=generate_password_hash(admin_password)
+            ))
+        else:
+            if not check_password_hash(admin.password_hash, admin_password):
+                admin.password_hash = generate_password_hash(admin_password)
+
+        s.commit()
     except IntegrityError: s.rollback()
 
 init_db()
