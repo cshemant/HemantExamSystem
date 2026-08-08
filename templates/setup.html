@@ -1,0 +1,20 @@
+{% extends 'base.html' %}{% block content %}
+<section class="login-shell"><div class="container setup-shell">
+  <div class="setup-card">
+    <div class="eyebrow">Offline V{{ app_version }} · First-time setup</div>
+    <h1>Create the faculty administrator</h1>
+    <p class="muted setup-copy">This account controls students, exams, questions and results on this computer. No default administrator password is included in the offline package.</p>
+    <form method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Administrator Username</label>
+      <input name="username" autocomplete="username" minlength="3" required>
+      <label>Password</label>
+      <input name="password" type="password" autocomplete="new-password" minlength="10" required>
+      <label>Confirm Password</label>
+      <input name="confirm_password" type="password" autocomplete="new-password" minlength="10" required>
+      <button>Create Administrator</button>
+    </form>
+    <p class="setup-note">Use a strong password and store it securely. Student passwords are also stored only as secure password hashes.</p>
+  </div>
+</div></section>
+{% endblock %}

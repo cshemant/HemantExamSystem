@@ -1,0 +1,44 @@
+LEARN WITH HEMANT — OFFLINE EXAM SYSTEM V2.02
+================================================
+
+For faculty / colleges
+----------------------
+1. Extract the downloaded ZIP to a normal folder.
+2. Double-click LearnWithHemantOfflineExam.exe.
+3. Your browser opens automatically.
+4. On the first launch, create your faculty/admin username and password.
+5. Add students/exams and start the examination.
+6. Students connected to the same LAN/Wi-Fi can open the Student LAN URL
+   displayed in the launcher window.
+7. Keep the launcher window open until the exam is finished.
+
+No Internet is required while the offline examination is running.
+
+Where data is stored
+--------------------
+The executable does not store the live database inside its own folder.
+On Windows, data is stored under:
+
+  %LOCALAPPDATA%\LearnWithHemantExam\
+
+This includes exam.db, the local server secret, and LAN_ACCESS.txt.
+Because the database lives outside the executable, installing a newer offline
+version does not overwrite existing students, exams, attempts, or results.
+Back up this folder before important exams.
+
+Security design
+---------------
+- No default administrator password is shipped in the packaged V2.02 build.
+- Administrator and student passwords are stored as password hashes.
+- CSRF protection and hardened browser security headers are enabled.
+- The distributed application is a compiled Windows executable; raw Python,
+  HTML templates and CSS are not shipped as editable project files.
+- Mutable exam data is kept in the current Windows user's LocalAppData folder.
+
+No desktop application can be made impossible to reverse engineer or tamper
+with by a machine administrator. For formal/high-stakes exams, also use a
+restricted Windows account, controlled lab machines, OS-level access controls,
+regular backups, and a code-signed executable from a trusted certificate.
+
+Version: 2.02
+Website: https://exam.learnwithhemant.com

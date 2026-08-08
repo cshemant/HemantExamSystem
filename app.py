@@ -1,4 +1,4 @@
-import os, csv, io, random, socket, secrets
+import os, csv, io, random, socket, secrets, sys
 from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
@@ -14,15 +14,26 @@ from sqlalchemy.exc import IntegrityError
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font
 
-BASE_DIR=Path(__file__).resolve().parent
-load_dotenv(BASE_DIR/'.env')
+RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
+DATA_DIR.mkdir(parents=True,exist_ok=True)
+load_dotenv(RESOURCE_DIR/'.env')
+
+APP_VERSION='2.02'
+OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
+DEFAULT_OFFLINE_DOWNLOAD_URL=(
+    'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
+    + OFFLINE_RELEASE_FILENAME
+)
+OFFLINE_DOWNLOAD_URL=os.getenv('OFFLINE_DOWNLOAD_URL',DEFAULT_OFFLINE_DOWNLOAD_URL).strip() or DEFAULT_OFFLINE_DOWNLOAD_URL
+OFFLINE_REQUIRE_SETUP=os.getenv('OFFLINE_REQUIRE_SETUP','0').strip().lower() in {'1','true','yes','on'}
 
 APP_MODE=os.getenv('APP_MODE','offline').strip().lower()
 if APP_MODE not in {'offline','online'}: raise RuntimeError('APP_MODE must be offline or online')
 
 def normalize_database_url(raw):
     if not raw:
-        return f"sqlite:///{(BASE_DIR/'exam.db').as_posix()}"
+        return f"sqlite:///{(DATA_DIR/'exam.db').as_posix()}"
     raw=raw.strip()
     if raw.startswith('postgres://'):
         raw='postgresql+psycopg://'+raw[len('postgres://'):]
@@ -36,13 +47,20 @@ if APP_MODE=='online' and not DATABASE_URL.startswith('postgresql'):
 
 secret=os.getenv('SECRET_KEY','').strip()
 admin_password=os.getenv('ADMIN_PASSWORD','').strip()
+admin_username=os.getenv('ADMIN_USERNAME','admin').strip() or 'admin'
 if APP_MODE=='online':
     if len(secret)<24: raise RuntimeError('Online mode requires a strong SECRET_KEY (24+ characters).')
     if len(admin_password)<10: raise RuntimeError('Online mode requires ADMIN_PASSWORD with at least 10 characters.')
-if not secret: secret='offline-development-secret-change-me'
-if not admin_password: admin_password='Admin@123'
+if not secret:
+    secret='offline-development-secret-change-me'
+if not admin_password and not OFFLINE_REQUIRE_SETUP:
+    admin_password='Admin@123'
 
-app=Flask(__name__)
+app=Flask(
+    __name__,
+    template_folder=str(RESOURCE_DIR/'templates'),
+    static_folder=str(RESOURCE_DIR/'static')
+)
 app.secret_key=secret
 cookie_secure=os.getenv('COOKIE_SECURE','1' if APP_MODE=='online' else '0').strip().lower() in {'1','true','yes','on'}
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=cookie_secure,MAX_CONTENT_LENGTH=3*1024*1024)
@@ -72,21 +90,26 @@ def parse_dt(value): return datetime.fromisoformat(value)
 def init_db():
     Base.metadata.create_all(engine)
     s=DB()
-    username=os.getenv('ADMIN_USERNAME','admin').strip() or 'admin'
     try:
-        admin = s.scalar(select(Admin).where(Admin.username == username))
+        # Online deployments intentionally sync the configured administrator password.
+        # Source-based offline development keeps the historical default behavior.
+        # The packaged V2.02 desktop build uses first-run setup instead, so no default
+        # administrator credential is shipped inside the downloadable executable.
+        if APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP:
+            admin=s.scalar(select(Admin).where(Admin.username==admin_username))
+            if not admin:
+                s.add(Admin(username=admin_username,password_hash=generate_password_hash(admin_password)))
+            elif admin_password and not check_password_hash(admin.password_hash,admin_password):
+                admin.password_hash=generate_password_hash(admin_password)
+            s.commit()
+    except IntegrityError:
+        s.rollback()
 
-        if not admin:
-            s.add(Admin(
-                username=username,
-                password_hash=generate_password_hash(admin_password)
-            ))
-        else:
-            if not check_password_hash(admin.password_hash, admin_password):
-                admin.password_hash = generate_password_hash(admin_password)
-
-        s.commit()
-    except IntegrityError: s.rollback()
+def needs_offline_setup():
+    if APP_MODE!='offline' or not OFFLINE_REQUIRE_SETUP:
+        return False
+    s=DB()
+    return (s.scalar(select(func.count()).select_from(Admin)) or 0)==0
 
 init_db()
 
@@ -102,8 +125,65 @@ def csrf_and_session_setup():
 
 @app.context_processor
 def globals_for_templates():
-    dbname='PostgreSQL' if DATABASE_URL.startswith('postgresql') else 'SQLite'
-    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'runtime_label':f"{'Online' if APP_MODE=='online' else 'Offline / LAN'} · {dbname}"}
+    return {
+        'csrf_token':web_session.get('_csrf_token',''),
+        'web_session':web_session,
+        'is_online':APP_MODE=='online',
+        'app_version':APP_VERSION
+    }
+
+
+@app.before_request
+def offline_first_run_guard():
+    if not needs_offline_setup():
+        return None
+    allowed={'setup_admin','static','health'}
+    if request.endpoint not in allowed:
+        return redirect(url_for('setup_admin'))
+    return None
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options','nosniff')
+    response.headers.setdefault('X-Frame-Options','DENY')
+    response.headers.setdefault('Referrer-Policy','same-origin')
+    response.headers.setdefault('Permissions-Policy','camera=(), microphone=(), geolocation=()')
+    return response
+
+@app.route('/setup',methods=['GET','POST'])
+def setup_admin():
+    if not needs_offline_setup():
+        return redirect(url_for('home'))
+    if request.method=='POST':
+        username=request.form.get('username','').strip()
+        password=request.form.get('password','')
+        confirm=request.form.get('confirm_password','')
+        if len(username)<3:
+            flash('Administrator username must contain at least 3 characters.','error')
+        elif len(password)<10:
+            flash('Administrator password must contain at least 10 characters.','error')
+        elif password!=confirm:
+            flash('Passwords do not match.','error')
+        else:
+            s=DB()
+            try:
+                s.add(Admin(username=username,password_hash=generate_password_hash(password)))
+                s.commit()
+                flash('Administrator account created. You can now sign in.')
+                return redirect(url_for('home'))
+            except IntegrityError:
+                s.rollback()
+                flash('That administrator username is already in use.','error')
+    return render_template('setup.html',login_page=True)
+
+@app.route('/download/offline')
+def offline_download():
+    if APP_MODE!='online':
+        return redirect(url_for('home'))
+    parsed=urlparse(OFFLINE_DOWNLOAD_URL)
+    if parsed.scheme not in {'https','http'} or not parsed.netloc:
+        abort(503,'Offline download is temporarily unavailable.')
+    return redirect(OFFLINE_DOWNLOAD_URL,code=302)
 
 @app.template_filter('dt')
 def format_dt(v):
@@ -458,6 +538,6 @@ if __name__=='__main__':
     port=int(os.getenv('PORT','8080'))
     try:local_ip=socket.gethostbyname(socket.gethostname())
     except Exception:local_ip='SERVER-IP'
-    print('='*64);print('LEARN WITH HEMANT — EXAM SYSTEM V2');print(f"Mode: {'ONLINE' if APP_MODE=='online' else 'OFFLINE / LAN'}");print(f"Database: {'PostgreSQL' if DATABASE_URL.startswith('postgresql') else 'SQLite'}");print('Server: http://127.0.0.1:%s'%port)
+    print('='*64);print(f'LEARN WITH HEMANT — EXAM SYSTEM V{APP_VERSION}');print(f"Mode: {'ONLINE' if APP_MODE=='online' else 'OFFLINE / LAN'}");print(f"Database: {'PostgreSQL' if DATABASE_URL.startswith('postgresql') else 'SQLite'}");print('Server: http://127.0.0.1:%s'%port)
     if APP_MODE=='offline':print(f'LAN URL: http://{local_ip}:{port}')
     print('='*64);app.run(host='0.0.0.0',port=port,debug=False,threaded=True)

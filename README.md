@@ -1,21 +1,135 @@
-# Learn with Hemant — Exam System V2 (Dual Mode)
+# Learn with Hemant — Exam System V2.02
 
-One Flask codebase, two deployment modes:
+One codebase supports:
 
-- **Offline / LAN:** SQLite (`exam.db`) on the faculty/server computer.
-- **Online:** PostgreSQL on a hosted server/VPS/container platform.
+- **Online mode:** Flask + PostgreSQL (for `exam.learnwithhemant.com`).
+- **Offline/LAN source mode:** Flask + SQLite.
+- **Offline V2.02 Windows distribution:** a compiled one-click executable built automatically by GitHub Actions.
 
-The exam workflow remains intentionally simple: students, exams, MCQs, CSV import, activation, randomized question order, server-controlled timer, autosave, resume, automatic submission, automatic scoring, and results.
+The exam workflow includes student/admin login, bulk student import from CSV/XLSX, exams, question import, randomized question order, server timer, autosave, resume, automatic submission/scoring, and results.
 
-## 1) Offline / LAN mode
+## Online deployment
 
-Run `setup_once.bat` once while Internet is available to install Python dependencies. Then run `run_server.bat`.
-
-Default offline admin (from `.env.example`):
+Set environment variables on the hosting platform:
 
 ```text
-Username: admin
-Password: Admin@123
+APP_MODE=online
+SECRET_KEY=<long-random-secret>
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=<strong-password>
+DATABASE_URL=<PostgreSQL URL>
+COOKIE_SECURE=1
+```
+
+Install:
+
+```bash
+pip install -r requirements-online.txt
+```
+
+Start:
+
+```bash
+gunicorn wsgi:app
+```
+
+### Permanent offline download route
+
+The login page links to:
+
+```text
+https://exam.learnwithhemant.com/download/offline
+```
+
+That URL is intentionally owned by the application and remains stable. It redirects to `OFFLINE_DOWNLOAD_URL`, so the binary can later move from GitHub Releases to Cloudflare R2 or another storage provider without changing the login-page HTML.
+
+Default V2.02 target:
+
+```text
+https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/LearnWithHemant_Offline_Exam_V2.02_Windows.zip
+```
+
+Override it in Render/hosting environment variables when needed:
+
+```text
+OFFLINE_DOWNLOAD_URL=https://your-public-storage.example/offline-v2.02.zip
+```
+
+## Offline V2.02 — end-user experience
+
+The release package contains a compiled Windows executable:
+
+```text
+LearnWithHemantOfflineExam.exe
+```
+
+Faculty workflow:
+
+1. Download and extract the ZIP.
+2. Double-click `LearnWithHemantOfflineExam.exe`.
+3. The local server starts and the browser opens automatically.
+4. On first launch, faculty creates an administrator username/password.
+5. Students on the same LAN/Wi-Fi open the LAN URL shown in the launcher window.
+6. Internet is not required while the exam is running.
+
+Offline data persists in:
+
+```text
+%LOCALAPPDATA%\LearnWithHemantExam\
+```
+
+This keeps the SQLite database separate from the executable, so replacing the executable with a later version does not overwrite exam data.
+
+## Building and publishing Offline V2.02
+
+The repository includes:
+
+```text
+.github/workflows/build-offline-v202.yml
+```
+
+The workflow uses a Windows GitHub runner and Nuitka to compile the application. Raw `.py`, template and CSS project files are not included as editable files in the end-user ZIP.
+
+After committing V2.02, create and push the release tag:
+
+```bash
+git add .
+git commit -m "Add Offline Exam V2.02 distribution"
+git push
+git tag v2.02
+git push origin v2.02
+```
+
+GitHub Actions then creates the permanent Release assets:
+
+```text
+LearnWithHemant_Offline_Exam_V2.02_Windows.zip
+LearnWithHemant_Offline_Exam_V2.02_Windows.zip.sha256
+```
+
+The fixed download URL becomes valid after that release workflow completes.
+
+## Security design
+
+- No default administrator password in the compiled offline distribution.
+- First-run administrator setup.
+- Administrator/student passwords are stored as hashes.
+- CSRF protection on state-changing requests.
+- HttpOnly/SameSite cookies; Secure cookies online.
+- Additional browser security headers.
+- Mutable local database is stored outside the executable under the current Windows user's LocalAppData.
+- End-user package contains a compiled executable instead of editable project source/templates.
+- SHA-256 checksum is published with the release.
+
+A distributed desktop/server executable cannot be made impossible to reverse-engineer by a machine administrator. For high-stakes exams, use controlled lab PCs, OS account restrictions, backups, and code-sign the Windows executable. Also note that if the GitHub **source repository itself is public**, the source remains publicly readable regardless of binary packaging. To hide source code, keep the source repository private and host only the compiled ZIP on a separate public binary/storage endpoint, then set `OFFLINE_DOWNLOAD_URL` to that endpoint.
+
+## Source-based offline/LAN mode
+
+For development/testing only:
+
+```bash
+python -m pip install -r requirements.txt
+python app.py
 ```
 
 Faculty PC:
@@ -24,117 +138,10 @@ Faculty PC:
 http://127.0.0.1:8080
 ```
 
-Students on the same LAN/Wi-Fi:
+Student LAN access:
 
 ```text
 http://SERVER-IP:8080
 ```
 
-The server prints the likely LAN URL when it starts.
-
-### Upgrading from V1 without losing your existing offline data
-
-If your V1 folder already contains `exam.db`, copy that exact file into the V2 project folder before starting V2. The V2 SQLAlchemy models intentionally keep the V1 table/column structure compatible, so the same SQLite database can be read directly.
-
-Back up `exam.db` before upgrading.
-
-## 2) Online / PostgreSQL mode
-
-Install online dependencies:
-
-```bash
-python -m pip install -r requirements-online.txt
-```
-
-Copy `.env.online.example` to `.env` and set:
-
-```text
-APP_MODE=online
-SECRET_KEY=<long-random-value>
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=<strong-password>
-DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DATABASE
-PORT=8080
-COOKIE_SECURE=1
-WEB_CONCURRENCY=3
-```
-
-Run behind a production WSGI server:
-
-```bash
-gunicorn --workers 3 --threads 4 --bind 0.0.0.0:8080 wsgi:app
-```
-
-Use HTTPS and a domain/reverse proxy in production.
-
-## 3) Docker online test
-
-The included `docker-compose.online.yml` starts PostgreSQL + the web app. Change all example passwords/secrets before exposing it publicly.
-
-```bash
-docker compose -f docker-compose.online.yml up --build
-```
-
-The local Docker Compose file sets `COOKIE_SECURE=0` so HTTP localhost testing works. In production behind HTTPS, set `COOKIE_SECURE=1`.
-
-Then open:
-
-```text
-http://localhost:8080
-```
-
-## 4) How dual mode works
-
-The application reads environment variables at startup:
-
-```text
-APP_MODE=offline
-DATABASE_URL omitted
-        ↓
-SQLite: <project>/exam.db
-```
-
-or
-
-```text
-APP_MODE=online
-DATABASE_URL=postgresql+psycopg://...
-        ↓
-PostgreSQL
-```
-
-The routes, templates, login, timer, scoring and exam logic are the same in both modes.
-
-## 5) Online safeguards added in V2
-
-- Database abstraction through SQLAlchemy
-- PostgreSQL support
-- CSRF checks for forms and autosave requests
-- Secure/HttpOnly session cookies in production online mode
-- Reverse-proxy support
-- Environment-based secrets
-- Database connection pre-ping
-- `/health` endpoint for hosting health checks
-- POST-only exam submission
-
-## Important
-
-V2 is dual-deploy, not yet a seamless offline-to-cloud synchronization engine. If Internet disappears during an online exam, the online server becomes unreachable unless the college switches students to a separately running LAN server. Automatic merging/synchronization between offline SQLite and online PostgreSQL should be implemented as a later version because it requires conflict-resolution and exam-integrity rules.
-
-## Bulk student import
-
-Faculty can create hundreds of student logins from **CSV** or **Excel (.xlsx)** on the Students page.
-
-Required columns:
-
-```text
-roll_no,name,password
-```
-
-- Downloadable CSV and Excel templates are available inside the admin Students page.
-- Existing roll numbers are skipped instead of overwritten.
-- Blank/incomplete rows are skipped and reported after import.
-- Passwords are hashed before being stored.
-
-Sample files are included as `sample_students.csv` and `sample_students.xlsx`.
-
+The compiled V2.02 distribution is preferred for colleges/faculty because it avoids requiring Python installation and does not expose the editable project files in the download package.

@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+build-offline/
+*.build/
+*.dist/
+*.onefile-build/
+*.exe
+*.zip.sha256
