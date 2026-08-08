@@ -15,7 +15,6 @@
   <nav class="nav-links"><a href="{{ url_for('student_dashboard') }}">My Exams</a></nav>
   {% endif %}
   <span class="nav-spacer"></span>
-  <span class="mode-badge"><span class="mode-dot"></span>{{ runtime_label }}</span>
   {% if web_session.get('role') %}<a class="logout-link" href="{{ url_for('logout') }}">Logout</a>{% endif %}
 </div></header>
 {% if login_page %}<main>{% else %}<main class="page"><div class="container">{% endif %}
