@@ -1,0 +1,4 @@
+question,option_a,option_b,option_c,option_d,correct_answer,marks
+Which Android component represents a screen?,Activity,Service,Broadcast Receiver,Content Provider,A,1
+Which file declares Android application components?,strings.xml,AndroidManifest.xml,build.gradle,colors.xml,B,1
+What does APK stand for?,Android Package Kit,Application Programming Kernel,Android Program Key,Application Package Kernel,A,1
