@@ -32,15 +32,13 @@ jobs:
         shell: pwsh
         run: |
           python -m nuitka `
-            --mode=onefile `
-            --msvc=latest `
+            --onefile `
             --assume-yes-for-downloads `
-            --show-progress `
-            --report=nuitka-report.xml `
             --output-dir=build-offline `
             --output-filename=LearnWithHemantOfflineExam.exe `
             --include-data-dir=templates=templates `
             --include-data-dir=static=static `
+            --include-data-file=preloaded_question_banks.json=preloaded_question_banks.json `
             --company-name="Learn with Hemant" `
             --product-name="Learn with Hemant Offline Exam" `
             --file-description="Offline LAN Examination System" `
@@ -48,14 +46,6 @@ jobs:
             --product-version=2.0.2.0 `
             offline_launcher.py
 
-      - name: Upload Nuitka diagnostic report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: nuitka-diagnostics
-          path: nuitka-report.xml
-          if-no-files-found: ignore
-          
       - name: Prepare V2.02 download package
         shell: pwsh
         run: |

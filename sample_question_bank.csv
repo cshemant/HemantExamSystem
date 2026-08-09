@@ -1,0 +1,7 @@
+﻿subject,course_semester,unit,topic,question,option_a,option_b,option_c,option_d,correct_answer,marks,difficulty,bloom_level,co_mapping,tags,status
+Mobile Application Development,B.Tech CSE / Sem 5,1,Android Architecture,Which component manages the Android application screen?,Service,Activity,Broadcast Receiver,Content Provider,B,1,Easy,Understand,CO1,"android,activity",approved
+Mobile Application Development,B.Tech CSE / Sem 5,2,Activity Lifecycle,Which callback is normally called when an Activity is first created?,onCreate(),onPause(),onStop(),onDestroy(),A,1,Medium,Understand,CO2,"activity,lifecycle",approved
+Mobile Application Development,B.Tech CSE / Sem 5,2,Intent,Which Intent type explicitly names the target component?,Implicit Intent,Explicit Intent,Broadcast Intent,Pending Intent,B,1,Medium,Apply,CO2,intent,approved
+Mobile Application Development,B.Tech CSE / Sem 5,3,Layouts,Which layout arranges child views in a single row or column?,ConstraintLayout,FrameLayout,LinearLayout,TableLayout,C,1,Easy,Remember,CO3,"ui,layout",approved
+Mobile Application Development,B.Tech CSE / Sem 5,4,Storage,Which database is commonly used for structured local Android data?,SQLite,FTP,DNS,SMTP,A,1,Medium,Apply,CO4,"storage,sqlite",approved
+Mobile Application Development,B.Tech CSE / Sem 5,4,Security,Why should sensitive values not be hard-coded in client applications?,It increases APK size only,It can expose secrets through reverse engineering,It disables layouts,It prevents compilation,B,1,Hard,Analyze,CO4,security,approved

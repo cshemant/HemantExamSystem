@@ -1,16 +1,29 @@
-# Learn with Hemant — Exam System V2.02
+# Learn with Hemant — Examination System V2.02+
 
-One codebase supports:
+A dual-mode examination platform for colleges and faculty. The same application supports online delivery and offline/LAN examinations, with a reusable academic Question Bank and controlled examination workflow.
 
-- **Online mode:** Flask + PostgreSQL (for `exam.learnwithhemant.com`).
-- **Offline/LAN source mode:** Flask + SQLite.
-- **Offline V2.02 Windows distribution:** a compiled one-click executable built automatically by GitHub Actions.
-
-The exam workflow includes student/admin login, bulk student import from CSV/XLSX, exams, question import, randomized question order, server timer, autosave, resume, automatic submission/scoring, and results.
+## Core examination workflow
+- Student and Faculty/Admin login
+- Bulk student import from CSV/XLSX
+- Reusable Question Bank
+- Subject, Semester, Unit, Topic, Difficulty, Bloom Level, CO mapping and Tags
+- Draft/Approved question workflow
+- Question version history
+- CSV/XLSX Question Bank import and templates
+- Add selected approved questions to an exam
+- Exam blueprint generation using Unit and Difficulty weightage
+- Larger question pool + randomized per-student subset
+- Option shuffling with stable answer mapping
+- Autosave, Resume, Server Timer and automatic submission/scoring
+- Browser-level integrity event logging (tab/full-screen exits)
+- Results filtering and CSV/XLSX export
+- Question/item analytics
+- Role-based faculty accounts
+- Administrator audit trail
+- Offline database backup/restore
 
 ## Online deployment
-
-Set environment variables on the hosting platform:
+Set:
 
 ```text
 APP_MODE=online
@@ -21,111 +34,15 @@ DATABASE_URL=<PostgreSQL URL>
 COOKIE_SECURE=1
 ```
 
-Install:
+Install and start:
 
 ```bash
 pip install -r requirements-online.txt
-```
-
-Start:
-
-```bash
 gunicorn wsgi:app
 ```
 
-### Permanent offline download route
-
-The login page links to:
-
-```text
-https://exam.learnwithhemant.com/download/offline
-```
-
-That URL is intentionally owned by the application and remains stable. It redirects to `OFFLINE_DOWNLOAD_URL`, so the binary can later move from GitHub Releases to Cloudflare R2 or another storage provider without changing the login-page HTML.
-
-Default V2.02 target:
-
-```text
-https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/LearnWithHemant_Offline_Exam_V2.02_Windows.zip
-```
-
-Override it in Render/hosting environment variables when needed:
-
-```text
-OFFLINE_DOWNLOAD_URL=https://your-public-storage.example/offline-v2.02.zip
-```
-
-## Offline V2.02 — end-user experience
-
-The release package contains a compiled Windows executable:
-
-```text
-LearnWithHemantOfflineExam.exe
-```
-
-Faculty workflow:
-
-1. Download and extract the ZIP.
-2. Double-click `LearnWithHemantOfflineExam.exe`.
-3. The local server starts and the browser opens automatically.
-4. On first launch, faculty creates an administrator username/password.
-5. Students on the same LAN/Wi-Fi open the LAN URL shown in the launcher window.
-6. Internet is not required while the exam is running.
-
-Offline data persists in:
-
-```text
-%LOCALAPPDATA%\LearnWithHemantExam\
-```
-
-This keeps the SQLite database separate from the executable, so replacing the executable with a later version does not overwrite exam data.
-
-## Building and publishing Offline V2.02
-
-The repository includes:
-
-```text
-.github/workflows/build-offline-v202.yml
-```
-
-The workflow uses a Windows GitHub runner and Nuitka to compile the application. Raw `.py`, template and CSS project files are not included as editable files in the end-user ZIP.
-
-After committing V2.02, create and push the release tag:
-
-```bash
-git add .
-git commit -m "Add Offline Exam V2.02 distribution"
-git push
-git tag v2.02
-git push origin v2.02
-```
-
-GitHub Actions then creates the permanent Release assets:
-
-```text
-LearnWithHemant_Offline_Exam_V2.02_Windows.zip
-LearnWithHemant_Offline_Exam_V2.02_Windows.zip.sha256
-```
-
-The fixed download URL becomes valid after that release workflow completes.
-
-## Security design
-
-- No default administrator password in the compiled offline distribution.
-- First-run administrator setup.
-- Administrator/student passwords are stored as hashes.
-- CSRF protection on state-changing requests.
-- HttpOnly/SameSite cookies; Secure cookies online.
-- Additional browser security headers.
-- Mutable local database is stored outside the executable under the current Windows user's LocalAppData.
-- End-user package contains a compiled executable instead of editable project source/templates.
-- SHA-256 checksum is published with the release.
-
-A distributed desktop/server executable cannot be made impossible to reverse-engineer by a machine administrator. For high-stakes exams, use controlled lab PCs, OS account restrictions, backups, and code-sign the Windows executable. Also note that if the GitHub **source repository itself is public**, the source remains publicly readable regardless of binary packaging. To hide source code, keep the source repository private and host only the compiled ZIP on a separate public binary/storage endpoint, then set `OFFLINE_DOWNLOAD_URL` to that endpoint.
-
-## Source-based offline/LAN mode
-
-For development/testing only:
+## Offline / LAN mode
+For source testing:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -138,10 +55,49 @@ Faculty PC:
 http://127.0.0.1:8080
 ```
 
-Student LAN access:
+Students on the same LAN/Wi-Fi:
 
 ```text
 http://SERVER-IP:8080
 ```
 
-The compiled V2.02 distribution is preferred for colleges/faculty because it avoids requiring Python installation and does not expose the editable project files in the download package.
+The Wi-Fi/LAN does not need Internet access.
+
+## Question Bank import format
+Use the in-app CSV/XLSX template. Main columns:
+
+```text
+subject,course_semester,unit,topic,question,option_a,option_b,option_c,option_d,correct_answer,marks,difficulty,bloom_level,co_mapping,tags,status
+```
+
+## Exam Blueprint
+A faculty member can define:
+- Questions per student
+- Question pool size
+- Easy / Medium / Hard percentages
+- Unit distribution such as `1:20, 2:30, 3:30, 4:20`
+- Randomized question selection/order
+- Option shuffling
+- Browser integrity monitoring threshold
+
+The generator uses only **approved** Question Bank items. Once attempts begin, the generated question pool is locked from regeneration to protect result integrity.
+
+## Governance
+- Faculty accounts avoid sharing the administrator password.
+- Faculty can manage students, Question Bank, exams, results and analytics.
+- Administrator-only controls include faculty account management, audit logs and recovery tools.
+- Editing a Question Bank item preserves a revision record; faculty edits return the item to Draft until approved again.
+
+## Offline recovery
+In offline mode, **System → Download Backup** creates a consistent `.db` snapshot. The same page can restore a valid backup. Back up before important examinations.
+
+## Security notes
+- Passwords are stored as hashes.
+- CSRF protection is enforced on state-changing requests.
+- Session cookies are HttpOnly/SameSite and Secure in online mode.
+- Browser security headers are enabled.
+- Browser integrity monitoring is **not** an OS-level lockdown browser. For high-stakes exams, use controlled lab PCs and a dedicated secure-browser/kiosk layer.
+- The downloadable Windows binary should be code-signed and security-validated before institutional distribution.
+
+## Presentation
+See `HOD_PRESENTATION_GUIDE.md` for the recommended live demonstration and likely HOD questions.

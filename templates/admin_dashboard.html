@@ -1,3 +1,16 @@
-{% extends 'base.html' %}{% block content %}<div class="page-head"><div class="eyebrow">Faculty control panel</div><h1>Admin Dashboard</h1><p class="muted">Prepare an exam in a few steps and monitor attempts from one place.</p></div>
-<div class="grid" style="margin-bottom:20px"><div class="stat-card"><strong>{{ stats.students }}</strong><span>Students</span></div><div class="stat-card"><strong>{{ stats.exams }}</strong><span>Exams</span></div><div class="stat-card"><strong>{{ stats.questions }}</strong><span>Questions</span></div><div class="stat-card"><strong>{{ stats.attempts }}</strong><span>Attempts</span></div></div>
-<div class="card soft"><h2>Recommended exam flow</h2><p class="muted">Add students → Create exam → Add/import questions → Activate exam → Students login → View results.</p></div>{% endblock %}
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div class="eyebrow">Faculty control panel</div><h1>Admin Dashboard</h1><p class="muted">Prepare, deliver, monitor and analyse examinations from one place.</p></div>
+<div class="grid stat-grid" style="margin-bottom:20px">
+  <div class="stat-card"><strong>{{ stats.students }}</strong><span>Students</span></div>
+  <div class="stat-card"><strong>{{ stats.bank_questions }}</strong><span>Bank Questions</span></div>
+  <div class="stat-card"><strong>{{ stats.exams }}</strong><span>Exams</span></div>
+  <div class="stat-card"><strong>{{ stats.attempts }}</strong><span>Attempts</span></div>
+</div>
+<div class="card soft"><h2>Recommended exam flow</h2><p class="muted">Bulk import students → Build/approve Question Bank → Create exam blueprint → Generate question pool → Activate exam → Students login → Review results & analytics.</p></div>
+<div class="grid dashboard-shortcuts">
+  <a class="shortcut-card" href="{{ url_for('question_bank') }}"><strong>Question Bank</strong><span>Reusable questions with Unit, Difficulty, Bloom and CO mapping.</span></a>
+  <a class="shortcut-card" href="{{ url_for('exams') }}"><strong>Exam Blueprint</strong><span>Generate balanced papers and randomized student attempts.</span></a>
+  <a class="shortcut-card" href="{{ url_for('analytics') }}"><strong>Item Analysis</strong><span>Track usage, correctness and discrimination after attempts.</span></a>
+  {% if web_session.get('role') == 'admin' %}<a class="shortcut-card" href="{{ url_for('system_tools') }}"><strong>System & Backup</strong><span>Faculty access, audit trail and offline backup/restore.</span></a>{% endif %}
+</div>
+{% endblock %}

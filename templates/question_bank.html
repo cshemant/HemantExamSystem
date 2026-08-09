@@ -1,0 +1,94 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div class="eyebrow">Reusable assessment repository</div><h1>Question Bank</h1><p class="muted">Maintain approved questions once, then reuse them across exams with academic metadata and version control.</p></div>
+
+<div class="card preloaded-bank-card">
+  <div class="import-header">
+    <div>
+      <div class="eyebrow">Ready-made academic library</div>
+      <h2>Preloaded Unit-wise Subject Banks</h2>
+      <p class="muted">Activate a ready-made bank, then create an exam immediately. The starter library contains {{ preloaded_packs|length }} major engineering subjects, each organized into 5 units with answers, difficulty, Bloom level and CO mapping.</p>
+      <p class="mini-note">These are general engineering starter questions. Faculty should review them against the university's exact syllabus before using them for a high-stakes examination.</p>
+      <div class="actions template-actions preloaded-downloads">
+        <a class="btn secondary small" href="{{ url_for('export_preloaded_question_banks',fmt='csv') }}">Download Master CSV</a>
+        <a class="btn secondary small" href="{{ url_for('export_preloaded_question_banks',fmt='xlsx') }}">Download Master Excel</a>
+      </div>
+    </div>
+    <form method="post" action="{{ url_for('activate_preloaded_category') }}" class="preloaded-category-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Activate complete category</label>
+      <div class="inline-form">
+        <select name="category" required>
+          <option value="">Choose category…</option>
+          {% for category in preloaded_categories %}<option value="{{ category }}">{{ category }}</option>{% endfor %}
+        </select>
+        <button class="small">Activate Category</button>
+      </div>
+    </form>
+  </div>
+  <div class="preloaded-summary">
+    <span class="badge success">{{ preloaded_packs|sum(attribute='question_count') }} prepared MCQs</span>
+    <span class="badge">5 units per subject</span>
+    <span class="badge">Answers included</span>
+    <span class="badge">Ready for blueprint generation</span>
+  </div>
+  <div class="table-wrap">
+    <table class="preloaded-table">
+      <tr><th>Category</th><th>Subject</th><th>Unit-wise coverage</th><th>Questions</th><th>Status</th><th>Action</th></tr>
+      {% for pack in preloaded_packs %}
+      <tr>
+        <td><span class="badge gray">{{ pack.category }}</span></td>
+        <td><strong>{{ pack.subject }}</strong><br><span class="muted">{{ pack.course_semester }}</span></td>
+        <td>
+          <details class="unit-details">
+            <summary>{{ pack.unit_count }} units · view coverage</summary>
+            <div class="unit-list">
+              {% for u in pack.units %}<span><strong>U{{ u.unit }}</strong> {{ u.title }} ({{ u.question_count }})</span>{% endfor %}
+            </div>
+          </details>
+        </td>
+        <td>{{ pack.question_count }}</td>
+        <td>
+          {% if pack.is_active %}<span class="badge success">Activated</span>
+          {% elif pack.is_partial %}<span class="badge">Partial {{ pack.active_count }}/{{ pack.question_count }}</span>
+          {% else %}<span class="badge gray">Not activated</span>{% endif %}
+        </td>
+        <td>
+          <div class="actions compact-actions">
+            {% if not pack.is_active %}
+            <form method="post" action="{{ url_for('activate_preloaded_question_bank',slug=pack.slug) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="small">{% if pack.is_partial %}Complete Bank{% else %}Activate Bank{% endif %}</button>
+            </form>
+            {% else %}
+            <a class="btn secondary small" href="{{ url_for('question_bank',subject=pack.subject,status='approved') }}">View Bank</a>
+            {% endif %}
+            <form method="post" action="{{ url_for('create_exam_from_preloaded_bank',slug=pack.slug) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button class="btn secondary small">Create Ready Exam</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+
+<div class="card"><h2>Add Bank Question</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<div class="grid"><div><label>Subject</label><input name="subject" placeholder="Mobile Application Development" required></div><div><label>Course / Semester</label><input name="course_semester" placeholder="B.Tech CSE / Sem 5"></div><div><label>Unit</label><input name="unit" placeholder="2"></div><div><label>Topic</label><input name="topic" placeholder="Activity Lifecycle"></div></div>
+<label>Question</label><textarea name="question" required></textarea>
+<div class="grid"><div><label>Option A</label><input name="option_a" required></div><div><label>Option B</label><input name="option_b" required></div><div><label>Option C</label><input name="option_c" required></div><div><label>Option D</label><input name="option_d" required></div></div>
+<div class="grid"><div><label>Correct Answer</label><select name="correct_answer"><option>A</option><option>B</option><option>C</option><option>D</option></select></div><div><label>Marks</label><input name="marks" type="number" min="1" value="1"></div><div><label>Difficulty</label><select name="difficulty"><option>Easy</option><option selected>Medium</option><option>Hard</option></select></div><div><label>Bloom Level</label><select name="bloom_level"><option>Remember</option><option selected>Understand</option><option>Apply</option><option>Analyze</option><option>Evaluate</option><option>Create</option></select></div></div>
+<div class="grid"><div><label>CO Mapping</label><input name="co_mapping" placeholder="CO2"></div><div><label>Tags</label><input name="tags" placeholder="activity,lifecycle"></div>{% if web_session.get('role')=='admin' %}<div><label>Initial Status</label><select name="status"><option value="draft">Draft</option><option value="approved">Approved</option></select></div>{% endif %}</div>
+<button>Add to Question Bank</button></form></div>
+
+<div class="card"><div class="import-header"><div><h2>Bulk Import Question Bank</h2><p class="muted">Import hundreds of reusable questions from CSV or Excel.</p></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('question_bank_template',fmt='csv') }}">CSV Template</a><a class="btn secondary small" href="{{ url_for('question_bank_template',fmt='xlsx') }}">Excel Template</a></div></div>
+<form method="post" action="{{ url_for('import_question_bank') }}" enctype="multipart/form-data" class="import-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div><label>Question Bank File</label><input type="file" name="question_file" accept=".csv,.xlsx" required></div><button>Import Questions</button></form></div>
+
+<div class="card"><h2>Search & Filter</h2><form method="get"><div class="filter-grid"><div><label>Keyword</label><input name="q" value="{{ filters.q }}" placeholder="question, topic or tag"></div><div><label>Subject</label><select name="subject"><option value="">All</option>{% for x in subjects %}<option value="{{ x }}" {% if filters.subject==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Unit</label><select name="unit"><option value="">All</option>{% for x in units %}<option value="{{ x }}" {% if filters.unit==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Difficulty</label><select name="difficulty"><option value="">All</option>{% for x in ['Easy','Medium','Hard'] %}<option value="{{ x }}" {% if filters.difficulty==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Status</label><select name="status"><option value="">All</option><option value="approved" {% if filters.status=='approved' %}selected{% endif %}>Approved</option><option value="draft" {% if filters.status=='draft' %}selected{% endif %}>Draft</option></select></div></div><div class="actions"><button>Apply Filters</button><a class="btn secondary" href="{{ url_for('question_bank') }}">Reset</a></div></form></div>
+
+<form method="post" action="{{ url_for('bank_add_to_exam') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<div class="card"><div class="import-header"><div><h2>Bank Questions ({{ questions|length }})</h2><p class="muted">Only approved questions can be added to an exam.</p></div><div class="bank-add-controls"><select name="exam_id" required><option value="">Select exam…</option>{% for e in exams %}<option value="{{ e.id }}">{{ e.title }}</option>{% endfor %}</select><button class="small">Add Selected to Exam</button></div></div>
+<div class="table-wrap"><table><tr><th></th><th>ID</th><th>Question</th><th>Academic Mapping</th><th>Difficulty</th><th>Status</th><th>Usage</th><th>Actions</th></tr>
+{% for q in questions %}<tr><td><input class="table-check" type="checkbox" name="question_ids" value="{{ q.id }}" {% if q.status!='approved' %}disabled{% endif %}></td><td>#{{ q.id }}<br><span class="muted">v{{ q.version }}</span></td><td><strong>{{ q.question }}</strong><div class="mini-meta">{{ q.tags or 'No tags' }}</div></td><td>{{ q.subject }}{% if q.unit %}<br><span class="muted">Unit {{ q.unit }}{% if q.topic %} · {{ q.topic }}{% endif %}</span>{% endif %}<br><span class="muted">{{ q.bloom_level }}{% if q.co_mapping %} · {{ q.co_mapping }}{% endif %}</span></td><td><span class="badge">{{ q.difficulty }}</span></td><td>{% if q.status=='approved' %}<span class="badge success">Approved</span>{% else %}<span class="badge gray">Draft</span>{% endif %}</td><td>{{ usage.get(q.id,0) }} exam(s)</td><td><div class="actions"><a class="btn secondary small" href="{{ url_for('edit_bank_question',question_id=q.id) }}">Edit</a>{% if web_session.get('role')=='admin' and q.status!='approved' %}<button class="btn small" formmethod="post" formaction="{{ url_for('approve_bank_question',question_id=q.id) }}">Approve</button>{% endif %}</div></td></tr>{% else %}<tr><td colspan="8">No bank questions match the current filters.</td></tr>{% endfor %}</table></div></div></form>
+{% endblock %}
