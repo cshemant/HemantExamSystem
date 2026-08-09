@@ -127,3 +127,29 @@ body.mobile-menu-open{overflow:hidden}
   .inline-form select{min-width:0;width:100%}
   .preloaded-table{min-width:900px}
 }
+
+/* Prepared unit question-paper sets */
+.unit-paper-sets{margin-top:12px;padding-top:10px;border-top:1px solid var(--line,#dce4ef);display:grid;gap:8px}
+.unit-paper-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.unit-paper-row>span{min-width:56px;font-weight:800;color:var(--ink,#0f172a)}
+.unit-paper-row form{margin:0}
+.btn.tiny,button.tiny{padding:6px 9px;font-size:12px;border-radius:9px}
+
+
+/* Student result performance grade + visible exam parts */
+.result-card{display:flex;align-items:center;justify-content:space-between;gap:28px}
+.result-main{min-width:0}
+.result-performance{display:flex;flex-direction:column;align-items:center;justify-content:center;min-width:190px;padding:18px 22px;border-left:1px solid var(--border)}
+.result-grade-label{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px}
+.result-grade{display:inline-flex;align-items:center;justify-content:center;min-width:150px;padding:11px 18px;border-radius:999px;font-size:24px;font-weight:900;border:1px solid transparent}
+.result-percent{margin-top:7px;font-size:14px;font-weight:800;color:var(--muted)}
+.result-grade.outstanding{background:#ecfdf3;color:#067647;border-color:#abefc6}
+.result-grade.very-good{background:#eff8ff;color:#175cd3;border-color:#b2ddff}
+.result-grade.good{background:#f0fdf4;color:#15803d;border-color:#bbf7d0}
+.result-grade.average{background:#fff8e7;color:#8a5b00;border-color:#f7d98a}
+.result-grade.poor{background:#fff1f0;color:#b42318;border-color:#fecdca}
+@media(max-width:700px){
+  .result-card{align-items:flex-start;flex-direction:column}
+  .result-performance{width:100%;min-width:0;border-left:0;border-top:1px solid var(--border);padding:18px 0 0;align-items:flex-start}
+  .result-grade{min-width:0;font-size:21px}
+}

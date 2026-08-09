@@ -411,6 +411,34 @@ def student_required(fn):
 
 def get_attempt(s,student_id,exam_id): return s.scalar(select(Attempt).where(Attempt.student_id==student_id,Attempt.exam_id==exam_id))
 
+def student_exam_display_title(s, exam):
+    """Return a clean student-facing title and distinguish duplicate Ready Exams as Part 1, Part 2, etc."""
+    raw=(exam.title or '').strip()
+    suffix=' - Ready Exam'
+    if not raw.endswith(suffix):
+        return raw
+    base=raw[:-len(suffix)].strip()
+    siblings=s.scalars(select(Exam).where(Exam.title==raw).order_by(Exam.id.asc())).all()
+    if len(siblings)<=1:
+        return base
+    for idx,row in enumerate(siblings,1):
+        if row.id==exam.id:
+            return f"{base} - Part {idx}"
+    return base
+
+def result_performance(score,total_marks):
+    total=total_marks or 0
+    pct=round(((score or 0)/total)*100) if total else 0
+    if pct>=90:
+        return pct,'Outstanding','outstanding'
+    if pct>=75:
+        return pct,'Very Good','very-good'
+    if pct>=60:
+        return pct,'Good','good'
+    if pct>=40:
+        return pct,'Average','average'
+    return pct,'Poor','poor'
+
 def get_exam_config(s,exam_id,create=False):
     cfg=s.scalar(select(ExamConfig).where(ExamConfig.exam_id==exam_id))
     if not cfg and create:
@@ -758,6 +786,61 @@ def create_exam_from_preloaded_bank(slug):
         s.rollback(); flash(f'Could not create the ready exam: {exc}','error')
         return redirect(url_for('question_bank'))
 
+@app.route('/admin/question-bank/preloaded/<slug>/unit-set/<unit>/<set_code>/quick-exam',methods=['POST'])
+@staff_required
+def create_unit_set_exam_from_preloaded_bank(slug,unit,set_code):
+    pack=load_preloaded_question_banks().get(slug)
+    if not pack: abort(404)
+    set_code=str(set_code or '').upper()
+    unit=str(unit or '').strip()
+    configured=next((p for p in pack.get('paper_sets',[]) if str(p.get('unit'))==unit and str(p.get('set_code','')).upper()==set_code),None)
+    if not configured:
+        abort(404)
+    s=DB()
+    try:
+        added,_=activate_preloaded_pack(s,pack)
+        if added: s.flush()
+        marker=f'preloaded:{slug}'
+        set_marker=f'paper-set-{set_code.lower()}'
+        bank_rows=s.scalars(select(BankQuestion).where(
+            BankQuestion.created_by==marker,
+            BankQuestion.status=='approved',
+            BankQuestion.unit==unit,
+            BankQuestion.tags.contains(set_marker)
+        ).order_by(BankQuestion.id)).all()
+        expected=int(configured.get('question_count') or 0)
+        if expected and len(bank_rows)!=expected:
+            flash(f'Unit {unit} Set {set_code} is incomplete: expected {expected} questions but found {len(bank_rows)}.','error')
+            s.rollback(); return redirect(url_for('question_bank'))
+        if not bank_rows:
+            flash(f'No approved questions were found for Unit {unit} Set {set_code}.','error')
+            s.rollback(); return redirect(url_for('question_bank'))
+        title=f"{pack['subject']} - Unit {unit} - Set {set_code}"
+        duration=max(5,int(configured.get('duration_minutes') or 15))
+        exam=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso())
+        s.add(exam); s.flush()
+        cfg=get_exam_config(s,exam.id,create=True)
+        cfg.subject=pack['subject']; cfg.course_semester=pack.get('course_semester','')
+        cfg.question_count=len(bank_rows); cfg.pool_size=len(bank_rows)
+        easy=sum(1 for x in bank_rows if canonical_difficulty(x.difficulty)=='Easy')
+        medium=sum(1 for x in bank_rows if canonical_difficulty(x.difficulty)=='Medium')
+        hard=sum(1 for x in bank_rows if canonical_difficulty(x.difficulty)=='Hard')
+        total=max(1,len(bank_rows))
+        cfg.easy_pct=round(easy*100/total); cfg.medium_pct=round(medium*100/total); cfg.hard_pct=max(0,100-cfg.easy_pct-cfg.medium_pct)
+        cfg.unit_weights=json.dumps({unit:1},ensure_ascii=False)
+        cfg.randomize_questions=False; cfg.shuffle_options=False; cfg.require_fullscreen=False; cfg.tab_switch_limit=3
+        cfg.last_generation_summary=f"Prepared Unit {unit} Set {set_code}: {len(bank_rows)} fixed syllabus-aligned MCQs."
+        cfg.updated_at=now_iso()
+        for bq in bank_rows:
+            copy_bank_question_to_exam(s,bq,exam.id)
+        audit_event(s,'unit_set_exam_created','exam',exam.id,f'preloaded={slug}, unit={unit}, set={set_code}, questions={len(bank_rows)}')
+        s.commit()
+        flash(f'Created "{title}" with {len(bank_rows)} fixed questions. Review it, then click Activate.')
+        return redirect(url_for('exams'))
+    except Exception as exc:
+        s.rollback(); flash(f'Could not create Unit {unit} Set {set_code}: {exc}','error')
+        return redirect(url_for('question_bank'))
+
 @app.route('/admin/question-bank/import',methods=['POST'])
 @staff_required
 def import_question_bank():
@@ -1055,7 +1138,7 @@ def student_dashboard():
     s=DB();st=s.get(Student,web_session['user_id']);exams_list=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.id.desc())).all();rows=[]
     for e in exams_list:
         pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=get_exam_config(s,e.id);display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
-        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None})())
+        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_exam_display_title(s,e),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None})())
     return render_template('student_dashboard.html',student=st,exams=rows)
 
 @app.route('/student/exam/<int:exam_id>')
@@ -1091,7 +1174,7 @@ def take_exam(exam_id):
         text={'A':q.option_a,'B':q.option_b,'C':q.option_c,'D':q.option_d};display=[(chr(65+i),key,text[key]) for i,key in enumerate(aq.option_order or 'ABCD')]
         views.append(type('QuestionView',(),{'id':q.id,'question':q.question,'display_options':display})())
     saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();answers={a.question_id:a.selected_answer for a in saved}
-    return render_template('exam.html',exam=exam,questions=views,answers=answers,end_epoch=end_dt.timestamp(),cfg=cfg)
+    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),cfg=cfg)
 
 @app.route('/student/save-answer',methods=['POST'])
 @student_required
@@ -1142,7 +1225,8 @@ def submitted(exam_id):
     if not exam or not attempt:abort(404)
     if attempt.status!='submitted' and now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt)
     violations=s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0
-    return render_template('submitted.html',exam=exam,attempt=attempt,violations=violations)
+    percentage,grade,grade_class=result_performance(attempt.score,attempt.total_marks)
+    return render_template('submitted.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,violations=violations,percentage=percentage,grade=grade,grade_class=grade_class)
 
 @app.errorhandler(400)
 def bad_request(e):return render_template('error.html',heading='Invalid or expired request',message=getattr(e,'description','Please refresh the page and try again.')),400
