@@ -31,11 +31,11 @@ Offline mode: Faculty laptop → local exam server → local database → studen
 
 ## New: Ready-made unit-wise engineering question banks
 
-The Question Bank now includes a built-in starter library covering **44 major/common engineering subjects** with **660 prepared MCQs**.
+The Question Bank now includes a built-in starter library covering **44 major/common engineering subjects** with **745 prepared MCQs**.
 
 Each subject pack contains:
 - 5 unit-wise sections
-- 15 questions (3 per unit)
+- 15 starter questions for most subjects; Mobile Application Development includes 100 syllabus-aligned questions (20 per unit) plus two 10-question sets per unit
 - Correct answers
 - Easy / Medium / Hard classification
 - Bloom level

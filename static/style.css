@@ -153,3 +153,26 @@ body.mobile-menu-open{overflow:hidden}
   .result-performance{width:100%;min-width:0;border-left:0;border-top:1px solid var(--border);padding:18px 0 0;align-items:flex-start}
   .result-grade{min-width:0;font-size:21px}
 }
+
+
+/* Student-facing activity monitoring: intentionally neutral; detailed signals remain staff-only. */
+.badge.activity-neutral{background:#eef4ff;border-color:#c9d9ff;color:#315b9a}
+
+/* Faculty/Admin integrity drill-down on Results page. */
+.integrity-details{position:relative;min-width:132px}
+.integrity-details>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.integrity-details>summary::-webkit-details-marker{display:none}
+.integrity-view-label{font-size:12px;font-weight:800;color:var(--primary)}
+.integrity-popover{margin-top:10px;width:310px;max-width:min(82vw,310px);padding:14px 15px;border:1px solid var(--border);border-radius:14px;background:#fff;box-shadow:0 14px 34px rgba(16,24,40,.14);text-align:left}
+.integrity-popover-title{font-size:15px;font-weight:900;color:var(--text);padding-bottom:10px;border-bottom:1px solid var(--border);margin-bottom:4px}
+.integrity-metric-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:8px 0;font-size:13px;color:var(--muted)}
+.integrity-metric-row strong{font-size:15px;color:var(--text)}
+.integrity-metric-row.total{border-top:1px solid var(--border);margin-top:2px;padding-top:10px;font-weight:800}
+.integrity-log-title{margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.integrity-log{margin-top:5px;max-height:180px;overflow:auto}
+.integrity-log-item{display:grid;grid-template-columns:105px 1fr;gap:10px;padding:8px 0;border-bottom:1px solid #eef1f6;font-size:12px}
+.integrity-log-item:last-child{border-bottom:0}
+.integrity-log-time{color:var(--muted);font-size:11px}
+.integrity-log-item strong{display:block;color:var(--text);font-size:12px}
+.integrity-log-item small{display:block;color:var(--muted);margin-top:2px;line-height:1.35}
+@media(max-width:760px){.integrity-popover{width:270px}.integrity-log-item{grid-template-columns:1fr}.integrity-log-time{margin-bottom:-5px}}

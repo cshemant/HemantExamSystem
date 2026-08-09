@@ -5,7 +5,7 @@
     <h2>Your Result</h2>
     <div class="result-score">{{ attempt.score }} / {{ attempt.total_marks }}</div>
     <p class="muted">Submitted: {{ attempt.submitted_at|dt }}</p>
-    {% if violations %}<p style="margin-top:14px"><span class="badge warning">{{ violations }} integrity event(s) recorded</span></p>{% endif %}
+    {% if violations %}<p style="margin-top:14px"><span class="badge activity-neutral">Exam activity monitoring: {{ violations }} event{% if violations != 1 %}s{% endif %} recorded</span></p>{% endif %}
   </div>
   <div class="result-performance">
     <span class="result-grade-label">Performance</span>

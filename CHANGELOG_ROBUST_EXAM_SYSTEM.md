@@ -1,7 +1,7 @@
 
 ## V8 - Preloaded engineering question banks
 - Added **44** ready-made engineering subject banks.
-- Added **660** MCQs organized into **5 units per subject**.
+- Added **745** MCQs organized into **5 units per subject**.
 - Every prepared item includes the correct answer, difficulty, Bloom level and CO mapping.
 - Added one-click **Activate Bank** and category activation.
 - Added **Create Ready Exam**: a 15-question pool is created and each student receives 10 randomized questions.

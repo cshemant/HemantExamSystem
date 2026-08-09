@@ -1,6 +1,6 @@
 # Preloaded Engineering Question Banks
 
-Built-in starter library: **44 subjects · 5 units each · 15 MCQs per subject · 660 MCQs total.**
+Built-in starter library: **44 subjects · 5 units each · 745 MCQs total.** Most subjects contain 15 starter MCQs; **Mobile Application Development contains 100 syllabus-aligned MCQs with two ready 10-question papers for each unit.**
 
 Each activated question is stored as an approved Question Bank item with correct answer, difficulty, Bloom level and CO mapping.
 
@@ -61,3 +61,8 @@ Each activated question is stored as an approved Question Bank item with correct
 - Manufacturing Processes
 - Theory of Machines
 - Thermodynamics
+
+
+## Mobile Application Development prepared unit papers
+
+The Mobile Application Development bank follows the supplied five-unit syllabus and includes **Set A and Set B for every unit (10 MCQs per set)**. Faculty can create any unit paper directly from the Question Bank without manually selecting questions.

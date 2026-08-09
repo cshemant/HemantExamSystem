@@ -1019,9 +1019,33 @@ def result_rows(s,exam_id=None):
     stmt=select(Attempt,Student,Exam).join(Student,Student.id==Attempt.student_id).join(Exam,Exam.id==Attempt.exam_id)
     if exam_id:stmt=stmt.where(Exam.id==exam_id)
     raw=s.execute(stmt.order_by(Attempt.id.desc())).all();rows=[]
-    violation_counts=dict(s.execute(select(IntegrityEvent.attempt_id,func.count(IntegrityEvent.id)).group_by(IntegrityEvent.attempt_id)).all())
+
+    # Load integrity activity once so the Results page can show a useful breakdown
+    # without exposing those details on the student's result screen.
+    integrity_by_attempt={}
+    for ev in s.scalars(select(IntegrityEvent).order_by(IntegrityEvent.created_at,IntegrityEvent.id)).all():
+        integrity_by_attempt.setdefault(ev.attempt_id,[]).append(ev)
+
     for a,st,e in raw:
-        rows.append(type('ResultRow',(),{'attempt_id':a.id,'roll_no':st.roll_no,'name':st.name,'title':e.title,'exam_id':e.id,'status':a.status,'score':a.score,'total_marks':a.total_marks,'started_at':a.started_at,'submitted_at':a.submitted_at,'violations':violation_counts.get(a.id,0)})())
+        events=integrity_by_attempt.get(a.id,[])
+        tab_switches=sum(1 for ev in events if ev.event_type=='tab_hidden')
+        fullscreen_exits=sum(1 for ev in events if ev.event_type=='fullscreen_exit')
+        rows.append(type('ResultRow',(),{
+            'attempt_id':a.id,
+            'roll_no':st.roll_no,
+            'name':st.name,
+            'title':e.title,
+            'exam_id':e.id,
+            'status':a.status,
+            'score':a.score,
+            'total_marks':a.total_marks,
+            'started_at':a.started_at,
+            'submitted_at':a.submitted_at,
+            'violations':len(events),
+            'tab_switches':tab_switches,
+            'fullscreen_exits':fullscreen_exits,
+            'integrity_events':events,
+        })())
     return rows
 
 @app.route('/admin/results')
@@ -1032,8 +1056,8 @@ def results():
 @app.route('/admin/results/export/<fmt>')
 @staff_required
 def export_results(fmt):
-    s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);headers=['roll_no','name','exam','status','score','total_marks','integrity_events','started','submitted']
-    matrix=[[r.roll_no,r.name,r.title,r.status,r.score if r.score is not None else '',r.total_marks if r.total_marks is not None else '',r.violations,r.started_at,r.submitted_at or ''] for r in rows]
+    s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);headers=['roll_no','name','exam','status','score','total_marks','tab_switches','fullscreen_exits','total_integrity_events','started','submitted']
+    matrix=[[r.roll_no,r.name,r.title,r.status,r.score if r.score is not None else '',r.total_marks if r.total_marks is not None else '',r.tab_switches,r.fullscreen_exits,r.violations,r.started_at,r.submitted_at or ''] for r in rows]
     suffix=f'_exam_{exam_id}' if exam_id else '_all'
     if fmt=='csv':
         out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'exam_results{suffix}.csv')
@@ -1041,7 +1065,7 @@ def export_results(fmt):
         wb=Workbook();ws=wb.active;ws.title='Results';ws.append(headers)
         for row in matrix:ws.append(row)
         for cell in ws[1]:cell.font=Font(bold=True)
-        widths=[16,28,30,14,10,12,16,24,24]
+        widths=[16,28,30,14,10,12,14,16,20,24,24]
         for idx,width in enumerate(widths,1):ws.column_dimensions[chr(64+idx)].width=width
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'exam_results{suffix}.xlsx')
     abort(404)

@@ -6,7 +6,7 @@
     <div>
       <div class="eyebrow">Ready-made academic library</div>
       <h2>Preloaded Unit-wise Subject Banks</h2>
-      <p class="muted">Activate a ready-made bank, then create an exam immediately. The starter library contains {{ preloaded_packs|length }} major engineering subjects, each organized into 5 units with answers, difficulty, Bloom level and CO mapping.</p>
+      <p class="muted">Activate a ready-made bank, then create an exam immediately. The starter library contains {{ preloaded_packs|length }} major engineering subjects organized into 5 units with answers, difficulty, Bloom level and CO mapping. Mobile Application Development additionally includes two ready paper sets for every unit.</p>
       <p class="mini-note">These are general engineering starter questions. Faculty should review them against the university's exact syllabus before using them for a high-stakes examination.</p>
       <div class="actions template-actions preloaded-downloads">
         <a class="btn secondary small" href="{{ url_for('export_preloaded_question_banks',fmt='csv') }}">Download Master CSV</a>
@@ -44,6 +44,22 @@
             <div class="unit-list">
               {% for u in pack.units %}<span><strong>U{{ u.unit }}</strong> {{ u.title }} ({{ u.question_count }})</span>{% endfor %}
             </div>
+            {% if pack.paper_sets %}
+            <div class="unit-paper-sets">
+              <strong>Prepared unit papers</strong>
+              {% for u in pack.units %}
+              <div class="unit-paper-row">
+                <span>Unit {{ u.unit }}</span>
+                {% for ps in pack.paper_sets if ps.unit == u.unit %}
+                <form method="post" action="{{ url_for('create_unit_set_exam_from_preloaded_bank',slug=pack.slug,unit=ps.unit,set_code=ps.set_code) }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button class="btn secondary tiny">Set {{ ps.set_code }} · {{ ps.question_count }} Q</button>
+                </form>
+                {% endfor %}
+              </div>
+              {% endfor %}
+            </div>
+            {% endif %}
           </details>
         </td>
         <td>{{ pack.question_count }}</td>
