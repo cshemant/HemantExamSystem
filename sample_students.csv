@@ -1,2 +1,4 @@
-﻿roll_no,name,password
-2026001,Sample Student,Exam@123
+roll_no,name,password,department,program,semester,section,academic_year
+CSE26001,Aarav Sharma,Exam@26001,CSE,B.Tech CSE,5,A,2026-27
+CSE26002,Ananya Verma,Exam@26002,CSE,B.Tech CSE,5,A,2026-27
+CSE26003,Rohan Mehta,Exam@26003,CSE,B.Tech CSE,5,B,2026-27

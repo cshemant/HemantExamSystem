@@ -1,20 +1,9 @@
 {% extends 'base.html' %}{% block content %}
-<section class="login-shell"><div class="container setup-shell">
-  <div class="setup-card">
-    <div class="eyebrow">Offline V{{ app_version }} · First-time setup</div>
-    <h1>Create the faculty administrator</h1>
-    <p class="muted setup-copy">This account controls students, exams, questions and results on this computer. No default administrator password is included in the offline package.</p>
-    <form method="post">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <label>Administrator Username</label>
-      <input name="username" autocomplete="username" minlength="3" required>
-      <label>Password</label>
-      <input name="password" type="password" autocomplete="new-password" minlength="10" required>
-      <label>Confirm Password</label>
-      <input name="confirm_password" type="password" autocomplete="new-password" minlength="10" required>
-      <button>Create Administrator</button>
-    </form>
-    <p class="setup-note">Use a strong password and store it securely. Student passwords are also stored only as secure password hashes.</p>
-  </div>
-</div></section>
-{% endblock %}
+<section class="login-shell"><div class="container setup-shell"><div class="setup-card setup-wide">
+  <div class="eyebrow">Offline V{{ app_version }} · Institution setup</div><h1>Configure your examination centre</h1><p class="muted setup-copy">Set institutional branding and create the first Super Admin. These settings can be changed later from System.</p>
+  <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <h3>Institution</h3><div class="grid"><div><label>Institution / University Name</label><input name="institution_name" placeholder="XYZ University" required></div><div><label>Short Name</label><input name="short_name" placeholder="XYZ University"></div><div><label>System Name</label><input name="system_name" value="Examination Management System"></div><div><label>Department</label><input name="department" placeholder="Computer Science & Engineering"></div><div><label>Academic Year</label><input name="academic_year" placeholder="2026-27"></div><div><label>Exam Controller</label><input name="exam_controller" placeholder="Name / designation"></div><div><label>Admin Email</label><input name="admin_email" type="email"></div></div>
+    <h3>Super Admin</h3><div class="grid"><div><label>Administrator Username</label><input name="username" autocomplete="username" minlength="3" required></div><div><label>Password</label><input name="password" type="password" autocomplete="new-password" minlength="10" required></div><div><label>Confirm Password</label><input name="confirm_password" type="password" autocomplete="new-password" minlength="10" required></div></div>
+    <button>Create Institution & Super Admin</button>
+  </form><p class="setup-note">Passwords are stored as secure hashes. Use a strong administrator password and keep it in an institution-controlled password manager.</p>
+</div></div></section>{% endblock %}

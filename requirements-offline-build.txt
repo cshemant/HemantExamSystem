@@ -1,5 +1,5 @@
 -r requirements.txt
 waitress>=3.0,<4
-nuitka>=4.0,<5
+nuitka>=2.7,<3
 ordered-set>=4.1,<5
 zstandard>=0.23,<1

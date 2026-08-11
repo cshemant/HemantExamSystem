@@ -98,3 +98,14 @@ function initMobileMenu(){
   if(panel) panel.addEventListener('click',event=>event.stopPropagation());
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initMobileMenu); else initMobileMenu();
+
+function initCopyButtons(){
+  document.querySelectorAll('[data-copy-target]').forEach(btn=>{
+    btn.addEventListener('click',async()=>{
+      const target=document.getElementById(btn.getAttribute('data-copy-target'));
+      if(!target)return;
+      try{await navigator.clipboard.writeText((target.textContent||'').trim());const old=btn.textContent;btn.textContent='Copied';setTimeout(()=>btn.textContent=old,1200);}catch(_err){}
+    });
+  });
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initCopyButtons); else initCopyButtons();

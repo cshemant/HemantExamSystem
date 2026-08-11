@@ -101,3 +101,6 @@ In offline mode, **System → Download Backup** creates a consistent `.db` snaps
 
 ## Presentation
 See `HOD_PRESENTATION_GUIDE.md` for the recommended live demonstration and likely HOD questions.
+
+## Institution-ready deployment layer (V14 package)
+This package adds configurable institution branding, staff roles, batch/section management, exam approval, scheduled batch assignments, LAN QR access, institutional analytics, encrypted backup/restore and an installer/signing-ready Windows release workflow. See `INSTITUTION_DEPLOYMENT_GUIDE.md`, `SECURITY_PRIVACY_OVERVIEW.md` and `PILOT_PROPOSAL.md`.

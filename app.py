@@ -1,4 +1,4 @@
-import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil
+import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time
 from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
@@ -8,11 +8,15 @@ from flask import Flask, render_template, request, redirect, url_for, session as
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
-from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, UniqueConstraint, select, func, or_, delete
+from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, UniqueConstraint, Text, select, func, or_, delete
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, scoped_session, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font
+import qrcode
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
@@ -27,6 +31,8 @@ DEFAULT_OFFLINE_DOWNLOAD_URL=(
 )
 OFFLINE_DOWNLOAD_URL=os.getenv('OFFLINE_DOWNLOAD_URL',DEFAULT_OFFLINE_DOWNLOAD_URL).strip() or DEFAULT_OFFLINE_DOWNLOAD_URL
 OFFLINE_REQUIRE_SETUP=os.getenv('OFFLINE_REQUIRE_SETUP','0').strip().lower() in {'1','true','yes','on'}
+SESSION_TIMEOUT_MINUTES=max(10,int(os.getenv('SESSION_TIMEOUT_MINUTES','45')))
+BACKUP_KDF_ITERATIONS=max(100000,int(os.getenv('BACKUP_KDF_ITERATIONS','390000')))
 
 APP_MODE=os.getenv('APP_MODE','offline').strip().lower()
 if APP_MODE not in {'offline','online'}: raise RuntimeError('APP_MODE must be offline or online')
@@ -222,6 +228,72 @@ class AuditLog(Base):
     details:Mapped[str]=mapped_column(String,nullable=False,default='')
     created_at:Mapped[str]=mapped_column(String,nullable=False)
 
+class InstitutionProfile(Base):
+    __tablename__='institution_profile'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    institution_name:Mapped[str]=mapped_column(String,nullable=False,default='Learn with Hemant')
+    short_name:Mapped[str]=mapped_column(String,nullable=False,default='Learn with Hemant')
+    system_name:Mapped[str]=mapped_column(String,nullable=False,default='Exam System')
+    department:Mapped[str]=mapped_column(String,nullable=False,default='')
+    academic_year:Mapped[str]=mapped_column(String,nullable=False,default='')
+    admin_email:Mapped[str]=mapped_column(String,nullable=False,default='')
+    exam_controller:Mapped[str]=mapped_column(String,nullable=False,default='')
+    contact_phone:Mapped[str]=mapped_column(String,nullable=False,default='')
+    logo_data:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    updated_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class FacultyRole(Base):
+    __tablename__='faculty_roles'
+    __table_args__=(UniqueConstraint('faculty_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    faculty_id:Mapped[int]=mapped_column(ForeignKey('faculty_users.id'),nullable=False)
+    role:Mapped[str]=mapped_column(String,nullable=False,default='faculty')
+    department:Mapped[str]=mapped_column(String,nullable=False,default='')
+    updated_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class AcademicGroup(Base):
+    __tablename__='academic_groups'
+    __table_args__=(UniqueConstraint('department','program','semester','section','academic_year'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    department:Mapped[str]=mapped_column(String,nullable=False,default='')
+    program:Mapped[str]=mapped_column(String,nullable=False)
+    semester:Mapped[str]=mapped_column(String,nullable=False)
+    section:Mapped[str]=mapped_column(String,nullable=False)
+    academic_year:Mapped[str]=mapped_column(String,nullable=False,default='')
+    is_active:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class StudentGroup(Base):
+    __tablename__='student_groups'
+    __table_args__=(UniqueConstraint('student_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    group_id:Mapped[int]=mapped_column(ForeignKey('academic_groups.id'),nullable=False)
+    assigned_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class ExamSession(Base):
+    __tablename__='exam_sessions'
+    __table_args__=(UniqueConstraint('exam_id','group_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    group_id:Mapped[int]=mapped_column(ForeignKey('academic_groups.id'),nullable=False)
+    scheduled_start:Mapped[str]=mapped_column(String,nullable=False,default='')
+    scheduled_end:Mapped[str]=mapped_column(String,nullable=False,default='')
+    venue:Mapped[str]=mapped_column(String,nullable=False,default='')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class ExamApproval(Base):
+    __tablename__='exam_approvals'
+    __table_args__=(UniqueConstraint('exam_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    status:Mapped[str]=mapped_column(String,nullable=False,default='draft')
+    requested_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    requested_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    reviewed_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    reviewed_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    comments:Mapped[str]=mapped_column(String,nullable=False,default='')
+
 
 def now_dt(): return datetime.now().astimezone()
 def now_iso(): return now_dt().isoformat(timespec='seconds')
@@ -241,6 +313,123 @@ def actor_label(s=None):
 
 def audit_event(s,action,entity_type='',entity_id='',details=''):
     s.add(AuditLog(actor=actor_label(s),action=action,entity_type=str(entity_type or ''),entity_id=str(entity_id or ''),details=str(details or '')[:1500],created_at=now_iso()))
+
+ROLE_LABELS={'super_admin':'Super Admin','exam_controller':'Exam Controller','hod':'HOD','faculty':'Faculty'}
+APPROVER_ROLES={'super_admin','exam_controller','hod'}
+
+
+def get_institution(s=None,create=True):
+    s=s or DB()
+    row=s.scalar(select(InstitutionProfile).order_by(InstitutionProfile.id.asc()))
+    if not row and create:
+        row=InstitutionProfile(institution_name='Learn with Hemant',short_name='Learn with Hemant',system_name='Exam System',department='',academic_year='',admin_email='',exam_controller='',contact_phone='',logo_data='',updated_at=now_iso())
+        s.add(row);s.flush()
+    return row
+
+
+def current_staff_role(s=None):
+    if web_session.get('role')=='admin': return 'super_admin'
+    if web_session.get('role')!='faculty': return web_session.get('role','')
+    s=s or DB(); uid=web_session.get('user_id')
+    row=s.scalar(select(FacultyRole).where(FacultyRole.faculty_id==uid)) if uid else None
+    return row.role if row and row.role in ROLE_LABELS else 'faculty'
+
+
+def can_approve_exams(s=None): return current_staff_role(s) in APPROVER_ROLES
+
+def can_approve_content(s=None): return current_staff_role(s) in APPROVER_ROLES
+
+
+def get_exam_approval(s,exam_id,create=True):
+    row=s.scalar(select(ExamApproval).where(ExamApproval.exam_id==exam_id))
+    if not row and create:
+        row=ExamApproval(exam_id=exam_id,status='draft',requested_by='',requested_at='',reviewed_by='',reviewed_at='',comments='')
+        s.add(row);s.flush()
+    return row
+
+
+def group_label(group):
+    if not group:return 'Unassigned'
+    bits=[group.program]
+    if group.semester:bits.append(f'Sem {group.semester}')
+    if group.section:bits.append(f'Section {group.section}')
+    label=' · '.join(bits)
+    return f'{label} ({group.academic_year})' if group.academic_year else label
+
+
+def student_group(s,student_id):
+    return s.execute(select(AcademicGroup).join(StudentGroup,StudentGroup.group_id==AcademicGroup.id).where(StudentGroup.student_id==student_id)).scalar_one_or_none()
+
+
+def find_or_create_group(s,department,program,semester,section,academic_year):
+    department=(department or '').strip();program=(program or '').strip();semester=(semester or '').strip();section=(section or '').strip();academic_year=(academic_year or '').strip()
+    if not program or not semester or not section:return None
+    row=s.scalar(select(AcademicGroup).where(AcademicGroup.department==department,AcademicGroup.program==program,AcademicGroup.semester==semester,AcademicGroup.section==section,AcademicGroup.academic_year==academic_year))
+    if not row:
+        row=AcademicGroup(department=department,program=program,semester=semester,section=section,academic_year=academic_year,is_active=True,created_at=now_iso());s.add(row);s.flush()
+    return row
+
+
+def assign_student_group(s,student_id,group_id):
+    row=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student_id))
+    if group_id:
+        if row:row.group_id=group_id;row.assigned_at=now_iso()
+        else:s.add(StudentGroup(student_id=student_id,group_id=group_id,assigned_at=now_iso()))
+    elif row:s.delete(row)
+
+
+def parse_local_schedule(value):
+    value=(value or '').strip()
+    if not value:return ''
+    try:return datetime.fromisoformat(value).strftime('%Y-%m-%dT%H:%M:%S')
+    except ValueError:raise ValueError('Schedule date/time is invalid.')
+
+
+def exam_access_for_student(s,student_id,exam):
+    sessions=s.scalars(select(ExamSession).where(ExamSession.exam_id==exam.id)).all()
+    if not sessions:return True,'Available',None
+    membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student_id))
+    if not membership:return False,'Not assigned to your batch/section',None
+    matched=next((x for x in sessions if x.group_id==membership.group_id),None)
+    if not matched:return False,'Not assigned to your batch/section',None
+    now=datetime.now()
+    if matched.scheduled_start:
+        start=datetime.fromisoformat(matched.scheduled_start)
+        if now<start:return False,f'Scheduled for {start.strftime("%d %b, %I:%M %p")}',matched
+    if matched.scheduled_end:
+        end=datetime.fromisoformat(matched.scheduled_end)
+        if now>end:return False,'Exam window closed',matched
+    return True,'Available',matched
+
+
+def local_lan_ip():
+    try:
+        sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);sock.connect(('8.8.8.8',80));ip=sock.getsockname()[0];sock.close();return ip
+    except Exception:
+        try:return socket.gethostbyname(socket.gethostname())
+        except Exception:return 'SERVER-IP'
+
+
+def qr_data_uri(text):
+    img=qrcode.make(text);buf=io.BytesIO();img.save(buf,format='PNG')
+    return 'data:image/png;base64,'+base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def backup_key(password,salt):
+    kdf=PBKDF2HMAC(algorithm=hashes.SHA256(),length=32,salt=salt,iterations=BACKUP_KDF_ITERATIONS)
+    return base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8')))
+
+
+def encrypt_backup_bytes(raw,password):
+    salt=os.urandom(16);token=Fernet(backup_key(password,salt)).encrypt(raw)
+    return b'LWHBK1'+salt+token
+
+
+def decrypt_backup_bytes(raw,password):
+    if not raw.startswith(b'LWHBK1') or len(raw)<23:raise ValueError('This is not a valid encrypted Learn with Hemant backup.')
+    salt=raw[6:22]
+    try:return Fernet(backup_key(password,salt)).decrypt(raw[22:])
+    except InvalidToken as exc:raise ValueError('Backup password is incorrect or the backup is damaged.') from exc
 
 PRELOADED_BANK_FILE=RESOURCE_DIR/'preloaded_question_banks.json'
 _PRELOADED_BANK_CACHE=None
@@ -316,6 +505,7 @@ def init_db():
                 s.add(Admin(username=admin_username,password_hash=generate_password_hash(admin_password)))
             elif admin_password and not check_password_hash(admin.password_hash,admin_password):
                 admin.password_hash=generate_password_hash(admin_password)
+            get_institution(s,create=True)
             s.commit()
     except IntegrityError:
         s.rollback()
@@ -333,6 +523,13 @@ def cleanup(_exc=None): DB.remove()
 
 @app.before_request
 def csrf_and_session_setup():
+    now_ts=int(time.time())
+    if web_session.get('role'):
+        last=int(web_session.get('_last_activity',now_ts))
+        if now_ts-last>SESSION_TIMEOUT_MINUTES*60:
+            web_session.clear();web_session['_csrf_token']=secrets.token_urlsafe(32);flash('Your session expired after inactivity. Please sign in again.','error')
+            if request.endpoint not in {'home','static','health'}:return redirect(url_for('home'))
+        else:web_session['_last_activity']=now_ts
     if '_csrf_token' not in web_session: web_session['_csrf_token']=secrets.token_urlsafe(32)
     if request.method in {'POST','PUT','PATCH','DELETE'}:
         supplied=request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
@@ -341,7 +538,11 @@ def csrf_and_session_setup():
 
 @app.context_processor
 def globals_for_templates():
-    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'is_online':APP_MODE=='online','app_version':APP_VERSION}
+    try:
+        s=DB();institution=get_institution(s,create=True);staff_role=current_staff_role(s) if web_session.get('role') in {'admin','faculty'} else web_session.get('role','')
+    except Exception:
+        institution=None;staff_role=web_session.get('role','')
+    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'is_online':APP_MODE=='online','app_version':APP_VERSION,'institution':institution,'staff_role':staff_role,'staff_role_label':ROLE_LABELS.get(staff_role,staff_role.replace('_',' ').title() if staff_role else '')}
 
 @app.before_request
 def offline_first_run_guard():
@@ -370,14 +571,18 @@ def setup_admin():
         else:
             s=DB()
             try:
-                s.add(Admin(username=username,password_hash=generate_password_hash(password))); s.commit(); flash('Administrator account created. You can now sign in.'); return redirect(url_for('home'))
+                inst=get_institution(s,create=True)
+                inst.institution_name=request.form.get('institution_name','').strip() or 'Learn with Hemant'
+                inst.short_name=request.form.get('short_name','').strip() or inst.institution_name
+                inst.system_name=request.form.get('system_name','').strip() or 'Examination Management System'
+                inst.department=request.form.get('department','').strip();inst.academic_year=request.form.get('academic_year','').strip();inst.admin_email=request.form.get('admin_email','').strip();inst.exam_controller=request.form.get('exam_controller','').strip();inst.updated_at=now_iso()
+                s.add(Admin(username=username,password_hash=generate_password_hash(password))); s.commit(); flash('Institution and administrator account created. You can now sign in.'); return redirect(url_for('home'))
             except IntegrityError:
                 s.rollback(); flash('That administrator username is already in use.','error')
     return render_template('setup.html',login_page=True)
 
 @app.route('/download/offline')
 def offline_download():
-    if APP_MODE!='online': return redirect(url_for('home'))
     parsed=urlparse(OFFLINE_DOWNLOAD_URL)
     if parsed.scheme not in {'https','http'} or not parsed.netloc: abort(503,'Offline download is temporarily unavailable.')
     return redirect(OFFLINE_DOWNLOAD_URL,code=302)
@@ -406,6 +611,14 @@ def student_required(fn):
     @wraps(fn)
     def inner(*a,**kw):
         if web_session.get('role')!='student': return redirect(url_for('home'))
+        return fn(*a,**kw)
+    return inner
+
+def approver_required(fn):
+    @wraps(fn)
+    def inner(*a,**kw):
+        if web_session.get('role') not in {'admin','faculty'}:return redirect(url_for('home'))
+        if not can_approve_exams(DB()):abort(403)
         return fn(*a,**kw)
     return inner
 
@@ -574,12 +787,12 @@ def home():
             if not row:
                 row=s.scalar(select(Faculty).where(Faculty.username==username,Faculty.is_active==True)); role='faculty'
             if row and check_password_hash(row.password_hash,password):
-                csrf=web_session.get('_csrf_token'); web_session.clear(); web_session['_csrf_token']=csrf; web_session.update(role=role,user_id=row.id,username=row.username)
+                csrf=web_session.get('_csrf_token'); web_session.clear(); web_session['_csrf_token']=csrf; web_session.update(role=role,user_id=row.id,username=row.username,_last_activity=int(time.time()))
                 audit_event(s,'staff_login','user',row.id,role); s.commit(); return redirect(url_for('admin_dashboard'))
         else:
             row=s.scalar(select(Student).where(Student.roll_no==request.form.get('roll_no','').strip()))
             if row and check_password_hash(row.password_hash,request.form.get('password','')):
-                csrf=web_session.get('_csrf_token'); web_session.clear(); web_session['_csrf_token']=csrf; web_session.update(role='student',user_id=row.id,username=row.roll_no); return redirect(url_for('student_dashboard'))
+                csrf=web_session.get('_csrf_token'); web_session.clear(); web_session['_csrf_token']=csrf; web_session.update(role='student',user_id=row.id,username=row.roll_no,_last_activity=int(time.time())); return redirect(url_for('student_dashboard'))
         flash('Invalid login credentials.','error')
     return render_template('login.html',login_page=True)
 
@@ -614,9 +827,13 @@ def students():
         if not roll or not name or not pw: flash('All student fields are required.','error')
         else:
             try:
-                st=Student(roll_no=roll,name=name,password_hash=generate_password_hash(pw),created_at=now_iso()); s.add(st); s.flush(); audit_event(s,'student_created','student',st.id,roll); s.commit(); flash('Student added.')
+                st=Student(roll_no=roll,name=name,password_hash=generate_password_hash(pw),created_at=now_iso()); s.add(st); s.flush();
+                try:group_id=int(request.form.get('group_id','0') or 0)
+                except ValueError:group_id=0
+                if group_id and s.get(AcademicGroup,group_id):assign_student_group(s,st.id,group_id)
+                audit_event(s,'student_created','student',st.id,roll); s.commit(); flash('Student added.')
             except IntegrityError:s.rollback();flash('Roll number already exists.','error')
-    rows=s.scalars(select(Student).order_by(Student.roll_no)).all(); return render_template('students.html',students=rows)
+    rows=s.scalars(select(Student).order_by(Student.roll_no)).all();groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();membership=dict(s.execute(select(StudentGroup.student_id,StudentGroup.group_id)).all());group_map={g.id:g for g in groups};return render_template('students.html',students=rows,groups=groups,membership=membership,group_map=group_map,group_label=group_label)
 
 @app.route('/admin/students/import',methods=['POST'])
 @staff_required
@@ -632,7 +849,10 @@ def import_students():
         roll=row.get('roll_no','').strip(); name=row.get('name','').strip(); password=row.get('password','')
         if not roll or not name or not password: invalid+=1; continue
         if roll in existing or roll in seen: duplicates+=1; continue
-        s.add(Student(roll_no=roll,name=name,password_hash=generate_password_hash(password),created_at=now_iso())); seen.add(roll); added+=1
+        st=Student(roll_no=roll,name=name,password_hash=generate_password_hash(password),created_at=now_iso());s.add(st);s.flush()
+        group=find_or_create_group(s,row.get('department',''),row.get('program',''),row.get('semester',''),row.get('section',''),row.get('academic_year',''))
+        if group:assign_student_group(s,st.id,group.id)
+        seen.add(roll); added+=1
     try:
         audit_event(s,'students_bulk_import','student','',f'added={added}, duplicates={duplicates}, invalid={invalid}'); s.commit()
     except IntegrityError:s.rollback();flash('Import could not be completed because one or more roll numbers conflict with existing students.','error');return redirect(url_for('students'))
@@ -644,7 +864,7 @@ def import_students():
 @app.route('/admin/students/template/<fmt>')
 @staff_required
 def student_import_template(fmt):
-    headers=['roll_no','name','password']
+    headers=['roll_no','name','password','department','program','semester','section','academic_year']
     if fmt=='csv':
         out=io.StringIO(newline=''); writer=csv.writer(out); writer.writerow(headers); data=io.BytesIO(out.getvalue().encode('utf-8-sig')); return send_file(data,mimetype='text/csv',as_attachment=True,download_name='student_import_template.csv')
     if fmt=='xlsx':
@@ -653,6 +873,34 @@ def student_import_template(fmt):
         ws.column_dimensions['A'].width=18;ws.column_dimensions['B'].width=28;ws.column_dimensions['C'].width=22
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name='student_import_template.xlsx')
     abort(404)
+
+
+@app.route('/admin/groups',methods=['GET','POST'])
+@staff_required
+def academic_groups():
+    s=DB()
+    if request.method=='POST':
+        action=request.form.get('action','create')
+        if action=='create':
+            group=find_or_create_group(s,request.form.get('department',''),request.form.get('program',''),request.form.get('semester',''),request.form.get('section',''),request.form.get('academic_year',''))
+            if not group:flash('Program, semester and section are required.','error')
+            else:audit_event(s,'academic_group_created','group',group.id,group_label(group));s.commit();flash('Batch / section created.')
+        elif action=='assign':
+            try:student_id=int(request.form.get('student_id','0'));group_id=int(request.form.get('group_id','0'))
+            except ValueError:student_id=group_id=0
+            if s.get(Student,student_id) and s.get(AcademicGroup,group_id):assign_student_group(s,student_id,group_id);audit_event(s,'student_group_assigned','student',student_id,f'group={group_id}');s.commit();flash('Student batch / section updated.')
+        return redirect(url_for('academic_groups'))
+    groups=s.scalars(select(AcademicGroup).order_by(AcademicGroup.academic_year.desc(),AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all()
+    counts=dict(s.execute(select(StudentGroup.group_id,func.count()).group_by(StudentGroup.group_id)).all())
+    students_list=s.scalars(select(Student).order_by(Student.roll_no)).all();memberships=dict(s.execute(select(StudentGroup.student_id,StudentGroup.group_id)).all())
+    return render_template('groups.html',groups=groups,counts=counts,students=students_list,memberships=memberships,group_label=group_label)
+
+@app.route('/admin/groups/<int:group_id>/toggle',methods=['POST'])
+@staff_required
+def toggle_group(group_id):
+    s=DB();row=s.get(AcademicGroup,group_id)
+    if row:row.is_active=not row.is_active;audit_event(s,'academic_group_enabled' if row.is_active else 'academic_group_disabled','group',row.id,group_label(row));s.commit()
+    return redirect(url_for('academic_groups'))
 
 @app.route('/admin/question-bank',methods=['GET','POST'])
 @staff_required
@@ -665,7 +913,7 @@ def question_bank():
         else:
             try: marks=max(1,int(request.form.get('marks','1')))
             except ValueError: marks=1
-            status='approved' if web_session.get('role')=='admin' and request.form.get('status')=='approved' else 'draft'
+            status='approved' if can_approve_content(s) and request.form.get('status')=='approved' else 'draft'
             bq=BankQuestion(
                 subject=request.form.get('subject','General').strip() or 'General',course_semester=request.form.get('course_semester','').strip(),unit=request.form.get('unit','').strip(),topic=request.form.get('topic','').strip(),question_type='MCQ',question=question,
                 option_a=request.form.get('option_a','').strip(),option_b=request.form.get('option_b','').strip(),option_c=request.form.get('option_c','').strip(),option_d=request.form.get('option_d','').strip(),correct_answer=ans,marks=marks,
@@ -856,7 +1104,7 @@ def import_question_bank():
         if not question or ans not in {'A','B','C','D'}: invalid+=1;continue
         try:marks=max(1,int(r.get('marks') or 1))
         except ValueError:marks=1
-        requested_status=(r.get('status') or 'draft').lower(); status='approved' if web_session.get('role')=='admin' and requested_status=='approved' else 'draft'
+        requested_status=(r.get('status') or 'draft').lower(); status='approved' if can_approve_content(s) and requested_status=='approved' else 'draft'
         s.add(BankQuestion(subject=(r.get('subject') or 'General').strip() or 'General',course_semester=(r.get('course_semester') or '').strip(),unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type='MCQ',question=question,option_a=(r.get('option_a') or '').strip(),option_b=(r.get('option_b') or '').strip(),option_c=(r.get('option_c') or '').strip(),option_d=(r.get('option_d') or '').strip(),correct_answer=ans,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso()));added+=1
     audit_event(s,'question_bank_bulk_import','bank_question','',f'added={added}, invalid={invalid}');s.commit();flash(f'Imported {added} question(s).'+(f' Skipped {invalid} invalid row(s).' if invalid else ''));return redirect(url_for('question_bank'))
 
@@ -887,13 +1135,13 @@ def edit_bank_question(question_id):
         try:q.marks=max(1,int(request.form.get('marks','1')))
         except ValueError:q.marks=1
         q.difficulty=canonical_difficulty(request.form.get('difficulty'));q.bloom_level=canonical_bloom(request.form.get('bloom_level'));q.co_mapping=request.form.get('co_mapping','').strip();q.tags=request.form.get('tags','').strip();q.version+=1;q.updated_at=now_iso()
-        if web_session.get('role')=='admin':q.status=request.form.get('status','draft') if request.form.get('status') in {'draft','approved'} else 'draft'
+        if can_approve_content(s):q.status=request.form.get('status','draft') if request.form.get('status') in {'draft','approved'} else 'draft'
         else:q.status='draft'
         audit_event(s,'bank_question_edited','bank_question',q.id,f'version={q.version}, status={q.status}');s.commit();flash('Question updated. Previous version was preserved.');return redirect(url_for('edit_bank_question',question_id=q.id))
     return render_template('question_bank_edit.html',question=q,revisions=revisions)
 
 @app.route('/admin/question-bank/<int:question_id>/approve',methods=['POST'])
-@admin_required
+@approver_required
 def approve_bank_question(question_id):
     s=DB();q=s.get(BankQuestion,question_id)
     if not q:abort(404)
@@ -924,11 +1172,11 @@ def exams():
         except ValueError:duration=30
         title=request.form.get('title','').strip()
         if title:
-            e=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(e);s.flush();get_exam_config(s,e.id,create=True);audit_event(s,'exam_created','exam',e.id,title);s.commit();flash('Exam created.')
+            e=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(e);s.flush();get_exam_config(s,e.id,create=True);get_exam_approval(s,e.id,create=True);audit_event(s,'exam_created','exam',e.id,title);s.commit();flash('Exam created as draft.')
     raw=s.execute(select(Exam,func.count(Question.id)).outerjoin(Question,Question.exam_id==Exam.id).group_by(Exam.id).order_by(Exam.id.desc())).all();rows=[]
     for e,count in raw:
         cfg=get_exam_config(s,e.id);target=(cfg.question_count if cfg and cfg.question_count else count)
-        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0})())
+        approval=get_exam_approval(s,e.id,create=True);session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.exam_id==e.id)) or 0;rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count})())
     return render_template('exams.html',exams=rows)
 
 @app.route('/admin/exam/<int:exam_id>/toggle',methods=['POST'])
@@ -937,8 +1185,55 @@ def toggle_exam(exam_id):
     s=DB();e=s.get(Exam,exam_id)
     if e:
         if not e.is_active and (s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0)==0:flash('Add questions before activating this exam.','error');return redirect(url_for('exams'))
+        if not e.is_active:
+            approval=get_exam_approval(s,exam_id,create=True)
+            if approval.status!='approved':
+                if can_approve_exams(s):
+                    approval.status='approved';approval.reviewed_by=actor_label(s);approval.reviewed_at=now_iso();approval.comments='Approved during activation';audit_event(s,'exam_approved','exam',e.id,'approved during activation')
+                else:
+                    flash('This exam requires HOD / Exam Controller approval before activation. Use Request Approval first.','error');return redirect(url_for('exams'))
         e.is_active=not bool(e.is_active);audit_event(s,'exam_activated' if e.is_active else 'exam_deactivated','exam',e.id,e.title);s.commit()
     return redirect(url_for('exams'))
+
+
+@app.route('/admin/exam/<int:exam_id>/approval/request',methods=['POST'])
+@staff_required
+def request_exam_approval(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    row=get_exam_approval(s,exam_id,create=True);row.status='pending';row.requested_by=actor_label(s);row.requested_at=now_iso();row.comments=request.form.get('comments','').strip()[:500];row.reviewed_by='';row.reviewed_at='';audit_event(s,'exam_approval_requested','exam',exam_id,row.comments);s.commit();flash('Exam sent for HOD / Exam Controller approval.');return redirect(request.referrer or url_for('exams'))
+
+@app.route('/admin/exam/<int:exam_id>/approval/<decision>',methods=['POST'])
+@approver_required
+def review_exam_approval(exam_id,decision):
+    if decision not in {'approve','reject'}:abort(404)
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    row=get_exam_approval(s,exam_id,create=True);row.status='approved' if decision=='approve' else 'rejected';row.reviewed_by=actor_label(s);row.reviewed_at=now_iso();row.comments=request.form.get('comments','').strip()[:500];audit_event(s,'exam_approved' if decision=='approve' else 'exam_rejected','exam',exam_id,row.comments);s.commit();flash('Exam approved.' if decision=='approve' else 'Exam returned for changes.');return redirect(request.referrer or url_for('exams'))
+
+@app.route('/admin/exam/<int:exam_id>/session',methods=['POST'])
+@staff_required
+def save_exam_session(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    try:group_id=int(request.form.get('group_id','0'))
+    except ValueError:group_id=0
+    group=s.get(AcademicGroup,group_id)
+    if not group:flash('Choose a valid batch / section.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+    try:start=parse_local_schedule(request.form.get('scheduled_start',''));end=parse_local_schedule(request.form.get('scheduled_end',''))
+    except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
+    if start and end and datetime.fromisoformat(end)<=datetime.fromisoformat(start):flash('Session end time must be after the start time.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+    row=s.scalar(select(ExamSession).where(ExamSession.exam_id==exam_id,ExamSession.group_id==group_id))
+    if row:row.scheduled_start=start;row.scheduled_end=end;row.venue=request.form.get('venue','').strip()
+    else:s.add(ExamSession(exam_id=exam_id,group_id=group_id,scheduled_start=start,scheduled_end=end,venue=request.form.get('venue','').strip(),created_at=now_iso()))
+    audit_event(s,'exam_session_saved','exam',exam_id,f'{group_label(group)}, {start or "any time"}, venue={request.form.get("venue","").strip()}');s.commit();flash('Exam batch / section session saved.');return redirect(url_for('exam_builder',exam_id=exam_id))
+
+@app.route('/admin/exam/<int:exam_id>/session/<int:session_id>/delete',methods=['POST'])
+@staff_required
+def delete_exam_session(exam_id,session_id):
+    s=DB();row=s.get(ExamSession,session_id)
+    if row and row.exam_id==exam_id:s.delete(row);audit_event(s,'exam_session_deleted','exam',exam_id,f'session={session_id}');s.commit();flash('Exam session removed.')
+    return redirect(url_for('exam_builder',exam_id=exam_id))
 
 @app.route('/admin/exam/<int:exam_id>/builder',methods=['GET','POST'])
 @staff_required
@@ -981,7 +1276,7 @@ def exam_builder(exam_id):
     subjects=s.scalars(select(BankQuestion.subject).where(BankQuestion.status=='approved').distinct().order_by(BankQuestion.subject)).all();pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0;attempt_count=s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0
     try:unit_weights_display=', '.join(f'{k}:{v}' for k,v in json.loads(cfg.unit_weights or '{}').items())
     except Exception:unit_weights_display=''
-    return render_template('exam_builder.html',exam=exam,cfg=cfg,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display)
+    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);return render_template('exam_builder.html',exam=exam,cfg=cfg,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,group_label=group_label,can_approve=can_approve_exams(s))
 
 @app.route('/admin/exam/<int:exam_id>/questions',methods=['GET','POST'])
 @staff_required
@@ -1030,15 +1325,20 @@ def result_rows(s,exam_id=None):
         events=integrity_by_attempt.get(a.id,[])
         tab_switches=sum(1 for ev in events if ev.event_type=='tab_hidden')
         fullscreen_exits=sum(1 for ev in events if ev.event_type=='fullscreen_exit')
+        pct,grade,_grade_class=result_performance(a.score,a.total_marks) if a.status=='submitted' else (0,'-','')
+        grp=student_group(s,st.id)
         rows.append(type('ResultRow',(),{
             'attempt_id':a.id,
             'roll_no':st.roll_no,
             'name':st.name,
+            'group_label':group_label(grp) if grp else 'Unassigned',
             'title':e.title,
             'exam_id':e.id,
             'status':a.status,
             'score':a.score,
             'total_marks':a.total_marks,
+            'percentage':pct,
+            'grade':grade,
             'started_at':a.started_at,
             'submitted_at':a.submitted_at,
             'violations':len(events),
@@ -1056,8 +1356,8 @@ def results():
 @app.route('/admin/results/export/<fmt>')
 @staff_required
 def export_results(fmt):
-    s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);headers=['roll_no','name','exam','status','score','total_marks','tab_switches','fullscreen_exits','total_integrity_events','started','submitted']
-    matrix=[[r.roll_no,r.name,r.title,r.status,r.score if r.score is not None else '',r.total_marks if r.total_marks is not None else '',r.tab_switches,r.fullscreen_exits,r.violations,r.started_at,r.submitted_at or ''] for r in rows]
+    s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);headers=['roll_no','name','batch_section','exam','status','score','total_marks','percentage','grade','tab_switches','fullscreen_exits','total_integrity_events','started','submitted']
+    matrix=[[r.roll_no,r.name,r.group_label,r.title,r.status,r.score if r.score is not None else '',r.total_marks if r.total_marks is not None else '',r.percentage if r.status=='submitted' else '',r.grade if r.status=='submitted' else '',r.tab_switches,r.fullscreen_exits,r.violations,r.started_at,r.submitted_at or ''] for r in rows]
     suffix=f'_exam_{exam_id}' if exam_id else '_all'
     if fmt=='csv':
         out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'exam_results{suffix}.csv')
@@ -1065,10 +1365,52 @@ def export_results(fmt):
         wb=Workbook();ws=wb.active;ws.title='Results';ws.append(headers)
         for row in matrix:ws.append(row)
         for cell in ws[1]:cell.font=Font(bold=True)
-        widths=[16,28,30,14,10,12,14,16,20,24,24]
+        widths=[16,28,34,30,14,10,12,12,16,14,16,20,24,24]
         for idx,width in enumerate(widths,1):ws.column_dimensions[chr(64+idx)].width=width
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'exam_results{suffix}.xlsx')
     abort(404)
+
+
+def _score_summary(percentages):
+    if not percentages:return {'count':0,'average':0,'highest':0,'lowest':0,'pass_pct':0,'outstanding':0,'very_good':0,'good':0,'average_grade':0,'poor':0}
+    vals=[float(x) for x in percentages];n=len(vals)
+    return {'count':n,'average':round(sum(vals)/n,1),'highest':round(max(vals),1),'lowest':round(min(vals),1),'pass_pct':round(sum(1 for x in vals if x>=40)*100/n,1),'outstanding':sum(1 for x in vals if x>=90),'very_good':sum(1 for x in vals if 75<=x<90),'good':sum(1 for x in vals if 60<=x<75),'average_grade':sum(1 for x in vals if 40<=x<60),'poor':sum(1 for x in vals if x<40)}
+
+
+def institutional_analytics_data(s):
+    raw=s.execute(select(Attempt,Student,Exam).join(Student,Student.id==Attempt.student_id).join(Exam,Exam.id==Attempt.exam_id).where(Attempt.status=='submitted')).all()
+    percentages=[];exam_pcts={};student_pcts={}
+    for a,st,e in raw:
+        pct=((a.score or 0)/(a.total_marks or 1))*100;percentages.append(pct);exam_pcts.setdefault(e.id,[]).append(pct);student_pcts.setdefault(st.id,[]).append(pct)
+    overall=_score_summary(percentages)
+    exam_rows=[]
+    exams_all=s.scalars(select(Exam).order_by(Exam.id.desc())).all();total_students=s.scalar(select(func.count()).select_from(Student)) or 0
+    for e in exams_all:
+        sessions=s.scalars(select(ExamSession).where(ExamSession.exam_id==e.id)).all();group_ids={x.group_id for x in sessions}
+        if group_ids:
+            strength=s.scalar(select(func.count(func.distinct(StudentGroup.student_id))).where(StudentGroup.group_id.in_(group_ids))) or 0
+        else:strength=total_students
+        summary=_score_summary(exam_pcts.get(e.id,[]));appeared=summary['count'];exam_rows.append({'id':e.id,'title':e.title,'strength':int(strength),'appeared':appeared,'absent':max(0,int(strength)-appeared),'average':summary['average'],'highest':summary['highest'],'lowest':summary['lowest'],'pass_pct':summary['pass_pct']})
+    group_rows=[];groups=s.scalars(select(AcademicGroup).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();membership=dict(s.execute(select(StudentGroup.student_id,StudentGroup.group_id)).all())
+    for g in groups:
+        student_ids=[sid for sid,gid in membership.items() if gid==g.id];vals=[]
+        for sid in student_ids:vals.extend(student_pcts.get(sid,[]))
+        summary=_score_summary(vals);group_rows.append({'label':group_label(g),'students':len(student_ids),'attempts':summary['count'],'average':summary['average'],'pass_pct':summary['pass_pct']})
+    # Academic attainment from reusable bank metadata.
+    maps=s.scalars(select(ExamBankMap)).all();bank_by_exam_q={m.exam_question_id:m.bank_question_id for m in maps};bank_ids=set(bank_by_exam_q.values());banks={b.id:b for b in (s.scalars(select(BankQuestion).where(BankQuestion.id.in_(bank_ids))).all() if bank_ids else [])};questions={q.id:q for q in (s.scalars(select(Question).where(Question.id.in_(list(bank_by_exam_q)))).all() if bank_by_exam_q else [])};submitted_ids={a.id for a,_,_ in raw};unit_stats={};co_stats={}
+    if submitted_ids and bank_by_exam_q:
+        answers=s.scalars(select(Answer).where(Answer.attempt_id.in_(submitted_ids),Answer.question_id.in_(list(bank_by_exam_q)))).all()
+        for ans in answers:
+            bank=banks.get(bank_by_exam_q.get(ans.question_id));q=questions.get(ans.question_id)
+            if not bank or not q:continue
+            ok=1 if ans.selected_answer==q.correct_answer else 0
+            if bank.unit:
+                key=f'{bank.subject} · Unit {bank.unit}';st=unit_stats.setdefault(key,[0,0]);st[0]+=1;st[1]+=ok
+            if bank.co_mapping:
+                key=f'{bank.subject} · {bank.co_mapping}';st=co_stats.setdefault(key,[0,0]);st[0]+=1;st[1]+=ok
+    unit_rows=[{'label':k,'responses':v[0],'attainment':round(v[1]*100/v[0],1) if v[0] else 0} for k,v in sorted(unit_stats.items())]
+    co_rows=[{'label':k,'responses':v[0],'attainment':round(v[1]*100/v[0],1) if v[0] else 0} for k,v in sorted(co_stats.items())]
+    return overall,exam_rows,group_rows,unit_rows,co_rows
 
 @app.route('/admin/analytics')
 @staff_required
@@ -1090,7 +1432,31 @@ def analytics():
             n=max(1,round(len(samples)*0.27));bottom=samples[:n];top=samples[-n:];disc=(sum(x[1] for x in top)/n)-(sum(x[1] for x in bottom)/n)
         observed='-' if rate is None else ('Easy' if rate>=0.75 else 'Medium' if rate>=0.4 else 'Hard')
         rows.append(type('AnalyticsRow',(),{'id':q.id,'subject':q.subject,'unit':q.unit,'topic':q.topic,'question':q.question,'declared_difficulty':q.difficulty,'times_used':usage.get(q.id,0),'responses':st['responses'],'correct_rate':rate,'observed_difficulty':observed,'discrimination':disc})())
-    return render_template('analytics.html',rows=rows)
+    overall,exam_rows,group_rows,unit_rows,co_rows=institutional_analytics_data(s);return render_template('analytics.html',rows=rows,overall=overall,exam_rows=exam_rows,group_rows=group_rows,unit_rows=unit_rows,co_rows=co_rows)
+
+
+@app.route('/admin/institution',methods=['GET','POST'])
+@admin_required
+def institution_settings():
+    s=DB();row=get_institution(s,create=True)
+    if request.method=='POST':
+        row.institution_name=request.form.get('institution_name','').strip() or 'Learn with Hemant';row.short_name=request.form.get('short_name','').strip() or row.institution_name;row.system_name=request.form.get('system_name','').strip() or 'Examination Management System';row.department=request.form.get('department','').strip();row.academic_year=request.form.get('academic_year','').strip();row.admin_email=request.form.get('admin_email','').strip();row.exam_controller=request.form.get('exam_controller','').strip();row.contact_phone=request.form.get('contact_phone','').strip()
+        logo=request.files.get('logo_file')
+        if logo and logo.filename:
+            raw=logo.read();mime=(logo.mimetype or '').lower()
+            if mime not in {'image/png','image/jpeg','image/webp'}:flash('Logo must be PNG, JPG or WebP.','error');return redirect(url_for('institution_settings'))
+            if len(raw)>1024*1024:flash('Logo must be smaller than 1 MB.','error');return redirect(url_for('institution_settings'))
+            row.logo_data=f'data:{mime};base64,'+base64.b64encode(raw).decode('ascii')
+        if request.form.get('remove_logo')=='1':row.logo_data=''
+        row.updated_at=now_iso();audit_event(s,'institution_profile_updated','system',row.id,row.institution_name);s.commit();flash('Institution branding and profile updated.');return redirect(url_for('institution_settings'))
+    return render_template('institution.html',profile=row)
+
+@app.route('/admin/exam-centre')
+@staff_required
+def exam_centre():
+    s=DB();port=int(os.getenv('PORT','8080'));lan_ip=local_lan_ip();student_url=(request.url_root.rstrip('/') if APP_MODE=='online' else f'http://{lan_ip}:{port}')
+    stats={'students':s.scalar(select(func.count()).select_from(Student)) or 0,'active_exams':s.scalar(select(func.count()).select_from(Exam).where(Exam.is_active==True)) or 0,'in_progress':s.scalar(select(func.count()).select_from(Attempt).where(Attempt.status=='in_progress')) or 0}
+    return render_template('exam_centre.html',mode=APP_MODE,db_name='PostgreSQL' if DATABASE_URL.startswith('postgresql') else 'SQLite',student_url=student_url,qr_uri=qr_data_uri(student_url),lan_ip=lan_ip,port=port,stats=stats)
 
 @app.route('/admin/faculty',methods=['GET','POST'])
 @admin_required
@@ -1101,9 +1467,10 @@ def faculty_users():
         if len(username)<3 or not name or len(password)<10:flash('Faculty name, a 3+ character username and a 10+ character password are required.','error')
         else:
             try:
-                row=Faculty(username=username,name=name,password_hash=generate_password_hash(password),is_active=True,created_at=now_iso());s.add(row);s.flush();audit_event(s,'faculty_created','faculty',row.id,username);s.commit();flash('Faculty login created.')
+                role=request.form.get('staff_role','faculty') if request.form.get('staff_role') in {'faculty','hod','exam_controller'} else 'faculty'
+                row=Faculty(username=username,name=name,password_hash=generate_password_hash(password),is_active=True,created_at=now_iso());s.add(row);s.flush();s.add(FacultyRole(faculty_id=row.id,role=role,department=request.form.get('department','').strip(),updated_at=now_iso()));audit_event(s,'faculty_created','faculty',row.id,f'{username}, role={role}');s.commit();flash('Staff login created.')
             except IntegrityError:s.rollback();flash('That faculty username already exists.','error')
-    rows=s.scalars(select(Faculty).order_by(Faculty.username)).all();return render_template('faculty.html',faculty=rows)
+    rows=s.scalars(select(Faculty).order_by(Faculty.username)).all();role_map={r.faculty_id:r for r in s.scalars(select(FacultyRole)).all()};return render_template('faculty.html',faculty=rows,role_map=role_map,role_labels=ROLE_LABELS)
 
 @app.route('/admin/faculty/<int:faculty_id>/toggle',methods=['POST'])
 @admin_required
@@ -1112,6 +1479,19 @@ def toggle_faculty(faculty_id):
     if row:row.is_active=not row.is_active;audit_event(s,'faculty_enabled' if row.is_active else 'faculty_disabled','faculty',row.id,row.username);s.commit()
     return redirect(url_for('faculty_users'))
 
+
+@app.route('/admin/faculty/<int:faculty_id>/role',methods=['POST'])
+@admin_required
+def update_faculty_role(faculty_id):
+    s=DB();faculty=s.get(Faculty,faculty_id)
+    if not faculty:abort(404)
+    role=request.form.get('staff_role','faculty')
+    if role not in {'faculty','hod','exam_controller'}:flash('Invalid staff role.','error');return redirect(url_for('faculty_users'))
+    row=s.scalar(select(FacultyRole).where(FacultyRole.faculty_id==faculty_id))
+    if row:row.role=role;row.department=request.form.get('department','').strip();row.updated_at=now_iso()
+    else:s.add(FacultyRole(faculty_id=faculty_id,role=role,department=request.form.get('department','').strip(),updated_at=now_iso()))
+    audit_event(s,'faculty_role_updated','faculty',faculty_id,f'role={role}');s.commit();flash('Staff role updated.');return redirect(url_for('faculty_users'))
+
 @app.route('/admin/audit')
 @admin_required
 def audit_logs():
@@ -1119,7 +1499,8 @@ def audit_logs():
 
 @app.route('/admin/system')
 @admin_required
-def system_tools(): return render_template('system.html',offline=(APP_MODE=='offline'))
+def system_tools():
+    s=DB();return render_template('system.html',offline=(APP_MODE=='offline'),institution=get_institution(s,create=True))
 
 @app.route('/admin/system/backup')
 @admin_required
@@ -1138,15 +1519,38 @@ def system_backup():
         return response
     stamp=now_dt().strftime('%Y%m%d_%H%M');return send_file(tmp.name,as_attachment=True,download_name=f'LearnWithHemant_Exam_Backup_{stamp}.db',mimetype='application/octet-stream')
 
+
+@app.route('/admin/system/backup/encrypted',methods=['POST'])
+@admin_required
+def system_backup_encrypted():
+    if APP_MODE!='offline':abort(400,'Encrypted database backup is available only in offline mode.')
+    password=request.form.get('backup_password','')
+    if len(password)<10:flash('Use a backup password with at least 10 characters.','error');return redirect(url_for('system_tools'))
+    db_path=DATA_DIR/'exam.db'
+    if not db_path.exists():abort(404)
+    tmp=tempfile.NamedTemporaryFile(prefix='lwh_exam_backup_',suffix='.db',delete=False);tmp.close();src=sqlite3.connect(str(db_path));dst=sqlite3.connect(tmp.name)
+    try:src.backup(dst)
+    finally:dst.close();src.close()
+    try:raw=Path(tmp.name).read_bytes();payload=encrypt_backup_bytes(raw,password)
+    finally:
+        try:os.unlink(tmp.name)
+        except OSError:pass
+    s=DB();audit_event(s,'encrypted_backup_downloaded','system','','offline database');s.commit();data=io.BytesIO(payload);stamp=now_dt().strftime('%Y%m%d_%H%M');return send_file(data,as_attachment=True,download_name=f'ExamSystem_Encrypted_Backup_{stamp}.lwhbackup',mimetype='application/octet-stream')
+
 @app.route('/admin/system/restore',methods=['POST'])
 @admin_required
 def system_restore():
     if APP_MODE!='offline':abort(400,'Direct database restore is available only in offline mode.')
     upload=request.files.get('backup_file')
-    if not upload or not upload.filename:flash('Choose a .db backup file.','error');return redirect(url_for('system_tools'))
+    if not upload or not upload.filename:flash('Choose a .db or .lwhbackup backup file.','error');return redirect(url_for('system_tools'))
     fd,temp_name=tempfile.mkstemp(prefix='lwh_restore_',suffix='.db'); os.close(fd); temp=Path(temp_name)
     try:
-        upload.save(temp)
+        raw=upload.read()
+        if upload.filename.lower().endswith('.lwhbackup') or raw.startswith(b'LWHBK1'):
+            password=request.form.get('backup_password','')
+            if not password:raise ValueError('Enter the backup password used when the encrypted backup was created.')
+            raw=decrypt_backup_bytes(raw,password)
+        temp.write_bytes(raw)
         conn=sqlite3.connect(str(temp));tables={r[0] for r in conn.execute("select name from sqlite_master where type='table'").fetchall()};conn.close()
         if not {'admins','students','exams','questions','attempts','answers'}.issubset(tables):raise ValueError('This is not a valid Learn with Hemant exam backup.')
         DB.remove();engine.dispose();shutil.copy2(temp,DATA_DIR/'exam.db');init_db();rs=DB();audit_event(rs,'offline_backup_restored','system','',upload.filename or 'backup.db');rs.commit();flash('Backup restored successfully. Refresh the page and verify the data before conducting an exam.')
@@ -1161,8 +1565,10 @@ def system_restore():
 def student_dashboard():
     s=DB();st=s.get(Student,web_session['user_id']);exams_list=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.id.desc())).all();rows=[]
     for e in exams_list:
+        allowed,access_label,session_row=exam_access_for_student(s,st.id,e)
+        if access_label=='Not assigned to your batch/section':continue
         pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=get_exam_config(s,e.id);display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
-        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_exam_display_title(s,e),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None})())
+        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_exam_display_title(s,e),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else ''})())
     return render_template('student_dashboard.html',student=st,exams=rows)
 
 @app.route('/student/exam/<int:exam_id>')
@@ -1170,6 +1576,8 @@ def student_dashboard():
 def take_exam(exam_id):
     s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True))
     if not exam:flash('Exam is not active.','error');return redirect(url_for('student_dashboard'))
+    allowed,access_label,_session=exam_access_for_student(s,web_session['user_id'],exam)
+    if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
     cfg=get_exam_config(s,exam_id);attempt=get_attempt(s,web_session['user_id'],exam_id)
     if attempt and attempt.status=='submitted':return redirect(url_for('submitted',exam_id=exam_id))
     if not attempt:
@@ -1178,7 +1586,11 @@ def take_exam(exam_id):
         target=min((cfg.question_count if cfg and cfg.question_count else len(qids)),len(qids))
         if cfg is None or cfg.randomize_questions:qids=random.sample(qids,target)
         else:qids=qids[:target]
-        started=now_dt();end=started+timedelta(minutes=exam.duration_minutes);attempt=Attempt(student_id=web_session['user_id'],exam_id=exam_id,started_at=started.isoformat(timespec='seconds'),end_at=end.isoformat(timespec='seconds'),status='in_progress',question_order=','.join(map(str,qids)));s.add(attempt);s.flush()
+        started=now_dt();end=started+timedelta(minutes=exam.duration_minutes)
+        if _session and _session.scheduled_end:
+            session_end=datetime.fromisoformat(_session.scheduled_end).astimezone() if datetime.fromisoformat(_session.scheduled_end).tzinfo else datetime.fromisoformat(_session.scheduled_end).replace(tzinfo=started.tzinfo)
+            if session_end<end:end=session_end
+        attempt=Attempt(student_id=web_session['user_id'],exam_id=exam_id,started_at=started.isoformat(timespec='seconds'),end_at=end.isoformat(timespec='seconds'),status='in_progress',question_order=','.join(map(str,qids)));s.add(attempt);s.flush()
         for pos,qid in enumerate(qids,1):
             keys=list('ABCD')
             if cfg and cfg.shuffle_options:random.shuffle(keys)

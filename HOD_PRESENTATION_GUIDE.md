@@ -51,3 +51,17 @@ Presentation shortcut:
 6. Review the exam and click **Activate**.
 
 Important positioning: the built-in content is a general starter bank and should be reviewed against the university's exact syllabus before high-stakes use.
+
+## Institution-ready V14 additions
+- White-label Institution Profile (name, logo, department, academic year).
+- Staff roles: Super Admin, Exam Controller, HOD, Faculty.
+- Batch / semester / section management and bulk student mapping.
+- Exam approval workflow before activation.
+- Batch-wise exam schedule and venue assignment.
+- Exam Centre readiness screen with offline LAN URL and QR code.
+- Institutional analytics: strength, appeared, absent, average, pass %, grade distribution, batch performance, CO and unit attainment.
+- Encrypted offline backups and configurable inactivity timeout.
+- Windows installer build plus optional Authenticode signing hooks.
+
+### Strong demo sequence
+Institution Profile → Batches & Sections → Student Import → Question Bank → Exam Blueprint → Batch Session → Request/Approve Exam → Exam Centre QR → Student Attempt → Results → Analytics → Encrypted Backup.
