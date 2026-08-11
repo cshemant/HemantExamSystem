@@ -164,6 +164,16 @@ class BankQuestion(Base):
     created_at:Mapped[str]=mapped_column(String,nullable=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
+class SubjectCatalog(Base):
+    __tablename__='subject_catalog'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    name:Mapped[str]=mapped_column(String,unique=True,nullable=False)
+    category:Mapped[str]=mapped_column(String,nullable=False,default='Custom / Other')
+    course_semester:Mapped[str]=mapped_column(String,nullable=False,default='')
+    is_active:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    created_by:Mapped[str]=mapped_column(String,nullable=False,default='system')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
 class QuestionRevision(Base):
     __tablename__='question_revisions'
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
@@ -403,11 +413,37 @@ def exam_access_for_student(s,student_id,exam):
 
 
 def local_lan_ip():
+    """Return the IPv4 address used by the machine's current default LAN route.
+
+    The UDP connect does not send application data; it asks the OS which local
+    interface would be used for that route. This keeps the Exam Centre URL in
+    sync when the server laptop moves between Wi-Fi/LAN/hotspot networks.
+    """
+    probes=(('8.8.8.8',80),('1.1.1.1',80),('192.0.2.1',80))
+    for host,port in probes:
+        sock=None
+        try:
+            sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+            sock.connect((host,port))
+            ip=sock.getsockname()[0]
+            if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
+                return ip
+        except OSError:
+            pass
+        finally:
+            if sock:
+                try:sock.close()
+                except OSError:pass
     try:
-        sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);sock.connect(('8.8.8.8',80));ip=sock.getsockname()[0];sock.close();return ip
+        candidates=[]
+        for info in socket.getaddrinfo(socket.gethostname(),None,socket.AF_INET,socket.SOCK_DGRAM):
+            ip=info[4][0]
+            if ip and not ip.startswith('127.') and not ip.startswith('169.254.') and ip not in candidates:
+                candidates.append(ip)
+        private=next((ip for ip in candidates if ip.startswith('10.') or ip.startswith('192.168.') or (ip.startswith('172.') and 16<=int(ip.split('.')[1])<=31)),None)
+        return private or (candidates[0] if candidates else 'SERVER-IP')
     except Exception:
-        try:return socket.gethostbyname(socket.gethostname())
-        except Exception:return 'SERVER-IP'
+        return 'SERVER-IP'
 
 
 def qr_data_uri(text):
@@ -447,6 +483,7 @@ def load_preloaded_question_banks():
 
 def activate_preloaded_pack(s,pack):
     marker=f"preloaded:{pack['slug']}"
+    ensure_subject_catalog_entry(s,pack.get('subject',''),pack.get('category','Engineering'),pack.get('course_semester',''),'preloaded-library')
     existing=set(s.scalars(select(BankQuestion.question).where(BankQuestion.created_by==marker)).all())
     added=0
     for row in pack.get('questions',[]):
@@ -482,6 +519,49 @@ def activate_preloaded_pack(s,pack):
         s.add(bq); added+=1
     return added,len(existing)
 
+def ensure_subject_catalog_entry(s,name,category='Custom / Other',course_semester='',created_by='system',reactivate=True):
+    name=(name or '').strip()
+    if not name:
+        return None
+    category=(category or '').strip() or 'Custom / Other'
+    course_semester=(course_semester or '').strip()
+    row=s.scalar(select(SubjectCatalog).where(func.lower(SubjectCatalog.name)==name.lower()))
+    if row:
+        # Preserve a faculty-defined category, but upgrade generic placeholders when better metadata arrives.
+        if (not row.category or row.category in {'Custom / Other','Imported / Other','General'}) and category not in {'Custom / Other','Imported / Other','General'}:
+            row.category=category
+        if not row.course_semester and course_semester:
+            row.course_semester=course_semester
+        if reactivate:
+            row.is_active=True
+        return row
+    row=SubjectCatalog(name=name,category=category,course_semester=course_semester,is_active=True,created_by=created_by or 'system',created_at=now_iso())
+    s.add(row)
+    return row
+
+def seed_subject_catalog(s):
+    # Register all bundled subjects so the faculty form can use a categorized subject selector immediately.
+    for pack in load_preloaded_question_banks().values():
+        ensure_subject_catalog_entry(s,pack.get('subject',''),pack.get('category','Engineering'),pack.get('course_semester',''),'preloaded-library',False)
+    # Preserve subjects already present in older databases even if they were created before this feature existed.
+    for subject,course in s.execute(select(BankQuestion.subject,BankQuestion.course_semester).distinct()).all():
+        ensure_subject_catalog_entry(s,subject,'Custom / Other',course,'legacy-question-bank',False)
+    s.flush()
+
+def subject_catalog_groups(s,include_inactive=False):
+    stmt=select(SubjectCatalog)
+    if not include_inactive:
+        stmt=stmt.where(SubjectCatalog.is_active==True)
+    rows=s.scalars(stmt.order_by(SubjectCatalog.category,SubjectCatalog.name)).all()
+    grouped=[]
+    current=None
+    for row in rows:
+        if current is None or current['category']!=row.category:
+            current={'category':row.category,'subjects':[]}
+            grouped.append(current)
+        current['subjects'].append(row)
+    return grouped
+
 def preloaded_pack_statuses(s):
     output=[]
     for pack in load_preloaded_question_banks().values():
@@ -499,6 +579,7 @@ def init_db():
     Base.metadata.create_all(engine)
     s=DB()
     try:
+        seed_subject_catalog(s)
         if APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP:
             admin=s.scalar(select(Admin).where(Admin.username==admin_username))
             if not admin:
@@ -506,7 +587,7 @@ def init_db():
             elif admin_password and not check_password_hash(admin.password_hash,admin_password):
                 admin.password_hash=generate_password_hash(admin_password)
             get_institution(s,create=True)
-            s.commit()
+        s.commit()
     except IntegrityError:
         s.rollback()
 
@@ -906,44 +987,158 @@ def toggle_group(group_id):
 @staff_required
 def question_bank():
     s=DB()
+    seed_subject_catalog(s)
     if request.method=='POST':
         question=request.form.get('question','').strip(); ans=request.form.get('correct_answer','A').upper()
+        subject_name=request.form.get('subject','').strip()
+        catalog_subject=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True)) if subject_name else None
         if not question: flash('Question text is required.','error')
+        elif not catalog_subject: flash('Choose a subject from the Subject Catalog, or add your custom subject first.','error')
         elif ans not in {'A','B','C','D'}: flash('Correct answer must be A, B, C or D.','error')
         else:
             try: marks=max(1,int(request.form.get('marks','1')))
             except ValueError: marks=1
             status='approved' if can_approve_content(s) and request.form.get('status')=='approved' else 'draft'
+            course_semester=request.form.get('course_semester','').strip() or catalog_subject.course_semester
             bq=BankQuestion(
-                subject=request.form.get('subject','General').strip() or 'General',course_semester=request.form.get('course_semester','').strip(),unit=request.form.get('unit','').strip(),topic=request.form.get('topic','').strip(),question_type='MCQ',question=question,
+                subject=catalog_subject.name,course_semester=course_semester,unit=request.form.get('unit','').strip(),topic=request.form.get('topic','').strip(),question_type='MCQ',question=question,
                 option_a=request.form.get('option_a','').strip(),option_b=request.form.get('option_b','').strip(),option_c=request.form.get('option_c','').strip(),option_d=request.form.get('option_d','').strip(),correct_answer=ans,marks=marks,
                 difficulty=canonical_difficulty(request.form.get('difficulty')),bloom_level=canonical_bloom(request.form.get('bloom_level')),co_mapping=request.form.get('co_mapping','').strip(),tags=request.form.get('tags','').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso())
-            s.add(bq); s.flush(); audit_event(s,'bank_question_created','bank_question',bq.id,status); s.commit(); flash('Question added to the bank.')
-            return redirect(url_for('question_bank'))
-    q=(request.args.get('q') or '').strip(); subject=(request.args.get('subject') or '').strip(); unit=(request.args.get('unit') or '').strip(); difficulty=(request.args.get('difficulty') or '').strip(); status=(request.args.get('status') or '').strip()
+            s.add(bq); s.flush(); audit_event(s,'bank_question_created','bank_question',bq.id,f'status={status}, subject={catalog_subject.name}, category={catalog_subject.category}'); s.commit(); flash('Question added to the bank.')
+            return redirect(url_for('question_bank',subject=catalog_subject.name)+'#subject-workspace')
+    q=(request.args.get('q') or '').strip(); category=(request.args.get('category') or '').strip(); subject=(request.args.get('subject') or '').strip(); unit=(request.args.get('unit') or '').strip(); difficulty=(request.args.get('difficulty') or '').strip(); status=(request.args.get('status') or '').strip()
+    catalog_rows=s.scalars(select(SubjectCatalog).where(SubjectCatalog.is_active==True).order_by(SubjectCatalog.category,SubjectCatalog.name)).all()
+    catalog_map={row.name:row for row in catalog_rows}
     stmt=select(BankQuestion)
     if q: stmt=stmt.where(or_(BankQuestion.question.ilike(f'%{q}%'),BankQuestion.topic.ilike(f'%{q}%'),BankQuestion.tags.ilike(f'%{q}%')))
+    if category:
+        category_subjects=[row.name for row in catalog_rows if row.category==category]
+        stmt=stmt.where(BankQuestion.subject.in_(category_subjects)) if category_subjects else stmt.where(BankQuestion.id==-1)
     if subject: stmt=stmt.where(BankQuestion.subject==subject)
     if unit: stmt=stmt.where(BankQuestion.unit==unit)
     if difficulty: stmt=stmt.where(BankQuestion.difficulty==canonical_difficulty(difficulty))
     if status: stmt=stmt.where(BankQuestion.status==status)
     rows=s.scalars(stmt.order_by(BankQuestion.id.desc())).all()
-    subjects=s.scalars(select(BankQuestion.subject).distinct().order_by(BankQuestion.subject)).all(); units=s.scalars(select(BankQuestion.unit).where(BankQuestion.unit!='').distinct().order_by(BankQuestion.unit)).all(); exams_list=s.scalars(select(Exam).order_by(Exam.id.desc())).all()
+    units=s.scalars(select(BankQuestion.unit).where(BankQuestion.unit!='').distinct().order_by(BankQuestion.unit)).all(); exams_list=s.scalars(select(Exam).order_by(Exam.id.desc())).all()
     usage=dict(s.execute(select(ExamBankMap.bank_question_id,func.count(func.distinct(ExamBankMap.exam_id))).group_by(ExamBankMap.bank_question_id)).all())
+    question_counts=dict(s.execute(select(BankQuestion.subject,func.count()).group_by(BankQuestion.subject)).all())
     preloaded_packs=preloaded_pack_statuses(s)
     preloaded_categories=sorted({p.get('category','General') for p in preloaded_packs})
-    return render_template('question_bank.html',questions=rows,subjects=subjects,units=units,exams=exams_list,usage=usage,filters={'q':q,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
+    catalog_groups=subject_catalog_groups(s)
+    catalog_categories=sorted({row.category for row in catalog_rows})
+    selected_catalog_subject=catalog_map.get(subject) if subject else None
+    selected_subject_stats=None
+    if selected_catalog_subject:
+        approved_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved')) or 0
+        draft_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='draft')) or 0
+        selected_subject_stats={'total':approved_count+draft_count,'approved':approved_count,'draft':draft_count}
+    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,units=units,exams=exams_list,usage=usage,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
 
+@app.route('/admin/question-bank/subjects',methods=['POST'])
+@staff_required
+def add_subject_catalog():
+    s=DB()
+    name=(request.form.get('subject_name') or '').strip()
+    category=(request.form.get('category') or '').strip()
+    course=(request.form.get('course_semester') or '').strip()
+    if not name:
+        flash('Subject name is required.','error'); return redirect(url_for('question_bank'))
+    if not category:
+        flash('Assign a category before adding the subject.','error'); return redirect(url_for('question_bank'))
+    existing=s.scalar(select(SubjectCatalog).where(func.lower(SubjectCatalog.name)==name.lower()))
+    if existing:
+        existing.category=category; existing.course_semester=course or existing.course_semester; existing.is_active=True
+        audit_event(s,'subject_catalog_updated','subject',existing.id,f'name={existing.name}, category={category}')
+        s.commit(); flash(f'Updated subject “{existing.name}” under {category}.')
+        return redirect(url_for('question_bank',subject=existing.name)+'#subject-workspace')
+    row=ensure_subject_catalog_entry(s,name,category,course,actor_label(s)); s.flush()
+    audit_event(s,'subject_catalog_created','subject',row.id,f'name={row.name}, category={row.category}')
+    s.commit(); flash(f'Added “{row.name}” under {row.category}. It is now available in the question form.')
+    return redirect(url_for('question_bank',subject=row.name)+'#subject-workspace')
+
+@app.route('/admin/question-bank/subjects/<int:subject_id>/toggle',methods=['POST'])
+@approver_required
+def toggle_subject_catalog(subject_id):
+    s=DB(); row=s.get(SubjectCatalog,subject_id)
+    if not row: abort(404)
+    row.is_active=not row.is_active
+    audit_event(s,'subject_catalog_activated' if row.is_active else 'subject_catalog_deactivated','subject',row.id,f'name={row.name}, category={row.category}')
+    s.commit(); flash(f'{row.name} is now '+('active.' if row.is_active else 'hidden from new-question selection.'))
+    return redirect(url_for('question_bank'))
+
+@app.route('/admin/question-bank/subjects/<int:subject_id>/create-exam',methods=['POST'])
+@staff_required
+def create_exam_from_catalog_subject(subject_id):
+    """Create an inactive draft exam from the approved questions of a catalog subject."""
+    s=DB(); subject=s.get(SubjectCatalog,subject_id)
+    if not subject: abort(404)
+    if not subject.is_active:
+        flash('This subject is not active in the Subject Catalog.','error')
+        return redirect(url_for('question_bank'))
+
+    bank_rows=s.scalars(select(BankQuestion).where(
+        BankQuestion.subject==subject.name,
+        BankQuestion.status=='approved'
+    ).order_by(BankQuestion.unit,BankQuestion.id)).all()
+    if not bank_rows:
+        flash(f'Add and approve at least one question for {subject.name} before creating an exam.','error')
+        return redirect(url_for('question_bank',subject=subject.name)+'#subject-workspace')
+
+    try:
+        duration=max(1,int(request.form.get('duration','20')))
+    except ValueError:
+        duration=20
+    try:
+        per_student=max(1,int(request.form.get('question_count','10')))
+    except ValueError:
+        per_student=10
+    per_student=min(per_student,len(bank_rows))
+
+    exam=Exam(title=subject.name,duration_minutes=duration,is_active=False,created_at=now_iso())
+    s.add(exam); s.flush()
+    cfg=get_exam_config(s,exam.id,create=True)
+    cfg.subject=subject.name
+    cfg.course_semester=subject.course_semester or ''
+    cfg.question_count=per_student
+    cfg.pool_size=len(bank_rows)
+
+    easy=sum(1 for q in bank_rows if canonical_difficulty(q.difficulty)=='Easy')
+    medium=sum(1 for q in bank_rows if canonical_difficulty(q.difficulty)=='Medium')
+    total=max(1,len(bank_rows))
+    cfg.easy_pct=round(easy*100/total)
+    cfg.medium_pct=round(medium*100/total)
+    cfg.hard_pct=max(0,100-cfg.easy_pct-cfg.medium_pct)
+    units=sorted({(q.unit or '').strip() for q in bank_rows if (q.unit or '').strip()})
+    cfg.unit_weights=json.dumps({u:1 for u in units},ensure_ascii=False)
+    cfg.randomize_questions=True
+    cfg.shuffle_options=True
+    cfg.require_fullscreen=False
+    cfg.tab_switch_limit=3
+    cfg.last_generation_summary=f'Created from {subject.name}: {len(bank_rows)} approved bank questions; each student receives {per_student}.'
+    cfg.updated_at=now_iso()
+    get_exam_approval(s,exam.id,create=True)
+
+    for bq in bank_rows:
+        copy_bank_question_to_exam(s,bq,exam.id)
+
+    audit_event(s,'catalog_subject_exam_created','exam',exam.id,f'subject={subject.name}, pool={len(bank_rows)}, per_student={per_student}')
+    s.commit()
+    flash(f'Created ready exam “{subject.name}” with {len(bank_rows)} approved questions. Review the blueprint, approve it, then activate it for students.')
+    return redirect(url_for('exam_builder', exam_id=exam.id))
 
 
 @app.route('/admin/question-bank/preloaded/export/<fmt>')
 @staff_required
 def export_preloaded_question_banks(fmt):
-    headers=['subject','course_semester','unit','topic','question','option_a','option_b','option_c','option_d','correct_answer','marks','difficulty','bloom_level','co_mapping','tags']
+    headers=['category','subject','course_semester','unit','topic','question','option_a','option_b','option_c','option_d','correct_answer','marks','difficulty','bloom_level','co_mapping','tags']
     rows=[]
     for pack in load_preloaded_question_banks().values():
         for q in pack.get('questions',[]):
-            rows.append([q.get(h,'') for h in headers])
+            row=dict(q)
+            row['category']=pack.get('category','Engineering')
+            row['subject']=row.get('subject') or pack.get('subject','')
+            row['course_semester']=row.get('course_semester') or pack.get('course_semester','')
+            rows.append([row.get(h,'') for h in headers])
     if fmt=='csv':
         out=io.StringIO(newline=''); writer=csv.writer(out); writer.writerow(headers); writer.writerows(rows)
         data=io.BytesIO(out.getvalue().encode('utf-8-sig'))
@@ -952,7 +1147,7 @@ def export_preloaded_question_banks(fmt):
         wb=Workbook(); ws=wb.active; ws.title='Question Banks'; ws.append(headers)
         for cell in ws[1]: cell.font=Font(bold=True)
         for row in rows: ws.append(row)
-        widths={'A':34,'B':24,'C':8,'D':28,'E':58,'F':45,'G':45,'H':45,'I':45,'J':14,'K':9,'L':12,'M':16,'N':12,'O':34}
+        widths={'A':22,'B':34,'C':24,'D':8,'E':28,'F':58,'G':45,'H':45,'I':45,'J':45,'K':14,'L':9,'M':12,'N':16,'O':12,'P':34}
         for col,width in widths.items(): ws.column_dimensions[col].width=width
         data=io.BytesIO(); wb.save(data); data.seek(0)
         return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name='preloaded_engineering_question_banks.xlsx')
@@ -1093,33 +1288,58 @@ def create_unit_set_exam_from_preloaded_bank(slug,unit,set_code):
 @staff_required
 def import_question_bank():
     upload=request.files.get('question_file')
-    if not upload or not upload.filename: flash('Choose a CSV or Excel (.xlsx) file.','error');return redirect(url_for('question_bank'))
+    target_subject=(request.form.get('target_subject') or '').strip()
+    redirect_url=url_for('question_bank',subject=target_subject)+'#subject-workspace' if target_subject else url_for('question_bank')
+    if not upload or not upload.filename: flash('Choose a CSV or Excel (.xlsx) file.','error');return redirect(redirect_url)
     try: headers,rows=_rows_from_upload(upload)
-    except ValueError as exc: flash(str(exc),'error');return redirect(url_for('question_bank'))
-    required={'subject','question','option_a','option_b','option_c','option_d','correct_answer','marks'}
-    if not required.issubset(set(headers)): flash('Question bank file is missing required columns. Download the template and try again.','error');return redirect(url_for('question_bank'))
-    s=DB(); added=invalid=0
+    except ValueError as exc: flash(str(exc),'error');return redirect(redirect_url)
+    s=DB()
+    target_catalog=None
+    if target_subject:
+        target_catalog=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==target_subject,SubjectCatalog.is_active==True))
+        if not target_catalog:
+            flash('The selected Subject Catalog entry is not active.','error');return redirect(url_for('question_bank'))
+    required={'question','option_a','option_b','option_c','option_d','correct_answer','marks'}
+    if not target_catalog: required.add('subject')
+    if not required.issubset(set(headers)):
+        flash('Question bank file is missing required columns. Download the template and try again.','error');return redirect(redirect_url)
+    added=invalid=0
     for r in rows:
         ans=(r.get('correct_answer') or '').upper().strip(); question=(r.get('question') or '').strip()
         if not question or ans not in {'A','B','C','D'}: invalid+=1;continue
         try:marks=max(1,int(r.get('marks') or 1))
         except ValueError:marks=1
         requested_status=(r.get('status') or 'draft').lower(); status='approved' if can_approve_content(s) and requested_status=='approved' else 'draft'
-        s.add(BankQuestion(subject=(r.get('subject') or 'General').strip() or 'General',course_semester=(r.get('course_semester') or '').strip(),unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type='MCQ',question=question,option_a=(r.get('option_a') or '').strip(),option_b=(r.get('option_b') or '').strip(),option_c=(r.get('option_c') or '').strip(),option_d=(r.get('option_d') or '').strip(),correct_answer=ans,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso()));added+=1
-    audit_event(s,'question_bank_bulk_import','bank_question','',f'added={added}, invalid={invalid}');s.commit();flash(f'Imported {added} question(s).'+(f' Skipped {invalid} invalid row(s).' if invalid else ''));return redirect(url_for('question_bank'))
+        if target_catalog:
+            subject_name=target_catalog.name
+            course=(r.get('course_semester') or '').strip() or target_catalog.course_semester
+            category=target_catalog.category
+        else:
+            subject_name=(r.get('subject') or 'General').strip() or 'General'; course=(r.get('course_semester') or '').strip(); category=(r.get('category') or '').strip() or 'Imported / Other'
+            ensure_subject_catalog_entry(s,subject_name,category,course,actor_label(s))
+        s.add(BankQuestion(subject=subject_name,course_semester=course,unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type='MCQ',question=question,option_a=(r.get('option_a') or '').strip(),option_b=(r.get('option_b') or '').strip(),option_c=(r.get('option_c') or '').strip(),option_d=(r.get('option_d') or '').strip(),correct_answer=ans,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso()));added+=1
+    audit_event(s,'question_bank_bulk_import','bank_question','',f'added={added}, invalid={invalid}, target_subject={target_subject or "mixed"}')
+    s.commit();flash(f'Imported {added} question(s).'+(f' Skipped {invalid} invalid row(s).' if invalid else ''));return redirect(redirect_url)
 
 @app.route('/admin/question-bank/template/<fmt>')
 @staff_required
 def question_bank_template(fmt):
-    headers=['subject','course_semester','unit','topic','question','option_a','option_b','option_c','option_d','correct_answer','marks','difficulty','bloom_level','co_mapping','tags','status']
-    example=['Mobile Application Development','B.Tech CSE / Sem 5','2','Activity Lifecycle','Which callback is called when an Activity is first created?','onStart()','onCreate()','onResume()','onPause()','B','1','Medium','Understand','CO2','activity,lifecycle','approved']
+    headers=['category','subject','course_semester','unit','topic','question','option_a','option_b','option_c','option_d','correct_answer','marks','difficulty','bloom_level','co_mapping','tags','status']
+    subject_name=(request.args.get('subject') or '').strip()
+    category='Computer Science'; course='B.Tech CSE / Sem 5'
+    if subject_name:
+        s=DB(); row=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True))
+        if row: category=row.category; course=row.course_semester; subject_name=row.name
+        else: subject_name=''
+    example=[category,subject_name or 'Mobile Application Development',course or 'B.Tech CSE / Sem 5','1','Introduction','Replace this sample with your question','Option A','Option B','Option C','Option D','A','1','Medium','Understand','CO1','custom','approved']
+    safe_name=''.join(ch if ch.isalnum() else '_' for ch in (subject_name or 'question_bank')).strip('_') or 'question_bank'
     if fmt=='csv':
-        out=io.StringIO(newline='');writer=csv.writer(out);writer.writerow(headers);writer.writerow(example);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name='question_bank_template.csv')
+        out=io.StringIO(newline='');writer=csv.writer(out);writer.writerow(headers);writer.writerow(example);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{safe_name}_question_bank_template.csv')
     if fmt=='xlsx':
         wb=Workbook();ws=wb.active;ws.title='Question Bank';ws.append(headers);ws.append(example)
         for cell in ws[1]:cell.font=Font(bold=True)
-        for col,width in {'A':28,'B':24,'C':10,'D':24,'E':58,'F':26,'G':26,'H':26,'I':26,'J':15,'K':10,'L':14,'M':16,'N':14,'O':26,'P':12}.items():ws.column_dimensions[col].width=width
-        data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name='question_bank_template.xlsx')
+        for col,width in {'A':22,'B':28,'C':24,'D':10,'E':24,'F':58,'G':26,'H':26,'I':26,'J':26,'K':15,'L':10,'M':14,'N':16,'O':14,'P':26,'Q':12}.items():ws.column_dimensions[col].width=width
+        data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{safe_name}_question_bank_template.xlsx')
     abort(404)
 
 @app.route('/admin/question-bank/<int:question_id>/edit',methods=['GET','POST'])
@@ -1131,14 +1351,14 @@ def edit_bank_question(question_id):
     if request.method=='POST':
         snapshot={c.name:getattr(q,c.name) for c in BankQuestion.__table__.columns if c.name not in {'id','updated_at'}}
         s.add(QuestionRevision(bank_question_id=q.id,version=q.version,snapshot_json=json.dumps(snapshot,ensure_ascii=False),changed_by=actor_label(s),changed_at=now_iso()))
-        q.subject=request.form.get('subject','General').strip() or 'General';q.course_semester=request.form.get('course_semester','').strip();q.unit=request.form.get('unit','').strip();q.topic=request.form.get('topic','').strip();q.question=request.form.get('question','').strip();q.option_a=request.form.get('option_a','').strip();q.option_b=request.form.get('option_b','').strip();q.option_c=request.form.get('option_c','').strip();q.option_d=request.form.get('option_d','').strip();q.correct_answer=request.form.get('correct_answer','A').upper()
+        subject_name=request.form.get('subject','').strip(); catalog_subject=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True)); q.subject=catalog_subject.name if catalog_subject else q.subject;q.course_semester=request.form.get('course_semester','').strip() or (catalog_subject.course_semester if catalog_subject else q.course_semester);q.unit=request.form.get('unit','').strip();q.topic=request.form.get('topic','').strip();q.question=request.form.get('question','').strip();q.option_a=request.form.get('option_a','').strip();q.option_b=request.form.get('option_b','').strip();q.option_c=request.form.get('option_c','').strip();q.option_d=request.form.get('option_d','').strip();q.correct_answer=request.form.get('correct_answer','A').upper()
         try:q.marks=max(1,int(request.form.get('marks','1')))
         except ValueError:q.marks=1
         q.difficulty=canonical_difficulty(request.form.get('difficulty'));q.bloom_level=canonical_bloom(request.form.get('bloom_level'));q.co_mapping=request.form.get('co_mapping','').strip();q.tags=request.form.get('tags','').strip();q.version+=1;q.updated_at=now_iso()
         if can_approve_content(s):q.status=request.form.get('status','draft') if request.form.get('status') in {'draft','approved'} else 'draft'
         else:q.status='draft'
         audit_event(s,'bank_question_edited','bank_question',q.id,f'version={q.version}, status={q.status}');s.commit();flash('Question updated. Previous version was preserved.');return redirect(url_for('edit_bank_question',question_id=q.id))
-    return render_template('question_bank_edit.html',question=q,revisions=revisions)
+    seed_subject_catalog(s); return render_template('question_bank_edit.html',question=q,revisions=revisions,subject_groups=subject_catalog_groups(s))
 
 @app.route('/admin/question-bank/<int:question_id>/approve',methods=['POST'])
 @approver_required
@@ -1451,12 +1671,27 @@ def institution_settings():
         row.updated_at=now_iso();audit_event(s,'institution_profile_updated','system',row.id,row.institution_name);s.commit();flash('Institution branding and profile updated.');return redirect(url_for('institution_settings'))
     return render_template('institution.html',profile=row)
 
+def exam_centre_network_details():
+    port=int(os.getenv('PORT','8080'))
+    lan_ip=local_lan_ip()
+    student_url=request.url_root.rstrip('/') if APP_MODE=='online' else f'http://{lan_ip}:{port}'
+    return {'mode':APP_MODE,'lan_ip':lan_ip,'port':port,'student_url':student_url,'qr_uri':qr_data_uri(student_url)}
+
+
 @app.route('/admin/exam-centre')
 @staff_required
 def exam_centre():
-    s=DB();port=int(os.getenv('PORT','8080'));lan_ip=local_lan_ip();student_url=(request.url_root.rstrip('/') if APP_MODE=='online' else f'http://{lan_ip}:{port}')
+    s=DB();network=exam_centre_network_details()
     stats={'students':s.scalar(select(func.count()).select_from(Student)) or 0,'active_exams':s.scalar(select(func.count()).select_from(Exam).where(Exam.is_active==True)) or 0,'in_progress':s.scalar(select(func.count()).select_from(Attempt).where(Attempt.status=='in_progress')) or 0}
-    return render_template('exam_centre.html',mode=APP_MODE,db_name='PostgreSQL' if DATABASE_URL.startswith('postgresql') else 'SQLite',student_url=student_url,qr_uri=qr_data_uri(student_url),lan_ip=lan_ip,port=port,stats=stats)
+    return render_template('exam_centre.html',mode=network['mode'],db_name='PostgreSQL' if DATABASE_URL.startswith('postgresql') else 'SQLite',student_url=network['student_url'],qr_uri=network['qr_uri'],lan_ip=network['lan_ip'],port=network['port'],stats=stats)
+
+
+@app.route('/admin/exam-centre/network-info')
+@staff_required
+def exam_centre_network_info():
+    response=jsonify(exam_centre_network_details())
+    response.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0'
+    return response
 
 @app.route('/admin/faculty',methods=['GET','POST'])
 @admin_required

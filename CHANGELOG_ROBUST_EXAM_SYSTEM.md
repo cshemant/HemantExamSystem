@@ -1,3 +1,12 @@
+## V14.2 – Custom Subject Catalog
+
+- Added persistent custom subject creation with faculty-assigned categories.
+- Added categorized subject selectors to Question Bank create/edit screens.
+- Added Category + Subject filtering and category labels in the Question Bank table.
+- Added default Course/Semester auto-fill when a catalog subject is selected.
+- Added category-aware CSV/Excel Question Bank import templates.
+- Existing and preloaded subjects are registered automatically without deleting prior data.
+
 
 ## V8 - Preloaded engineering question banks
 - Added **44** ready-made engineering subject banks.

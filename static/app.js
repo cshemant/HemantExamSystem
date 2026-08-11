@@ -109,3 +109,74 @@ function initCopyButtons(){
   });
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initCopyButtons); else initCopyButtons();
+
+function initExamCentreNetworkRefresh(){
+  const btn=document.getElementById('refresh-network-btn');
+  if(!btn) return;
+  const endpoint=btn.getAttribute('data-network-url');
+  const urlEl=document.getElementById('student-access-url');
+  const ipEl=document.getElementById('lan-ip-value');
+  const portEl=document.getElementById('lan-port-value');
+  const qrEl=document.getElementById('student-qr-code');
+  const openEl=document.getElementById('open-student-login');
+  const statusEl=document.getElementById('network-refresh-status');
+  let refreshing=false;
+
+  const setStatus=(text,isError=false)=>{
+    if(!statusEl) return;
+    statusEl.textContent=text;
+    statusEl.classList.toggle('network-refresh-error',Boolean(isError));
+  };
+
+  const refreshNetwork=async(manual=false)=>{
+    if(refreshing) return;
+    refreshing=true;
+    const oldText=btn.textContent;
+    if(manual){btn.disabled=true;btn.textContent='Refreshing…';setStatus('Checking the current LAN connection…');}
+    try{
+      const res=await fetch(`${endpoint}?_=${Date.now()}`,{method:'GET',cache:'no-store',headers:{'Accept':'application/json'}});
+      if(!res.ok) throw new Error('Network refresh failed');
+      const data=await res.json();
+      const previous=urlEl ? (urlEl.textContent||'').trim() : '';
+      if(urlEl) urlEl.textContent=data.student_url;
+      if(ipEl) ipEl.textContent=data.lan_ip;
+      if(portEl) portEl.textContent=data.port;
+      if(qrEl) qrEl.src=data.qr_uri;
+      if(openEl) openEl.href=data.student_url;
+      const changed=previous && previous!==data.student_url;
+      if(manual || changed){
+        setStatus(changed ? `Network changed. Student URL and QR code updated to ${data.student_url}.` : `Network checked. Current student URL is ${data.student_url}.`);
+      }
+    }catch(_err){
+      if(manual) setStatus('Could not refresh the LAN address. Check the laptop network connection and try again.',true);
+    }finally{
+      refreshing=false;
+      if(manual){btn.disabled=false;btn.textContent=oldText;}
+    }
+  };
+
+  btn.addEventListener('click',()=>refreshNetwork(true));
+  // Re-check periodically so a Wi-Fi/LAN/hotspot change is reflected without a page reload.
+  setInterval(()=>refreshNetwork(false),15000);
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initExamCentreNetworkRefresh); else initExamCentreNetworkRefresh();
+
+function initQuestionBankSubjectCatalog(){
+  const subject=document.getElementById('bank-subject-select');
+  const course=document.getElementById('bank-course-semester');
+  if(!subject || !course) return;
+  let autoFilled='';
+  const applyDefault=()=>{
+    const option=subject.options[subject.selectedIndex];
+    if(!option) return;
+    const next=(option.getAttribute('data-course')||'').trim();
+    const current=(course.value||'').trim();
+    if(!current || current===autoFilled){
+      course.value=next;
+      autoFilled=next;
+    }
+  };
+  subject.addEventListener('change',applyDefault);
+  if(!(course.value||'').trim()) applyDefault();
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initQuestionBankSubjectCatalog); else initQuestionBankSubjectCatalog();

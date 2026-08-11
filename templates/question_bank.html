@@ -90,21 +90,106 @@
   </div>
 </div>
 
-<div class="card"><h2>Add Bank Question</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<div class="grid"><div><label>Subject</label><input name="subject" placeholder="Mobile Application Development" required></div><div><label>Course / Semester</label><input name="course_semester" placeholder="B.Tech CSE / Sem 5"></div><div><label>Unit</label><input name="unit" placeholder="2"></div><div><label>Topic</label><input name="topic" placeholder="Activity Lifecycle"></div></div>
+<div class="card subject-catalog-card">
+  <div class="import-header">
+    <div>
+      <div class="eyebrow">Your academic subjects</div>
+      <h2>Subject Catalog</h2>
+      <p class="muted">Add your own subject once, assign it to a category, and it will appear under that category whenever faculty add or filter Question Bank questions.</p>
+    </div>
+    <div class="subject-catalog-summary">{{ subjects|length }} active subject(s) · {{ catalog_categories|length }} categor{{ 'y' if catalog_categories|length == 1 else 'ies' }}</div>
+  </div>
+  <form method="post" action="{{ url_for('add_subject_catalog') }}" class="subject-catalog-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div>
+      <label>Category</label>
+      <input name="category" list="subject-category-list" placeholder="e.g. Computer Science, Mathematics, Management" required>
+      <datalist id="subject-category-list">{% for category in catalog_categories %}<option value="{{ category }}">{% endfor %}</datalist>
+      <span class="field-help">Choose an existing category or type a new one.</span>
+    </div>
+    <div><label>New Subject</label><input name="subject_name" placeholder="e.g. Cyber Security" required></div>
+    <div><label>Default Course / Semester</label><input name="course_semester" placeholder="e.g. B.Tech CSE / Sem 6"></div>
+    <button>Add Subject</button>
+  </form>
+  <div class="subject-catalog-groups">
+    {% for group in subject_groups %}
+      <div class="subject-group">
+        <div class="subject-group-title">{{ group.category }}</div>
+        <div class="subject-chips">
+          {% for item in group.subjects %}
+            <a class="subject-chip" href="{{ url_for('question_bank',subject=item.name) }}#subject-workspace" title="Open {{ item.name }} workspace">
+              <strong>{{ item.name }}</strong>
+              <span>{{ question_counts.get(item.name,0) }} Q{% if item.course_semester %} · {{ item.course_semester }}{% endif %}</span>
+            </a>
+          {% endfor %}
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+
+{% if selected_catalog_subject %}
+<div class="card subject-workspace-card" id="subject-workspace">
+  <div class="import-header">
+    <div>
+      <div class="eyebrow">Selected subject workspace</div>
+      <h2>{{ selected_catalog_subject.name }}</h2>
+      <p class="muted"><span class="badge gray">{{ selected_catalog_subject.category }}</span>{% if selected_catalog_subject.course_semester %} · {{ selected_catalog_subject.course_semester }}{% endif %}</p>
+    </div>
+    <div class="subject-workspace-counts">
+      <span class="badge success">Catalog Active</span>
+      <span class="badge">{{ selected_subject_stats.total }} question{{ '' if selected_subject_stats.total == 1 else 's' }}</span>
+      <span class="badge success">{{ selected_subject_stats.approved }} approved</span>
+      {% if selected_subject_stats.draft %}<span class="badge gray">{{ selected_subject_stats.draft }} draft</span>{% endif %}
+    </div>
+  </div>
+  {% if selected_subject_stats.total == 0 %}
+  <div class="subject-empty-state">
+    <strong>This subject has been added successfully, but it does not have any questions yet.</strong>
+    <p class="muted">Custom subjects do not use the preloaded-bank “Activate Bank” button. Add questions manually or upload them in bulk; approved questions then become available for exam creation.</p>
+  </div>
+  {% endif %}
+  <div class="actions subject-workspace-actions">
+    <a class="btn" href="#add-bank-question">+ Add Question</a>
+    <a class="btn secondary" href="#bulk-import">Upload CSV / Excel</a>
+    <a class="btn secondary" href="{{ url_for('question_bank_template',fmt='csv',subject=selected_catalog_subject.name) }}">Subject CSV Template</a>
+    <a class="btn secondary" href="{{ url_for('question_bank_template',fmt='xlsx',subject=selected_catalog_subject.name) }}">Subject Excel Template</a>
+    {% if selected_subject_stats.total %}<a class="btn secondary" href="#bank-questions">View {{ selected_subject_stats.total }} Question{{ '' if selected_subject_stats.total == 1 else 's' }}</a>{% endif %}
+  </div>
+  <div class="subject-exam-bridge">
+    <div>
+      <strong>Ready to conduct this subject?</strong>
+      <p class="muted">Only approved questions are copied into the exam. <strong>Create Ready Exam</strong> prepares the paper as Draft / Inactive, then opens its Blueprint &amp; Sessions page so an authorized user can approve and activate it.</p>
+    </div>
+    {% if selected_subject_stats.approved %}
+    <form method="post" action="{{ url_for('create_exam_from_catalog_subject',subject_id=selected_catalog_subject.id) }}" class="subject-exam-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Duration <input name="duration" type="number" min="1" value="20"></label>
+      <label>Questions per student <input name="question_count" type="number" min="1" max="{{ selected_subject_stats.approved }}" value="{{ 10 if selected_subject_stats.approved >= 10 else selected_subject_stats.approved }}"></label>
+      <button>Create Ready Exam</button>
+    </form>
+    {% else %}
+    <span class="badge gray">Approve at least 1 question to create an exam</span>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+<div class="card" id="add-bank-question"><h2>Add Bank Question</h2><p class="muted">Choose a subject from the catalog. If it is missing, add it above first so its category stays consistent across the system.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<div class="grid"><div><label>Subject</label><select name="subject" id="bank-subject-select" required><option value="">Choose subject…</option>{% for group in subject_groups %}<optgroup label="{{ group.category }}">{% for item in group.subjects %}<option value="{{ item.name }}" data-course="{{ item.course_semester }}" {% if filters.subject==item.name %}selected{% endif %}>{{ item.name }}</option>{% endfor %}</optgroup>{% endfor %}</select></div><div><label>Course / Semester</label><input name="course_semester" id="bank-course-semester" placeholder="B.Tech CSE / Sem 5"></div><div><label>Unit</label><input name="unit" placeholder="2"></div><div><label>Topic</label><input name="topic" placeholder="Activity Lifecycle"></div></div>
 <label>Question</label><textarea name="question" required></textarea>
 <div class="grid"><div><label>Option A</label><input name="option_a" required></div><div><label>Option B</label><input name="option_b" required></div><div><label>Option C</label><input name="option_c" required></div><div><label>Option D</label><input name="option_d" required></div></div>
 <div class="grid"><div><label>Correct Answer</label><select name="correct_answer"><option>A</option><option>B</option><option>C</option><option>D</option></select></div><div><label>Marks</label><input name="marks" type="number" min="1" value="1"></div><div><label>Difficulty</label><select name="difficulty"><option>Easy</option><option selected>Medium</option><option>Hard</option></select></div><div><label>Bloom Level</label><select name="bloom_level"><option>Remember</option><option selected>Understand</option><option>Apply</option><option>Analyze</option><option>Evaluate</option><option>Create</option></select></div></div>
 <div class="grid"><div><label>CO Mapping</label><input name="co_mapping" placeholder="CO2"></div><div><label>Tags</label><input name="tags" placeholder="activity,lifecycle"></div>{% if staff_role in ['super_admin','exam_controller','hod'] %}<div><label>Initial Status</label><select name="status"><option value="draft">Draft</option><option value="approved">Approved</option></select></div>{% endif %}</div>
 <button>Add to Question Bank</button></form></div>
 
-<div class="card"><div class="import-header"><div><h2>Bulk Import Question Bank</h2><p class="muted">Import hundreds of reusable questions from CSV or Excel.</p></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('question_bank_template',fmt='csv') }}">CSV Template</a><a class="btn secondary small" href="{{ url_for('question_bank_template',fmt='xlsx') }}">Excel Template</a></div></div>
-<form method="post" action="{{ url_for('import_question_bank') }}" enctype="multipart/form-data" class="import-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div><label>Question Bank File</label><input type="file" name="question_file" accept=".csv,.xlsx" required></div><button>Import Questions</button></form></div>
+<div class="card" id="bulk-import"><div class="import-header"><div><h2>Bulk Import Question Bank</h2><p class="muted">{% if selected_catalog_subject %}Upload questions directly into <strong>{{ selected_catalog_subject.name }}</strong>. The selected subject and category will be enforced automatically.{% else %}Import hundreds of reusable questions from CSV or Excel.{% endif %}</p></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('question_bank_template',fmt='csv',subject=selected_catalog_subject.name if selected_catalog_subject else '') }}">CSV Template</a><a class="btn secondary small" href="{{ url_for('question_bank_template',fmt='xlsx',subject=selected_catalog_subject.name if selected_catalog_subject else '') }}">Excel Template</a></div></div>
+<form method="post" action="{{ url_for('import_question_bank') }}" enctype="multipart/form-data" class="import-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if selected_catalog_subject %}<input type="hidden" name="target_subject" value="{{ selected_catalog_subject.name }}">{% endif %}<div><label>Question Bank File</label><input type="file" name="question_file" accept=".csv,.xlsx" required></div><button>Import Questions{% if selected_catalog_subject %} to {{ selected_catalog_subject.name }}{% endif %}</button></form></div>
 
-<div class="card"><h2>Search & Filter</h2><form method="get"><div class="filter-grid"><div><label>Keyword</label><input name="q" value="{{ filters.q }}" placeholder="question, topic or tag"></div><div><label>Subject</label><select name="subject"><option value="">All</option>{% for x in subjects %}<option value="{{ x }}" {% if filters.subject==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Unit</label><select name="unit"><option value="">All</option>{% for x in units %}<option value="{{ x }}" {% if filters.unit==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Difficulty</label><select name="difficulty"><option value="">All</option>{% for x in ['Easy','Medium','Hard'] %}<option value="{{ x }}" {% if filters.difficulty==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Status</label><select name="status"><option value="">All</option><option value="approved" {% if filters.status=='approved' %}selected{% endif %}>Approved</option><option value="draft" {% if filters.status=='draft' %}selected{% endif %}>Draft</option></select></div></div><div class="actions"><button>Apply Filters</button><a class="btn secondary" href="{{ url_for('question_bank') }}">Reset</a></div></form></div>
+<div class="card"><h2>Search & Filter</h2><form method="get"><div class="filter-grid subject-filter-grid"><div><label>Keyword</label><input name="q" value="{{ filters.q }}" placeholder="question, topic or tag"></div><div><label>Category</label><select name="category"><option value="">All categories</option>{% for x in catalog_categories %}<option value="{{ x }}" {% if filters.category==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Subject</label><select name="subject"><option value="">All subjects</option>{% for group in subject_groups %}<optgroup label="{{ group.category }}">{% for item in group.subjects %}<option value="{{ item.name }}" {% if filters.subject==item.name %}selected{% endif %}>{{ item.name }}</option>{% endfor %}</optgroup>{% endfor %}</select></div><div><label>Unit</label><select name="unit"><option value="">All</option>{% for x in units %}<option value="{{ x }}" {% if filters.unit==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Difficulty</label><select name="difficulty"><option value="">All</option>{% for x in ['Easy','Medium','Hard'] %}<option value="{{ x }}" {% if filters.difficulty==x %}selected{% endif %}>{{ x }}</option>{% endfor %}</select></div><div><label>Status</label><select name="status"><option value="">All</option><option value="approved" {% if filters.status=='approved' %}selected{% endif %}>Approved</option><option value="draft" {% if filters.status=='draft' %}selected{% endif %}>Draft</option></select></div></div><div class="actions"><button>Apply Filters</button><a class="btn secondary" href="{{ url_for('question_bank') }}">Reset</a></div></form></div>
 
 <form method="post" action="{{ url_for('bank_add_to_exam') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<div class="card"><div class="import-header"><div><h2>Bank Questions ({{ questions|length }})</h2><p class="muted">Only approved questions can be added to an exam.</p></div><div class="bank-add-controls"><select name="exam_id" required><option value="">Select exam…</option>{% for e in exams %}<option value="{{ e.id }}">{{ e.title }}</option>{% endfor %}</select><button class="small">Add Selected to Exam</button></div></div>
+<div class="card" id="bank-questions"><div class="import-header"><div><h2>Bank Questions ({{ questions|length }})</h2><p class="muted">Only approved questions can be added to an exam.</p></div><div class="bank-add-controls"><select name="exam_id" required><option value="">Select exam…</option>{% for e in exams %}<option value="{{ e.id }}">{{ e.title }}</option>{% endfor %}</select><button class="small">Add Selected to Exam</button></div></div>
 <div class="table-wrap"><table><tr><th></th><th>ID</th><th>Question</th><th>Academic Mapping</th><th>Difficulty</th><th>Status</th><th>Usage</th><th>Actions</th></tr>
-{% for q in questions %}<tr><td><input class="table-check" type="checkbox" name="question_ids" value="{{ q.id }}" {% if q.status!='approved' %}disabled{% endif %}></td><td>#{{ q.id }}<br><span class="muted">v{{ q.version }}</span></td><td><strong>{{ q.question }}</strong><div class="mini-meta">{{ q.tags or 'No tags' }}</div></td><td>{{ q.subject }}{% if q.unit %}<br><span class="muted">Unit {{ q.unit }}{% if q.topic %} · {{ q.topic }}{% endif %}</span>{% endif %}<br><span class="muted">{{ q.bloom_level }}{% if q.co_mapping %} · {{ q.co_mapping }}{% endif %}</span></td><td><span class="badge">{{ q.difficulty }}</span></td><td>{% if q.status=='approved' %}<span class="badge success">Approved</span>{% else %}<span class="badge gray">Draft</span>{% endif %}</td><td>{{ usage.get(q.id,0) }} exam(s)</td><td><div class="actions"><a class="btn secondary small" href="{{ url_for('edit_bank_question',question_id=q.id) }}">Edit</a>{% if staff_role in ['super_admin','exam_controller','hod'] and q.status!='approved' %}<button class="btn small" formmethod="post" formaction="{{ url_for('approve_bank_question',question_id=q.id) }}">Approve</button>{% endif %}</div></td></tr>{% else %}<tr><td colspan="8">No bank questions match the current filters.</td></tr>{% endfor %}</table></div></div></form>
+{% for q in questions %}<tr><td><input class="table-check" type="checkbox" name="question_ids" value="{{ q.id }}" {% if q.status!='approved' %}disabled{% endif %}></td><td>#{{ q.id }}<br><span class="muted">v{{ q.version }}</span></td><td><strong>{{ q.question }}</strong><div class="mini-meta">{{ q.tags or 'No tags' }}</div></td><td>{% set subject_meta=catalog_map.get(q.subject) %}{% if subject_meta %}<span class="badge gray subject-category-badge">{{ subject_meta.category }}</span><br>{% endif %}{{ q.subject }}{% if q.unit %}<br><span class="muted">Unit {{ q.unit }}{% if q.topic %} · {{ q.topic }}{% endif %}</span>{% endif %}<br><span class="muted">{{ q.bloom_level }}{% if q.co_mapping %} · {{ q.co_mapping }}{% endif %}</span></td><td><span class="badge">{{ q.difficulty }}</span></td><td>{% if q.status=='approved' %}<span class="badge success">Approved</span>{% else %}<span class="badge gray">Draft</span>{% endif %}</td><td>{{ usage.get(q.id,0) }} exam(s)</td><td><div class="actions"><a class="btn secondary small" href="{{ url_for('edit_bank_question',question_id=q.id) }}">Edit</a>{% if staff_role in ['super_admin','exam_controller','hod'] and q.status!='approved' %}<button class="btn small" formmethod="post" formaction="{{ url_for('approve_bank_question',question_id=q.id) }}">Approve</button>{% endif %}</div></td></tr>{% else %}<tr><td colspan="8">No bank questions match the current filters.</td></tr>{% endfor %}</table></div></div></form>
 {% endblock %}
