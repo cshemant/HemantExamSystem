@@ -525,7 +525,14 @@ def ensure_subject_catalog_entry(s,name,category='Custom / Other',course_semeste
         return None
     category=(category or '').strip() or 'Custom / Other'
     course_semester=(course_semester or '').strip()
-    row=s.scalar(select(SubjectCatalog).where(func.lower(SubjectCatalog.name)==name.lower()))
+    # Session uses autoflush=False, so a subject added earlier in the same
+    # request can still be pending in s.new and invisible to the SELECT below.
+    normalized_name=name.casefold()
+    row=next((obj for obj in s.new
+              if isinstance(obj,SubjectCatalog)
+              and (obj.name or '').strip().casefold()==normalized_name),None)
+    if row is None:
+        row=s.scalar(select(SubjectCatalog).where(func.lower(SubjectCatalog.name)==name.lower()))
     if row:
         # Preserve a faculty-defined category, but upgrade generic placeholders when better metadata arrives.
         if (not row.category or row.category in {'Custom / Other','Imported / Other','General'}) and category not in {'Custom / Other','Imported / Other','General'}:
@@ -543,6 +550,9 @@ def seed_subject_catalog(s):
     # Register all bundled subjects so the faculty form can use a categorized subject selector immediately.
     for pack in load_preloaded_question_banks().values():
         ensure_subject_catalog_entry(s,pack.get('subject',''),pack.get('category','Engineering'),pack.get('course_semester',''),'preloaded-library',False)
+    # Make newly queued bundled subjects visible before legacy BankQuestion
+    # subjects are checked. This prevents duplicate SubjectCatalog inserts.
+    s.flush()
     # Preserve subjects already present in older databases even if they were created before this feature existed.
     for subject,course in s.execute(select(BankQuestion.subject,BankQuestion.course_semester).distinct()).all():
         ensure_subject_catalog_entry(s,subject,'Custom / Other',course,'legacy-question-bank',False)
