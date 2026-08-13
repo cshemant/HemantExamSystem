@@ -355,6 +355,13 @@ def audit_event(s,action,entity_type='',entity_id='',details=''):
 
 ROLE_LABELS={'super_admin':'Super Admin','exam_controller':'Exam Controller','hod':'HOD','faculty':'Faculty'}
 APPROVER_ROLES={'super_admin','exam_controller','hod'}
+FACULTY_DAILY_SELF_APPROVAL_LIMIT=3
+EXAM_CREATION_AUDIT_ACTIONS={
+    'exam_created',
+    'catalog_subject_exam_created',
+    'ready_exam_created',
+    'unit_set_exam_created',
+}
 
 
 def get_institution(s=None,create=True):
@@ -374,9 +381,226 @@ def current_staff_role(s=None):
     return row.role if row and row.role in ROLE_LABELS else 'faculty'
 
 
+def current_staff_name(s=None):
+    """Return the human name for the currently signed-in staff account.
+
+    The dashboard must identify the person/account, not merely the permission role
+    (for example, show ``Hemant Dashboard`` while the header role chip can still
+    show ``HOD``). Existing sessions are supported by resolving the account from
+    either ``user_id`` or ``username``.
+    """
+    role=web_session.get('role')
+    username=(web_session.get('username') or '').strip()
+
+    def readable_username(value):
+        return value.replace('.',' ').replace('_',' ').replace('-',' ').strip().title()
+
+    if role=='faculty':
+        s=s or DB(); uid=web_session.get('user_id')
+        row=s.get(Faculty,uid) if uid else None
+        if row is None and username:
+            row=s.scalar(select(Faculty).where(Faculty.username==username))
+        if row:
+            account_name=(row.name or '').strip()
+            account_username=(row.username or username or '').strip()
+            # A few older accounts were created with the role itself in the Name
+            # field (e.g. "HOD"). In that case the username is a better account
+            # identifier than repeating the role as the dashboard title.
+            generic_role_names={'hod','faculty','admin','administrator','exam controller','super admin','staff'}
+            if account_name and account_name.casefold() not in generic_role_names:
+                return account_name
+            if account_username:
+                return readable_username(account_username)
+            if account_name:
+                return account_name
+
+    if role=='admin':
+        configured=(os.getenv('SUPER_ADMIN_DISPLAY_NAME') or '').strip()
+        if configured:
+            return configured
+
+    readable=readable_username(username)
+    return readable if readable else 'Staff'
+
+
 def can_approve_exams(s=None): return current_staff_role(s) in APPROVER_ROLES
 
 def can_approve_content(s=None): return current_staff_role(s) in APPROVER_ROLES
+
+def exam_owner_actor(s,exam_id):
+    """Return the staff actor that originally created an exam.
+
+    Ownership is derived from the immutable audit trail so this policy works with
+    existing databases without adding a new schema column.
+    """
+    owner=s.scalar(select(AuditLog.actor).where(
+        AuditLog.entity_type=='exam',
+        AuditLog.entity_id==str(exam_id),
+        AuditLog.action.in_(tuple(EXAM_CREATION_AUDIT_ACTIONS)),
+    ).order_by(AuditLog.id.asc()).limit(1))
+    if owner:
+        return owner
+    approval=get_exam_approval(s,exam_id,create=False)
+    return (approval.requested_by or '') if approval else ''
+
+def _stored_local_date(value):
+    value=(value or '').strip()
+    if not value:
+        return ''
+    try:
+        return parse_dt(value).astimezone(DISPLAY_TZ).date().isoformat()
+    except Exception:
+        try:
+            return datetime.fromisoformat(value).date().isoformat()
+        except Exception:
+            return ''
+
+def exam_scheduled_dates(s,exam_id):
+    dates=set()
+    for value in s.scalars(select(ExamSession.scheduled_start).where(ExamSession.exam_id==exam_id)).all():
+        day=_stored_local_date(value)
+        if day:
+            dates.add(day)
+    return dates
+
+def faculty_exam_ids_for_day(s,owner_actor,target_day,include_exam_id=None):
+    """Return a faculty member's exams for one day in conducting order.
+
+    Scheduled exams are ordered by their earliest session start on that day.
+    Unscheduled exams fall back to activation/creation time. This lets only the
+    4th and subsequent exams require external approval instead of blocking the
+    faculty member's first three exams merely because a fourth is also planned.
+    """
+    created=s.execute(select(AuditLog.entity_id).where(
+        AuditLog.entity_type=='exam',
+        AuditLog.actor==owner_actor,
+        AuditLog.action.in_(tuple(EXAM_CREATION_AUDIT_ACTIONS)),
+    )).all()
+    ids=set()
+    for (raw_id,) in created:
+        try:
+            ids.add(int(raw_id))
+        except (TypeError,ValueError):
+            continue
+    if include_exam_id:
+        ids.add(int(include_exam_id))
+    today=now_dt().date().isoformat()
+    entries=[]
+    for exam_id in ids:
+        exam=s.get(Exam,exam_id)
+        if not exam:
+            continue
+        starts=[]
+        for value in s.scalars(select(ExamSession.scheduled_start).where(ExamSession.exam_id==exam_id)).all():
+            if _stored_local_date(value)==target_day:
+                try:
+                    starts.append(parse_dt(value).astimezone(DISPLAY_TZ))
+                except Exception:
+                    pass
+        all_scheduled_dates=exam_scheduled_dates(s,exam_id)
+        occurs=bool(starts)
+        sort_dt=min(starts) if starts else None
+        if not all_scheduled_dates:
+            activated=s.scalars(select(AuditLog.created_at).where(
+                AuditLog.entity_type=='exam',
+                AuditLog.entity_id==str(exam_id),
+                AuditLog.action=='exam_activated',
+                AuditLog.actor==owner_actor,
+            ).order_by(AuditLog.id.asc())).all()
+            activation_on_day=[]
+            for value in activated:
+                if _stored_local_date(value)==target_day:
+                    try:
+                        activation_on_day.append(parse_dt(value).astimezone(DISPLAY_TZ))
+                    except Exception:
+                        pass
+            if activation_on_day:
+                occurs=True
+                sort_dt=min(activation_on_day)
+            elif target_day==today and exam.is_active:
+                occurs=True
+            if occurs and sort_dt is None:
+                try:
+                    sort_dt=parse_dt(exam.created_at).astimezone(DISPLAY_TZ)
+                except Exception:
+                    sort_dt=now_dt()
+        if exam_id==include_exam_id:
+            occurs=True
+            if sort_dt is None:
+                try:
+                    sort_dt=parse_dt(exam.created_at).astimezone(DISPLAY_TZ)
+                except Exception:
+                    sort_dt=now_dt()
+        if occurs:
+            entries.append((sort_dt or now_dt(),exam_id))
+    entries.sort(key=lambda item:(item[0],item[1]))
+    return [exam_id for _,exam_id in entries]
+
+def exam_counts_for_faculty_day(s,owner_actor,target_day,include_exam_id=None):
+    return len(faculty_exam_ids_for_day(s,owner_actor,target_day,include_exam_id=include_exam_id))
+
+def faculty_exam_ordinal_for_day(s,owner_actor,target_day,exam_id):
+    ids=faculty_exam_ids_for_day(s,owner_actor,target_day,include_exam_id=exam_id)
+    try:
+        return ids.index(int(exam_id))+1,len(ids)
+    except ValueError:
+        return 1,max(1,len(ids))
+
+def exam_approval_policy(s,exam):
+    """Return the approval rule for the currently logged-in staff member.
+
+    Ordinary Faculty may self-approve their own first three exams on a day.
+    The fourth and subsequent exams on the same day require approval from an HOD,
+    Exam Controller or Super Admin. Privileged approvers retain their normal rights.
+    """
+    role=current_staff_role(s)
+    result={
+        'role':role,
+        'limit':FACULTY_DAILY_SELF_APPROVAL_LIMIT,
+        'owner_actor':exam_owner_actor(s,exam.id),
+        'self_approval_allowed':False,
+        'external_approval_required':False,
+        'daily_exam_count':0,
+        'date_counts':{},
+        'date_labels':[],
+        'message':'',
+    }
+    if role!='faculty':
+        return result
+    actor=actor_label(s)
+    if result['owner_actor'] and result['owner_actor']!=actor:
+        result['external_approval_required']=True
+        result['message']='This exam was created by another staff account, so faculty self-approval is not available.'
+        return result
+    if not result['owner_actor']:
+        result['external_approval_required']=True
+        result['message']='Exam ownership could not be verified from the audit trail; HOD / Exam Controller approval is required.'
+        return result
+    dates=exam_scheduled_dates(s,exam.id)
+    if not dates:
+        dates={now_dt().date().isoformat()}
+    counts={}
+    ordinals={}
+    for day in sorted(dates):
+        ordinal,total=faculty_exam_ordinal_for_day(s,actor,day,exam.id)
+        counts[day]=total
+        ordinals[day]=ordinal
+    max_count=max(counts.values(),default=1)
+    result['date_counts']=counts
+    result['daily_exam_count']=max_count
+    result['date_labels']=[datetime.fromisoformat(day).strftime('%d %b %Y') for day in counts]
+    result['external_approval_required']=any(ordinal>FACULTY_DAILY_SELF_APPROVAL_LIMIT for ordinal in ordinals.values())
+    result['self_approval_allowed']=not result['external_approval_required']
+    if result['external_approval_required']:
+        blocked_day=next(day for day in sorted(ordinals) if ordinals[day]>FACULTY_DAILY_SELF_APPROVAL_LIMIT)
+        result['message']=(f'External approval required: this is exam #{ordinals[blocked_day]} of {counts[blocked_day]} on '
+                           f'{datetime.fromisoformat(blocked_day).strftime("%d %b %Y")}. '
+                           f'Faculty may self-approve only their first {FACULTY_DAILY_SELF_APPROVAL_LIMIT} exams per day.')
+    else:
+        detail=', '.join(f'{datetime.fromisoformat(day).strftime("%d %b %Y")}: exam #{ordinals[day]} of {counts[day]}' for day in sorted(ordinals))
+        result['message']=(f'Self-approval allowed ({detail}). Faculty may self-approve their first '
+                           f'{FACULTY_DAILY_SELF_APPROVAL_LIMIT} exams per day; activation will approve this exam automatically.')
+    return result
 
 def can_manage_staff_passwords(s=None):
     """Super Admin can reset any staff password; HOD can reset Faculty passwords only."""
@@ -702,10 +926,10 @@ def csrf_and_session_setup():
 @app.context_processor
 def globals_for_templates():
     try:
-        s=DB();institution=get_institution(s,create=True);staff_role=current_staff_role(s) if web_session.get('role') in {'admin','faculty'} else web_session.get('role','')
+        s=DB();institution=get_institution(s,create=True);staff_role=current_staff_role(s) if web_session.get('role') in {'admin','faculty'} else web_session.get('role','');staff_display_name=current_staff_name(s) if web_session.get('role') in {'admin','faculty'} else ''
     except Exception:
-        institution=None;staff_role=web_session.get('role','')
-    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'is_online':APP_MODE=='online','app_version':APP_VERSION,'institution':institution,'staff_role':staff_role,'staff_role_label':ROLE_LABELS.get(staff_role,staff_role.replace('_',' ').title() if staff_role else '')}
+        institution=None;staff_role=web_session.get('role','');staff_display_name=(web_session.get('username') or '').replace('.',' ').replace('_',' ').strip().title()
+    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'is_online':APP_MODE=='online','app_version':APP_VERSION,'institution':institution,'staff_role':staff_role,'staff_role_label':ROLE_LABELS.get(staff_role,staff_role.replace('_',' ').title() if staff_role else ''),'staff_display_name':staff_display_name}
 
 @app.before_request
 def offline_first_run_guard():
@@ -950,7 +1174,7 @@ def home():
             if not row:
                 row=s.scalar(select(Faculty).where(Faculty.username==username,Faculty.is_active==True)); role='faculty'
             if row and check_password_hash(row.password_hash,password):
-                csrf=web_session.get('_csrf_token'); web_session.clear(); web_session['_csrf_token']=csrf; web_session.update(role=role,user_id=row.id,username=row.username,_last_activity=int(time.time()))
+                csrf=web_session.get('_csrf_token'); web_session.clear(); web_session['_csrf_token']=csrf; web_session.update(role=role,user_id=row.id,username=row.username,display_name=((getattr(row,'name','') or row.username).strip()),_last_activity=int(time.time()))
                 audit_event(s,'staff_login','user',row.id,role); s.commit(); return redirect(url_for('admin_dashboard'))
         else:
             row=s.scalar(select(Student).where(Student.roll_no==request.form.get('roll_no','').strip()))
@@ -1478,7 +1702,9 @@ def exams():
     raw=s.execute(select(Exam,func.count(Question.id)).outerjoin(Question,Question.exam_id==Exam.id).group_by(Exam.id).order_by(Exam.id.desc())).all();rows=[]
     for e,count in raw:
         cfg=get_exam_config(s,e.id);target=(cfg.question_count if cfg and cfg.question_count else count)
-        approval=get_exam_approval(s,e.id,create=True);session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.exam_id==e.id)) or 0;rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count})())
+        approval=get_exam_approval(s,e.id,create=True);session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.exam_id==e.id)) or 0
+        policy=exam_approval_policy(s,e)
+        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count']})())
     return render_template('exams.html',exams=rows)
 
 @app.route('/admin/exam/<int:exam_id>/toggle',methods=['POST'])
@@ -1492,8 +1718,14 @@ def toggle_exam(exam_id):
             if approval.status!='approved':
                 if can_approve_exams(s):
                     approval.status='approved';approval.reviewed_by=actor_label(s);approval.reviewed_at=now_iso();approval.comments='Approved during activation';audit_event(s,'exam_approved','exam',e.id,'approved during activation')
+                elif current_staff_role(s)=='faculty':
+                    policy=exam_approval_policy(s,e)
+                    if policy['self_approval_allowed']:
+                        approval.status='approved';approval.reviewed_by=actor_label(s);approval.reviewed_at=now_iso();approval.comments=f'Faculty self-approved under <= {FACULTY_DAILY_SELF_APPROVAL_LIMIT} exams/day policy';audit_event(s,'exam_self_approved','exam',e.id,policy['message'])
+                    else:
+                        flash(policy['message'] or 'This exam requires HOD / Exam Controller approval before activation. Use Request Approval first.','error');return redirect(request.referrer or url_for('exams'))
                 else:
-                    flash('This exam requires HOD / Exam Controller approval before activation. Use Request Approval first.','error');return redirect(url_for('exams'))
+                    flash('This exam requires HOD / Exam Controller approval before activation. Use Request Approval first.','error');return redirect(request.referrer or url_for('exams'))
         e.is_active=not bool(e.is_active);audit_event(s,'exam_activated' if e.is_active else 'exam_deactivated','exam',e.id,e.title);s.commit()
     return redirect(url_for('exams'))
 
@@ -1578,7 +1810,7 @@ def exam_builder(exam_id):
     subjects=s.scalars(select(BankQuestion.subject).where(BankQuestion.status=='approved').distinct().order_by(BankQuestion.subject)).all();pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0;attempt_count=s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0
     try:unit_weights_display=', '.join(f'{k}:{v}' for k,v in json.loads(cfg.unit_weights or '{}').items())
     except Exception:unit_weights_display=''
-    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);return render_template('exam_builder.html',exam=exam,cfg=cfg,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,group_label=group_label,can_approve=can_approve_exams(s))
+    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);approval_policy=exam_approval_policy(s,exam);return render_template('exam_builder.html',exam=exam,cfg=cfg,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,approval_policy=approval_policy,group_label=group_label,can_approve=can_approve_exams(s))
 
 @app.route('/admin/exam/<int:exam_id>/questions',methods=['GET','POST'])
 @staff_required
