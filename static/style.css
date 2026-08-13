@@ -220,3 +220,32 @@ body.mobile-menu-open{overflow:hidden}
 .subject-exam-form label{min-width:145px;margin:0}
 .subject-exam-form input{margin-top:6px;min-width:120px}
 @media (max-width:700px){.subject-exam-form{width:100%}.subject-exam-form label,.subject-exam-form button{width:100%}.subject-exam-form input{width:100%}}
+
+/* Student answer review — available only for submitted attempts. */
+.answer-review-head .muted{max-width:760px}
+.answer-review-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.answer-review-summary>div{display:flex;flex-direction:column;gap:3px;padding:4px 8px}
+.answer-review-summary strong{font-size:18px;color:var(--text)}
+.answer-review-summary span{font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.answer-question-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}
+.answer-question-head h2{font-size:19px;margin:0;line-height:1.45;letter-spacing:-.01em}
+.answer-comparison{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.answer-box{border:1px solid var(--border);border-radius:14px;padding:15px;background:#f8fafc;display:flex;flex-direction:column;gap:7px}
+.answer-box.answer-correct,.correct-answer{background:#ecfdf3;border-color:#abefc6}
+.answer-box.answer-wrong{background:#fff6f5;border-color:#fecdca}
+.answer-label{font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.answer-box strong{font-size:15px;line-height:1.45}
+.answer-options-details{margin-top:14px;border-top:1px solid var(--border);padding-top:12px}
+.answer-options-details summary{cursor:pointer;color:var(--primary);font-weight:800;font-size:13px}
+.answer-option-list{display:grid;gap:8px;margin-top:12px}
+.answer-option-row{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:#fff;font-size:13px}
+.answer-option-row.correct-option{border-color:#abefc6;background:#f6fef9}
+.answer-option-row.selected-wrong-option{border-color:#fecdca;background:#fff8f7}
+.answer-option-tags{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;flex-shrink:0}
+@media(max-width:700px){
+  .answer-review-summary{grid-template-columns:1fr}
+  .answer-question-head{flex-direction:column}
+  .answer-comparison{grid-template-columns:1fr}
+  .answer-option-row{flex-direction:column}
+  .answer-option-tags{justify-content:flex-start}
+}

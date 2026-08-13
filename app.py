@@ -1919,7 +1919,60 @@ def submitted(exam_id):
     if attempt.status!='submitted' and now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt)
     violations=s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0
     percentage,grade,grade_class=result_performance(attempt.score,attempt.total_marks)
-    return render_template('submitted.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,violations=violations,percentage=percentage,grade=grade,grade_class=grade_class)
+    return render_template('submitted.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,violations=violations,percentage=percentage,grade=grade,grade_class=grade_class,answer_review_exam_id=exam.id if attempt.status=='submitted' else None)
+
+@app.route('/student/submitted/<int:exam_id>/answers')
+@student_required
+def submitted_answers(exam_id):
+    s=DB();exam=s.get(Exam,exam_id);attempt=get_attempt(s,web_session['user_id'],exam_id)
+    # Answer review is deliberately available only after this student's exam has been submitted.
+    if not exam or not attempt or attempt.status!='submitted':abort(404)
+
+    aq_rows=s.scalars(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id).order_by(AttemptQuestion.position)).all()
+    if aq_rows:
+        ordered=[(row.position,row.question_id,row.option_order or 'ABCD') for row in aq_rows]
+    else:
+        ordered=[(pos,qid,'ABCD') for pos,qid in enumerate(attempt_question_ids(s,attempt),1)]
+
+    qids=[qid for _pos,qid,_order in ordered]
+    qrows=s.scalars(select(Question).where(Question.id.in_(qids))).all() if qids else []
+    qmap={q.id:q for q in qrows}
+    saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all()
+    amap={a.question_id:a.selected_answer for a in saved}
+    views=[]
+
+    for position,qid,option_order in ordered:
+        q=qmap.get(qid)
+        if not q:continue
+        text={'A':q.option_a,'B':q.option_b,'C':q.option_c,'D':q.option_d}
+        order=option_order if len(option_order)==4 and set(option_order)==set('ABCD') else 'ABCD'
+        display_label={key:chr(65+i) for i,key in enumerate(order)}
+        student_key=amap.get(q.id)
+        correct_key=q.correct_answer
+        options=[]
+        for i,key in enumerate(order):
+            options.append(type('AnswerOptionView',(),{
+                'label':chr(65+i),
+                'key':key,
+                'text':text[key],
+                'is_student':student_key==key,
+                'is_correct':correct_key==key,
+            })())
+        views.append(type('AnswerReviewView',(),{
+            'position':position,
+            'question':q.question,
+            'marks':q.marks,
+            'student_key':student_key,
+            'student_label':display_label.get(student_key,'') if student_key else '',
+            'student_text':text.get(student_key,'') if student_key else '',
+            'correct_key':correct_key,
+            'correct_label':display_label.get(correct_key,correct_key),
+            'correct_text':text.get(correct_key,''),
+            'is_correct':bool(student_key and student_key==correct_key),
+            'options':options,
+        })())
+
+    return render_template('submitted_answers.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,questions=views,answer_review_exam_id=exam.id)
 
 @app.errorhandler(400)
 def bad_request(e):return render_template('error.html',heading='Invalid or expired request',message=getattr(e,'description','Please refresh the page and try again.')),400

@@ -1,0 +1,54 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head answer-review-head">
+  <div class="eyebrow">Submitted answer review</div>
+  <h1>{{ display_title }}</h1>
+  <p class="muted">Your submitted answer and the correct answer are shown below for this completed exam.</p>
+</div>
+
+<div class="answer-review-summary card soft">
+  <div><strong>{{ attempt.score }} / {{ attempt.total_marks }}</strong><span>Final score</span></div>
+  <div><strong>{{ questions|length }}</strong><span>Questions reviewed</span></div>
+  <div><strong>{{ attempt.submitted_at|dt }}</strong><span>Submitted</span></div>
+</div>
+
+{% for q in questions %}
+<section class="card answer-review-card">
+  <div class="answer-question-head">
+    <h2>Q{{ q.position }}. {{ q.question }}</h2>
+    <span class="badge {{ 'success' if q.is_correct else 'gray' }}">{{ 'Correct' if q.is_correct else 'Incorrect / Not answered' }}</span>
+  </div>
+
+  <div class="answer-comparison">
+    <div class="answer-box student-answer {{ 'answer-correct' if q.is_correct else 'answer-wrong' }}">
+      <span class="answer-label">Your submitted answer</span>
+      {% if q.student_key %}
+        <strong>{{ q.student_label }}. {{ q.student_text }}</strong>
+      {% else %}
+        <strong>Not answered</strong>
+      {% endif %}
+    </div>
+    <div class="answer-box correct-answer">
+      <span class="answer-label">Correct answer</span>
+      <strong>{{ q.correct_label }}. {{ q.correct_text }}</strong>
+    </div>
+  </div>
+
+  <details class="answer-options-details">
+    <summary>View all options</summary>
+    <div class="answer-option-list">
+      {% for option in q.options %}
+      <div class="answer-option-row{% if option.is_correct %} correct-option{% endif %}{% if option.is_student and not option.is_correct %} selected-wrong-option{% endif %}">
+        <span><strong>{{ option.label }}.</strong> {{ option.text }}</span>
+        <span class="answer-option-tags">
+          {% if option.is_student %}<span class="badge gray">Your answer</span>{% endif %}
+          {% if option.is_correct %}<span class="badge success">Correct answer</span>{% endif %}
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+</section>
+{% else %}
+<div class="card"><p class="muted">No submitted questions were found for this attempt.</p></div>
+{% endfor %}
+{% endblock %}
