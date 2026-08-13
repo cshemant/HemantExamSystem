@@ -1,5 +1,41 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div class="eyebrow">Role-based access</div><h1>Staff Users</h1><p class="muted">Super Admin controls system settings. Exam Controller and HOD can approve examinations; Faculty prepares academic content and requests approval.</p></div>
-<div class="card"><h2>Create Staff Login</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Name</label><input name="name" required></div><div><label>Username</label><input name="username" required></div><div><label>Password</label><input type="password" name="password" minlength="10" required></div><div><label>Role</label><select name="staff_role"><option value="faculty">Faculty</option><option value="hod">HOD</option><option value="exam_controller">Exam Controller</option></select></div><div><label>Department</label><input name="department" placeholder="CSE"></div></div><button>Create Staff Login</button></form></div>
-<div class="card"><h2>Staff Accounts</h2><div class="table-wrap"><table><tr><th>Username</th><th>Name</th><th>Role</th><th>Department</th><th>Status</th><th>Actions</th></tr>{% for f in faculty %}{% set role=role_map.get(f.id) %}<tr><td><strong>{{ f.username }}</strong></td><td>{{ f.name }}</td><td><span class="badge">{{ role_labels.get(role.role if role else 'faculty','Faculty') }}</span></td><td>{{ role.department if role else '-' }}</td><td>{% if f.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge gray">Disabled</span>{% endif %}</td><td><div class="actions"><form method="post" action="{{ url_for('update_faculty_role',faculty_id=f.id) }}" class="inline-role-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><select name="staff_role"><option value="faculty" {% if not role or role.role=='faculty' %}selected{% endif %}>Faculty</option><option value="hod" {% if role and role.role=='hod' %}selected{% endif %}>HOD</option><option value="exam_controller" {% if role and role.role=='exam_controller' %}selected{% endif %}>Exam Controller</option></select><input name="department" value="{{ role.department if role else '' }}" placeholder="Dept"><button class="btn small secondary">Update</button></form><form method="post" action="{{ url_for('toggle_faculty',faculty_id=f.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">{% if f.is_active %}Disable{% else %}Enable{% endif %}</button></form></div></td></tr>{% else %}<tr><td colspan="6">No staff accounts created yet.</td></tr>{% endfor %}</table></div></div>
+<div class="page-head">
+  <div class="eyebrow">Role-based access</div>
+  <h1>{% if viewer_role=='hod' %}Faculty Password Management{% else %}Staff Users{% endif %}</h1>
+  {% if viewer_role=='hod' %}
+    <p class="muted">As HOD, you can reset passwords for Faculty accounts only. HOD, Exam Controller and Super Admin credentials are not available from this page.</p>
+  {% else %}
+    <p class="muted">Super Admin controls staff accounts and can reset passwords for Faculty, HOD and Exam Controller users. The configured Super Admin password remains environment-managed.</p>
+  {% endif %}
+</div>
+
+{% if viewer_role=='super_admin' %}
+<div class="card"><h2>Create Staff Login</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Name</label><input name="name" required></div><div><label>Username</label><input name="username" required></div><div><label>Password</label><input type="password" name="password" minlength="10" required autocomplete="new-password"></div><div><label>Role</label><select name="staff_role"><option value="faculty">Faculty</option><option value="hod">HOD</option><option value="exam_controller">Exam Controller</option></select></div><div><label>Department</label><input name="department" placeholder="CSE"></div></div><button>Create Staff Login</button></form></div>
+{% endif %}
+
+<div class="card"><h2>{% if viewer_role=='hod' %}Faculty Accounts{% else %}Staff Accounts{% endif %}</h2>
+<div class="table-wrap"><table><tr><th>Username</th><th>Name</th><th>Role</th><th>Department</th><th>Status</th><th>Actions</th></tr>
+{% for f in faculty %}{% set role=role_map.get(f.id) %}{% set target_role=role.role if role else 'faculty' %}
+<tr>
+  <td><strong>{{ f.username }}</strong></td><td>{{ f.name }}</td><td><span class="badge">{{ role_labels.get(target_role,'Faculty') }}</span></td><td>{{ role.department if role else '-' }}</td><td>{% if f.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge gray">Disabled</span>{% endif %}</td>
+  <td><div class="actions staff-account-actions">
+    {% if viewer_role=='super_admin' %}
+    <form method="post" action="{{ url_for('update_faculty_role',faculty_id=f.id) }}" class="inline-role-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><select name="staff_role"><option value="faculty" {% if target_role=='faculty' %}selected{% endif %}>Faculty</option><option value="hod" {% if target_role=='hod' %}selected{% endif %}>HOD</option><option value="exam_controller" {% if target_role=='exam_controller' %}selected{% endif %}>Exam Controller</option></select><input name="department" value="{{ role.department if role else '' }}" placeholder="Dept"><button class="btn small secondary">Update</button></form>
+    <form method="post" action="{{ url_for('toggle_faculty',faculty_id=f.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">{% if f.is_active %}Disable{% else %}Enable{% endif %}</button></form>
+    {% endif %}
+    {% if viewer_role=='super_admin' or (viewer_role=='hod' and target_role=='faculty') %}
+    <details class="password-reset-panel">
+      <summary class="btn small secondary">Reset Password</summary>
+      <form method="post" action="{{ url_for('reset_faculty_password',faculty_id=f.id) }}" class="password-reset-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>New Password</label><input type="password" name="new_password" minlength="10" required autocomplete="new-password" placeholder="Minimum 10 characters">
+        <label>Confirm Password</label><input type="password" name="confirm_password" minlength="10" required autocomplete="new-password" placeholder="Re-enter new password">
+        <button class="btn small">Save New Password</button>
+      </form>
+    </details>
+    {% endif %}
+  </div></td>
+</tr>
+{% else %}<tr><td colspan="6">No accounts are available for password management.</td></tr>{% endfor %}
+</table></div></div>
 {% endblock %}

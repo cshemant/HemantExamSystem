@@ -378,6 +378,10 @@ def can_approve_exams(s=None): return current_staff_role(s) in APPROVER_ROLES
 
 def can_approve_content(s=None): return current_staff_role(s) in APPROVER_ROLES
 
+def can_manage_staff_passwords(s=None):
+    """Super Admin can reset any staff password; HOD can reset Faculty passwords only."""
+    return current_staff_role(s) in {'super_admin','hod'}
+
 
 def get_exam_approval(s,exam_id,create=True):
     row=s.scalar(select(ExamApproval).where(ExamApproval.exam_id==exam_id))
@@ -1772,10 +1776,15 @@ def exam_centre_network_info():
     return response
 
 @app.route('/admin/faculty',methods=['GET','POST'])
-@admin_required
+@staff_required
 def faculty_users():
-    s=DB()
+    s=DB();viewer_role=current_staff_role(s)
+    if viewer_role not in {'super_admin','hod'}:
+        abort(403)
     if request.method=='POST':
+        # Only the Super Admin may create staff accounts or assign privileged roles.
+        if viewer_role!='super_admin':
+            abort(403)
         username=request.form.get('username','').strip();name=request.form.get('name','').strip();password=request.form.get('password','')
         if len(username)<3 or not name or len(password)<10:flash('Faculty name, a 3+ character username and a 10+ character password are required.','error')
         elif username.casefold()==super_admin_username.casefold():flash('That username is reserved for the Super Admin account.','error')
@@ -1784,7 +1793,44 @@ def faculty_users():
                 role=request.form.get('staff_role','faculty') if request.form.get('staff_role') in {'faculty','hod','exam_controller'} else 'faculty'
                 row=Faculty(username=username,name=name,password_hash=generate_password_hash(password),is_active=True,created_at=now_iso());s.add(row);s.flush();s.add(FacultyRole(faculty_id=row.id,role=role,department=request.form.get('department','').strip(),updated_at=now_iso()));audit_event(s,'faculty_created','faculty',row.id,f'{username}, role={role}');s.commit();flash('Staff login created.')
             except IntegrityError:s.rollback();flash('That faculty username already exists.','error')
-    rows=s.scalars(select(Faculty).order_by(Faculty.username)).all();role_map={r.faculty_id:r for r in s.scalars(select(FacultyRole)).all()};return render_template('faculty.html',faculty=rows,role_map=role_map,role_labels=ROLE_LABELS)
+    rows=s.scalars(select(Faculty).order_by(Faculty.username)).all()
+    role_map={r.faculty_id:r for r in s.scalars(select(FacultyRole)).all()}
+    # HOD users are deliberately shown Faculty accounts only. They cannot view or
+    # manage another HOD, an Exam Controller, or the Super Admin account here.
+    if viewer_role=='hod':
+        rows=[f for f in rows if (role_map.get(f.id).role if role_map.get(f.id) else 'faculty')=='faculty']
+    return render_template('faculty.html',faculty=rows,role_map=role_map,role_labels=ROLE_LABELS,viewer_role=viewer_role)
+
+@app.route('/admin/faculty/<int:faculty_id>/password',methods=['POST'])
+@staff_required
+def reset_faculty_password(faculty_id):
+    s=DB();actor_role=current_staff_role(s)
+    if actor_role not in {'super_admin','hod'}:
+        abort(403)
+    target=s.get(Faculty,faculty_id)
+    if not target:
+        abort(404)
+    target_role_row=s.scalar(select(FacultyRole).where(FacultyRole.faculty_id==faculty_id))
+    target_role=target_role_row.role if target_role_row and target_role_row.role in ROLE_LABELS else 'faculty'
+    if actor_role=='hod':
+        # HOD may reset only ordinary Faculty accounts, never HOD/Controller/Super Admin.
+        if target_role!='faculty':
+            abort(403)
+        if web_session.get('role')=='faculty' and int(web_session.get('user_id') or 0)==faculty_id:
+            abort(403)
+    password=request.form.get('new_password','')
+    confirm=request.form.get('confirm_password','')
+    if len(password)<10:
+        flash('New password must contain at least 10 characters.','error')
+        return redirect(url_for('faculty_users'))
+    if password!=confirm:
+        flash('New password and confirmation do not match.','error')
+        return redirect(url_for('faculty_users'))
+    target.password_hash=generate_password_hash(password)
+    audit_event(s,'staff_password_reset','faculty',target.id,f'target={target.username}, role={target_role}')
+    s.commit()
+    flash(f'Password updated for {target.username}.')
+    return redirect(url_for('faculty_users'))
 
 @app.route('/admin/faculty/<int:faculty_id>/toggle',methods=['POST'])
 @admin_required

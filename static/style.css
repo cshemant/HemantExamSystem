@@ -249,3 +249,15 @@ body.mobile-menu-open{overflow:hidden}
   .answer-option-row{flex-direction:column}
   .answer-option-tags{justify-content:flex-start}
 }
+
+/* Staff password reset workflow */
+.staff-account-actions{align-items:flex-start}
+.password-reset-panel{position:relative}
+.password-reset-panel>summary{list-style:none;user-select:none}
+.password-reset-panel>summary::-webkit-details-marker{display:none}
+.password-reset-panel[open]>summary{border-color:#b9cdf8;background:#f5f8ff}
+.password-reset-form{display:grid;gap:7px;min-width:270px;margin-top:8px;padding:13px;border:1px solid var(--border);border-radius:12px;background:#fff;box-shadow:0 12px 28px rgba(16,24,40,.10)}
+.password-reset-form label{font-size:12px;margin:0}
+.password-reset-form input{margin:0;min-width:240px;padding:9px 10px}
+.password-reset-form .btn{margin-top:2px}
+@media(max-width:700px){.password-reset-panel,.password-reset-form{width:100%}.password-reset-form{min-width:0}.password-reset-form input{min-width:0;width:100%}.staff-account-actions{flex-direction:column;align-items:stretch}}

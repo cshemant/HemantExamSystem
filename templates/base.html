@@ -21,6 +21,7 @@
     <a href="{{ url_for('results') }}">Results</a>
     <a href="{{ url_for('analytics') }}">Analytics</a>
     <a href="{{ url_for('exam_centre') }}">Exam Centre</a>
+    {% if staff_role in ['super_admin','hod'] %}<a href="{{ url_for('faculty_users') }}">Staff</a>{% endif %}
     {% if web_session.get('role') == 'admin' %}<a href="{{ url_for('system_tools') }}">System</a>{% endif %}
   </nav>
   {% elif web_session.get('role') == 'student' %}
@@ -45,7 +46,7 @@
     {% if web_session.get('role') in ['admin','faculty'] %}<div class="mobile-role">Signed in as {{ staff_role_label }}</div>{% endif %}
     <nav class="mobile-menu-links" aria-label="Mobile navigation">
       {% if web_session.get('role') in ['admin','faculty'] %}
-        <a href="{{ url_for('admin_dashboard') }}">Dashboard</a><a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches & Sections</a><a href="{{ url_for('question_bank') }}">Question Bank</a><a href="{{ url_for('exams') }}">Exams</a><a href="{{ url_for('results') }}">Results</a><a href="{{ url_for('analytics') }}">Analytics</a><a href="{{ url_for('exam_centre') }}">Exam Centre</a>{% if web_session.get('role') == 'admin' %}<a href="{{ url_for('system_tools') }}">System</a>{% endif %}
+        <a href="{{ url_for('admin_dashboard') }}">Dashboard</a><a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches & Sections</a><a href="{{ url_for('question_bank') }}">Question Bank</a><a href="{{ url_for('exams') }}">Exams</a><a href="{{ url_for('results') }}">Results</a><a href="{{ url_for('analytics') }}">Analytics</a><a href="{{ url_for('exam_centre') }}">Exam Centre</a>{% if staff_role in ['super_admin','hod'] %}<a href="{{ url_for('faculty_users') }}">Staff</a>{% endif %}{% if web_session.get('role') == 'admin' %}<a href="{{ url_for('system_tools') }}">System</a>{% endif %}
       {% elif web_session.get('role') == 'student' %}<a href="{{ url_for('student_dashboard') }}">My Exams</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}{% endif %}
       <a class="mobile-logout" href="{{ url_for('logout') }}">Logout</a>
     </nav>
