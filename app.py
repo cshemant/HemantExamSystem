@@ -1,6 +1,7 @@
 import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from functools import wraps
 from urllib.parse import urlparse
 
@@ -33,6 +34,15 @@ OFFLINE_DOWNLOAD_URL=os.getenv('OFFLINE_DOWNLOAD_URL',DEFAULT_OFFLINE_DOWNLOAD_U
 OFFLINE_REQUIRE_SETUP=os.getenv('OFFLINE_REQUIRE_SETUP','0').strip().lower() in {'1','true','yes','on'}
 SESSION_TIMEOUT_MINUTES=max(10,int(os.getenv('SESSION_TIMEOUT_MINUTES','45')))
 BACKUP_KDF_ITERATIONS=max(100000,int(os.getenv('BACKUP_KDF_ITERATIONS','390000')))
+
+# All user-facing dates/times use an explicit timezone so cloud hosts such as
+# Render (which commonly run in UTC) and offline Windows builds show the same time.
+APP_TIMEZONE=os.getenv('APP_TIMEZONE','Asia/Kolkata').strip() or 'Asia/Kolkata'
+try:
+    DISPLAY_TZ=ZoneInfo(APP_TIMEZONE)
+except Exception:
+    # Safe fallback for Indian deployments if the configured zone is unavailable.
+    DISPLAY_TZ=timezone(timedelta(hours=5,minutes=30))
 
 APP_MODE=os.getenv('APP_MODE','offline').strip().lower()
 if APP_MODE not in {'offline','online'}: raise RuntimeError('APP_MODE must be offline or online')
@@ -305,9 +315,21 @@ class ExamApproval(Base):
     comments:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 
-def now_dt(): return datetime.now().astimezone()
-def now_iso(): return now_dt().isoformat(timespec='seconds')
-def parse_dt(value): return datetime.fromisoformat(value)
+def now_dt():
+    """Current application time in the configured institutional timezone."""
+    return datetime.now(DISPLAY_TZ)
+
+def now_iso():
+    return now_dt().isoformat(timespec='seconds')
+
+def parse_dt(value):
+    """Parse stored timestamps and attach the configured timezone to legacy naive values."""
+    dt=datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=DISPLAY_TZ)
+
+def display_dt(value):
+    """Convert any stored timestamp (UTC/local/legacy) to the display timezone."""
+    return parse_dt(value).astimezone(DISPLAY_TZ)
 
 def actor_label(s=None):
     role=web_session.get('role','system')
@@ -402,7 +424,7 @@ def exam_access_for_student(s,student_id,exam):
     if not membership:return False,'Not assigned to your batch/section',None
     matched=next((x for x in sessions if x.group_id==membership.group_id),None)
     if not matched:return False,'Not assigned to your batch/section',None
-    now=datetime.now()
+    now=now_dt().replace(tzinfo=None)
     if matched.scheduled_start:
         start=datetime.fromisoformat(matched.scheduled_start)
         if now<start:return False,f'Scheduled for {start.strftime("%d %b, %I:%M %p")}',matched
@@ -525,14 +547,7 @@ def ensure_subject_catalog_entry(s,name,category='Custom / Other',course_semeste
         return None
     category=(category or '').strip() or 'Custom / Other'
     course_semester=(course_semester or '').strip()
-    # Session uses autoflush=False, so a subject added earlier in the same
-    # request can still be pending in s.new and invisible to the SELECT below.
-    normalized_name=name.casefold()
-    row=next((obj for obj in s.new
-              if isinstance(obj,SubjectCatalog)
-              and (obj.name or '').strip().casefold()==normalized_name),None)
-    if row is None:
-        row=s.scalar(select(SubjectCatalog).where(func.lower(SubjectCatalog.name)==name.lower()))
+    row=s.scalar(select(SubjectCatalog).where(func.lower(SubjectCatalog.name)==name.lower()))
     if row:
         # Preserve a faculty-defined category, but upgrade generic placeholders when better metadata arrives.
         if (not row.category or row.category in {'Custom / Other','Imported / Other','General'}) and category not in {'Custom / Other','Imported / Other','General'}:
@@ -550,9 +565,6 @@ def seed_subject_catalog(s):
     # Register all bundled subjects so the faculty form can use a categorized subject selector immediately.
     for pack in load_preloaded_question_banks().values():
         ensure_subject_catalog_entry(s,pack.get('subject',''),pack.get('category','Engineering'),pack.get('course_semester',''),'preloaded-library',False)
-    # Make newly queued bundled subjects visible before legacy BankQuestion
-    # subjects are checked. This prevents duplicate SubjectCatalog inserts.
-    s.flush()
     # Preserve subjects already present in older databases even if they were created before this feature existed.
     for subject,course in s.execute(select(BankQuestion.subject,BankQuestion.course_semester).distinct()).all():
         ensure_subject_catalog_entry(s,subject,'Custom / Other',course,'legacy-question-bank',False)
@@ -681,7 +693,7 @@ def offline_download():
 @app.template_filter('dt')
 def format_dt(v):
     if not v:return '-'
-    try:return parse_dt(v).strftime('%d %b %Y, %I:%M %p')
+    try:return display_dt(v).strftime('%d %b %Y, %I:%M %p')
     except Exception:return v
 
 def admin_required(fn):
