@@ -62,11 +62,18 @@ if APP_MODE=='online' and not DATABASE_URL.startswith('postgresql'):
     raise RuntimeError('Online mode requires a PostgreSQL DATABASE_URL.')
 
 secret=os.getenv('SECRET_KEY','').strip()
-admin_password=os.getenv('ADMIN_PASSWORD','').strip()
-admin_username=os.getenv('ADMIN_USERNAME','admin').strip() or 'admin'
+# SUPER_ADMIN_USERNAME is the preferred setting. ADMIN_USERNAME remains supported
+# for backwards compatibility with existing deployments.
+super_admin_username=(os.getenv('SUPER_ADMIN_USERNAME') or os.getenv('ADMIN_USERNAME') or 'admin').strip() or 'admin'
+legacy_admin_username=os.getenv('LEGACY_ADMIN_USERNAME','admin').strip() or 'admin'
+# Existing deployments already use ADMIN_PASSWORD, so keep it as the fallback.
+# SUPER_ADMIN_PASSWORD may be set later if a separate secret is preferred.
+admin_password=(os.getenv('SUPER_ADMIN_PASSWORD') or os.getenv('ADMIN_PASSWORD') or '').strip()
+# Compatibility alias used by older helper code.
+admin_username=super_admin_username
 if APP_MODE=='online':
     if len(secret)<24: raise RuntimeError('Online mode requires a strong SECRET_KEY (24+ characters).')
-    if len(admin_password)<10: raise RuntimeError('Online mode requires ADMIN_PASSWORD with at least 10 characters.')
+    if len(admin_password)<10: raise RuntimeError('Online mode requires SUPER_ADMIN_PASSWORD or ADMIN_PASSWORD with at least 10 characters.')
 if not secret:
     secret='offline-development-secret-change-me'
 if not admin_password and not OFFLINE_REQUIRE_SETUP:
@@ -597,17 +604,66 @@ def preloaded_pack_statuses(s):
     output.sort(key=lambda p:(p.get('category',''),p.get('subject','')))
     return output
 
+def ensure_super_admin_identity(s):
+    """Ensure one configured Super Admin login and optionally demote legacy ``admin``.
+
+    When SUPER_ADMIN_USERNAME differs from LEGACY_ADMIN_USERNAME (``admin`` by
+    default), the old Admin record is converted into an ordinary Faculty account
+    using the *same password hash*. This preserves the legacy username/password
+    while moving Super Admin authority to the newly configured username.
+    """
+    super_admin=s.scalar(select(Admin).where(Admin.username==super_admin_username))
+    if not super_admin:
+        super_admin=Admin(username=super_admin_username,password_hash=generate_password_hash(admin_password))
+        s.add(super_admin)
+        s.flush()
+    elif admin_password and not check_password_hash(super_admin.password_hash,admin_password):
+        super_admin.password_hash=generate_password_hash(admin_password)
+
+    if legacy_admin_username==super_admin_username:
+        return
+
+    legacy=s.scalar(select(Admin).where(Admin.username==legacy_admin_username))
+    if not legacy:
+        return
+
+    faculty=s.scalar(select(Faculty).where(Faculty.username==legacy_admin_username))
+    if faculty:
+        # The legacy Admin identity wins if the same username already exists in
+        # faculty_users, because the user's requirement is to preserve the old
+        # Admin credentials while changing only its role.
+        faculty.password_hash=legacy.password_hash
+        faculty.is_active=True
+    else:
+        faculty=Faculty(
+            username=legacy.username,
+            name=legacy.username.replace('.', ' ').replace('_', ' ').strip().title() or 'Faculty',
+            password_hash=legacy.password_hash,
+            is_active=True,
+            created_at=now_iso(),
+        )
+        s.add(faculty)
+        s.flush()
+
+    role_row=s.scalar(select(FacultyRole).where(FacultyRole.faculty_id==faculty.id))
+    if role_row:
+        role_row.role='faculty'
+        role_row.updated_at=now_iso()
+    else:
+        s.add(FacultyRole(faculty_id=faculty.id,role='faculty',department='',updated_at=now_iso()))
+
+    # Removing the old row is essential: staff login checks Admin before Faculty,
+    # so leaving it here would still grant the legacy username Super Admin rights.
+    s.delete(legacy)
+
+
 def init_db():
     Base.metadata.create_all(engine)
     s=DB()
     try:
         seed_subject_catalog(s)
         if APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP:
-            admin=s.scalar(select(Admin).where(Admin.username==admin_username))
-            if not admin:
-                s.add(Admin(username=admin_username,password_hash=generate_password_hash(admin_password)))
-            elif admin_password and not check_password_hash(admin.password_hash,admin_password):
-                admin.password_hash=generate_password_hash(admin_password)
+            ensure_super_admin_identity(s)
             get_institution(s,create=True)
         s.commit()
     except IntegrityError:
@@ -1722,6 +1778,7 @@ def faculty_users():
     if request.method=='POST':
         username=request.form.get('username','').strip();name=request.form.get('name','').strip();password=request.form.get('password','')
         if len(username)<3 or not name or len(password)<10:flash('Faculty name, a 3+ character username and a 10+ character password are required.','error')
+        elif username.casefold()==super_admin_username.casefold():flash('That username is reserved for the Super Admin account.','error')
         else:
             try:
                 role=request.form.get('staff_role','faculty') if request.form.get('staff_role') in {'faculty','hod','exam_controller'} else 'faculty'

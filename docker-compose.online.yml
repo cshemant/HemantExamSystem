@@ -20,7 +20,8 @@ services:
     environment:
       APP_MODE: online
       SECRET_KEY: replace-with-a-long-random-secret
-      ADMIN_USERNAME: admin
+      SUPER_ADMIN_USERNAME: superadmin
+      LEGACY_ADMIN_USERNAME: admin
       ADMIN_PASSWORD: replace-with-a-strong-admin-password
       DATABASE_URL: postgresql+psycopg://exam_user:exam_password_change_me@db:5432/examdb
       PORT: 8080
