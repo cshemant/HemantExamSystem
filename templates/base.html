@@ -4,7 +4,7 @@
 <title>{{ title or 'Exam System' }} | {{ institution.short_name if institution else 'Learn with Hemant' }}</title>
 <link rel="stylesheet" href="{{ url_for('static',filename='style.css') }}">
 <script src="{{ url_for('static',filename='app.js') }}"></script>
-</head><body>
+</head><body><a class="skip-link" href="#main-content">Skip to main content</a>
 <header class="site-header">
 <div class="container nav">
   <a class="brand" href="{{ url_for('home') }}">
@@ -14,6 +14,33 @@
   {% if web_session.get('role') in ['admin','faculty'] %}
   <nav class="nav-links admin-nav desktop-nav" aria-label="Admin navigation">
     <a href="{{ url_for('admin_dashboard') }}">Dashboard</a>
+    {% if staff_role == 'super_admin' %}
+    <details class="nav-dropdown superadmin-nav-dropdown">
+      <summary>Manage <span class="nav-dropdown-caret" aria-hidden="true">▾</span></summary>
+      <div class="nav-dropdown-menu" role="group" aria-label="Super Admin management menu">
+        <div class="nav-dropdown-section">
+          <span class="nav-dropdown-label">Academic</span>
+          <a href="{{ url_for('students') }}">Students</a>
+          <a href="{{ url_for('academic_groups') }}">Batches &amp; Sections</a>
+          <a href="{{ url_for('question_bank') }}">Question Bank</a>
+        </div>
+        <div class="nav-dropdown-section">
+          <span class="nav-dropdown-label">Examinations</span>
+          <a href="{{ url_for('exams') }}">Exams</a>
+          <a href="{{ url_for('results') }}">Results</a>
+          <a href="{{ url_for('analytics') }}">Analytics</a>
+          <a href="{{ url_for('exam_centre') }}">Exam Centre</a>
+          <a href="{{ url_for('edge_results_reconciliation') }}">Edge Results</a>
+        </div>
+        <div class="nav-dropdown-section">
+          <span class="nav-dropdown-label">Administration</span>
+          <a href="{{ url_for('staff_mfa_settings') }}">Security</a>
+          <a href="{{ url_for('faculty_users') }}">Staff</a>
+          <a href="{{ url_for('system_tools') }}">System</a>
+        </div>
+      </div>
+    </details>
+    {% else %}
     <a href="{{ url_for('students') }}">Students</a>
     <a href="{{ url_for('academic_groups') }}">Batches</a>
     <a href="{{ url_for('question_bank') }}">Question Bank</a>
@@ -21,11 +48,13 @@
     <a href="{{ url_for('results') }}">Results</a>
     <a href="{{ url_for('analytics') }}">Analytics</a>
     <a href="{{ url_for('exam_centre') }}">Exam Centre</a>
-    {% if staff_role in ['super_admin','hod'] %}<a href="{{ url_for('faculty_users') }}">Staff</a>{% endif %}
-    {% if web_session.get('role') == 'admin' %}<a href="{{ url_for('system_tools') }}">System</a>{% endif %}
+    <a href="{{ url_for('edge_results_reconciliation') }}">Edge Results</a>
+    <a href="{{ url_for('staff_mfa_settings') }}">Security</a>
+    {% if staff_role == 'hod' %}<a href="{{ url_for('faculty_users') }}">Staff</a>{% endif %}
+    {% endif %}
   </nav>
   {% elif web_session.get('role') == 'student' %}
-  <nav class="nav-links desktop-nav" aria-label="Student navigation"><a href="{{ url_for('student_dashboard') }}">My Exams</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}</nav>
+  <nav class="nav-links desktop-nav" aria-label="Student navigation"><a href="{{ url_for('student_dashboard') }}">My Exams</a><a href="{{ url_for('practice_centre') }}">Practice Centre</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}</nav>
   {% endif %}
   <span class="nav-spacer"></span>
   {% if web_session.get('role') %}
@@ -46,14 +75,24 @@
     {% if web_session.get('role') in ['admin','faculty'] %}<div class="mobile-role">Signed in as {{ staff_role_label }}</div>{% endif %}
     <nav class="mobile-menu-links" aria-label="Mobile navigation">
       {% if web_session.get('role') in ['admin','faculty'] %}
-        <a href="{{ url_for('admin_dashboard') }}">Dashboard</a><a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches & Sections</a><a href="{{ url_for('question_bank') }}">Question Bank</a><a href="{{ url_for('exams') }}">Exams</a><a href="{{ url_for('results') }}">Results</a><a href="{{ url_for('analytics') }}">Analytics</a><a href="{{ url_for('exam_centre') }}">Exam Centre</a>{% if staff_role in ['super_admin','hod'] %}<a href="{{ url_for('faculty_users') }}">Staff</a>{% endif %}{% if web_session.get('role') == 'admin' %}<a href="{{ url_for('system_tools') }}">System</a>{% endif %}
-      {% elif web_session.get('role') == 'student' %}<a href="{{ url_for('student_dashboard') }}">My Exams</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}{% endif %}
+        <a href="{{ url_for('admin_dashboard') }}">Dashboard</a>
+        {% if staff_role == 'super_admin' %}
+          <span class="mobile-menu-section-label">Academic</span>
+          <a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches &amp; Sections</a><a href="{{ url_for('question_bank') }}">Question Bank</a>
+          <span class="mobile-menu-section-label">Examinations</span>
+          <a href="{{ url_for('exams') }}">Exams</a><a href="{{ url_for('results') }}">Results</a><a href="{{ url_for('analytics') }}">Analytics</a><a href="{{ url_for('exam_centre') }}">Exam Centre</a><a href="{{ url_for('edge_results_reconciliation') }}">Edge Results</a>
+          <span class="mobile-menu-section-label">Administration</span>
+          <a href="{{ url_for('staff_mfa_settings') }}">Security</a><a href="{{ url_for('faculty_users') }}">Staff</a><a href="{{ url_for('system_tools') }}">System</a>
+        {% else %}
+          <a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches &amp; Sections</a><a href="{{ url_for('question_bank') }}">Question Bank</a><a href="{{ url_for('exams') }}">Exams</a><a href="{{ url_for('results') }}">Results</a><a href="{{ url_for('analytics') }}">Analytics</a><a href="{{ url_for('exam_centre') }}">Exam Centre</a><a href="{{ url_for('edge_results_reconciliation') }}">Edge Results</a><a href="{{ url_for('staff_mfa_settings') }}">Security</a>{% if staff_role == 'hod' %}<a href="{{ url_for('faculty_users') }}">Staff</a>{% endif %}
+        {% endif %}
+      {% elif web_session.get('role') == 'student' %}<a href="{{ url_for('student_dashboard') }}">My Exams</a><a href="{{ url_for('practice_centre') }}">Practice Centre</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}{% endif %}
       <a class="mobile-logout" href="{{ url_for('logout') }}">Logout</a>
     </nav>
   </aside>
 </div>
 {% endif %}
-{% if login_page %}<main>{% else %}<main class="page"><div class="container">{% endif %}
+{% if login_page %}<main id="main-content">{% else %}<main id="main-content" class="page"><div class="container">{% endif %}
 {% with msgs=get_flashed_messages(with_categories=true) %}{% for category,m in msgs %}<div class="flash {{ 'error' if category=='error' else '' }}">{{ m }}</div>{% endfor %}{% endwith %}
 {% block content %}{% endblock %}
 {% if not login_page %}</div>{% endif %}</main>

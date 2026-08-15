@@ -99,6 +99,26 @@ function initMobileMenu(){
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initMobileMenu); else initMobileMenu();
 
+
+function initDesktopNavDropdowns(){
+  const dropdowns=[...document.querySelectorAll('.nav-dropdown')];
+  if(!dropdowns.length) return;
+  document.addEventListener('click',event=>{
+    dropdowns.forEach(dropdown=>{
+      if(dropdown.open && !dropdown.contains(event.target)) dropdown.open=false;
+    });
+  });
+  document.addEventListener('keydown',event=>{
+    if(event.key==='Escape'){
+      dropdowns.forEach(dropdown=>{dropdown.open=false;});
+    }
+  });
+  dropdowns.forEach(dropdown=>{
+    dropdown.querySelectorAll('a').forEach(link=>link.addEventListener('click',()=>{dropdown.open=false;}));
+  });
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initDesktopNavDropdowns); else initDesktopNavDropdowns();
+
 function initCopyButtons(){
   document.querySelectorAll('[data-copy-target]').forEach(btn=>{
     btn.addEventListener('click',async()=>{
@@ -180,3 +200,162 @@ function initQuestionBankSubjectCatalog(){
   if(!(course.value||'').trim()) applyDefault();
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initQuestionBankSubjectCatalog); else initQuestionBankSubjectCatalog();
+
+function saveMultiAnswer(examId, questionId, fieldName){
+  const values=[...document.querySelectorAll(`input[name="${fieldName}"]:checked`)].map(el=>el.value);
+  return saveAnswer(examId,questionId,values.join(','));
+}
+
+const freeAnswerTimers=new Map();
+function initFreeAnswerAutosave(){
+  document.querySelectorAll('[data-autosave-question]').forEach(input=>{
+    input.addEventListener('input',()=>{
+      const examId=Number(input.getAttribute('data-autosave-exam'));
+      const questionId=Number(input.getAttribute('data-autosave-question'));
+      const key=`${examId}:${questionId}`;
+      clearTimeout(freeAnswerTimers.get(key));
+      freeAnswerTimers.set(key,setTimeout(()=>saveAnswer(examId,questionId,input.value),450));
+    });
+    input.addEventListener('blur',()=>{
+      const examId=Number(input.getAttribute('data-autosave-exam'));
+      const questionId=Number(input.getAttribute('data-autosave-question'));
+      saveAnswer(examId,questionId,input.value);
+    });
+  });
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initFreeAnswerAutosave); else initFreeAnswerAutosave();
+
+function startExamHeartbeat(examId,seconds=15){
+  const interval=Math.max(10,Math.min(60,Number(seconds)||15))*1000;
+  const ping=async(state='active')=>{
+    try{await fetch('/student/heartbeat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify({exam_id:examId,state})});}catch(_err){}
+  };
+  ping();setInterval(()=>ping(document.hidden?'hidden':'active'),interval);
+  window.addEventListener('online',()=>ping('online'));
+  window.addEventListener('offline',()=>ping('offline'));
+}
+
+function initQuestionTypeForms(){
+  document.querySelectorAll('[data-question-definition-form]').forEach(form=>{
+    const selector=form.querySelector('[data-question-type-selector]');
+    if(!selector)return;
+    const update=()=>{
+      const type=selector.value;
+      form.querySelectorAll('[data-qtype-section]').forEach(section=>{
+        const key=section.getAttribute('data-qtype-section');
+        const show=key===type || (key==='choice' && ['single_choice','multiple_select'].includes(type));
+        section.hidden=!show;
+        section.querySelectorAll('input,select,textarea').forEach(el=>{el.disabled=!show;});
+      });
+    };
+    selector.addEventListener('change',update);update();
+  });
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initQuestionTypeForms); else initQuestionTypeForms();
+
+function initExamInteractionMonitoring(){
+  const form=document.querySelector('[data-exam-integrity]');
+  if(!form)return;
+  const examId=Number(form.getAttribute('data-exam-integrity'));
+  form.addEventListener('copy',()=>logIntegrity(examId,'copy_attempt','Copy action used in exam form'));
+  form.addEventListener('paste',()=>logIntegrity(examId,'paste_attempt','Paste action used in exam form'));
+  form.addEventListener('contextmenu',()=>logIntegrity(examId,'context_menu','Context menu opened in exam form'));
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initExamInteractionMonitoring); else initExamInteractionMonitoring();
+
+function formatRemaining(total){
+  const seconds=Math.max(0,Number(total)||0),m=Math.floor(seconds/60),s=seconds%60;
+  return `${m}m ${s}s`;
+}
+function initLiveExamMonitor(){
+  const card=document.querySelector('[data-live-monitor-url]');
+  if(!card)return;
+  const endpoint=card.getAttribute('data-live-monitor-url');
+  const body=document.getElementById('live-candidate-body');
+  const esc=value=>String(value??'').replace(/[&<>"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+  const refresh=async()=>{
+    try{
+      const res=await fetch(`${endpoint}?_=${Date.now()}`,{cache:'no-store',headers:{Accept:'application/json'}});if(!res.ok)return;
+      const data=await res.json();
+      const set=(id,val)=>{const el=document.getElementById(id);if(el)el.textContent=val;};
+      set('live-online',data.counts.online);set('live-stale',data.counts.stale);set('live-offline',data.counts.offline);set('live-online-count',data.counts.online);
+      if(!body)return;
+      if(!data.rows.length){body.innerHTML='<tr><td colspan="7">No examination is currently in progress.</td></tr>';return;}
+      body.innerHTML=data.rows.map(r=>{
+        const cls=r.connection==='online'?'success':(r.connection==='stale'?'warning':'gray');
+        return `<tr><td><strong>${esc(r.roll_no)}</strong><div class="mini-meta">${esc(r.name)}</div></td><td>${esc(r.exam)}</td><td><span class="badge ${cls}">${esc(r.connection.charAt(0).toUpperCase()+r.connection.slice(1))}</span></td><td>${esc(r.answers)}</td><td>${esc(r.integrity)}</td><td>${formatRemaining(r.remaining_seconds)}</td><td>${esc(r.last_seen||'-')}</td></tr>`;
+      }).join('');
+    }catch(_err){}
+  };
+  setInterval(refresh,5000);
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initLiveExamMonitor); else initLiveExamMonitor();
+
+function initQuestionBankSelectAll(){
+  document.querySelectorAll('[data-select-all]').forEach(master=>{
+    master.addEventListener('change',()=>{
+      const name=master.getAttribute('data-select-all');
+      document.querySelectorAll(`input[name="${name}"]:not(:disabled)`).forEach(box=>{box.checked=master.checked;});
+    });
+  });
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initQuestionBankSelectAll); else initQuestionBankSelectAll();
+
+function initPracticeBuilder(){
+  const subject=document.getElementById('practice-subject');
+  const unit=document.getElementById('practice-unit');
+  if(!subject || !unit) return;
+  const updateUnits=()=>{
+    const opt=subject.options[subject.selectedIndex];
+    let units=[];
+    try{units=JSON.parse(opt?.getAttribute('data-units')||'[]');}catch(_err){units=[];}
+    unit.innerHTML='<option value="">All units</option>'+units.map(v=>`<option value="${String(v).replace(/"/g,'&quot;')}">Unit ${String(v).replace(/</g,'&lt;')}</option>`).join('');
+  };
+  subject.addEventListener('change',updateUnits);updateUnits();
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initPracticeBuilder); else initPracticeBuilder();
+
+function practiceFieldValue(fieldName,qtype){
+  if(qtype==='multiple_select') return [...document.querySelectorAll(`input[name="${fieldName}"]:checked`)].map(el=>el.value).join(',');
+  const checked=document.querySelector(`input[name="${fieldName}"]:checked`);
+  if(checked) return checked.value;
+  const input=document.querySelector(`[name="${fieldName}"]`);
+  return input ? input.value : '';
+}
+
+function initPracticeFeedback(){
+  document.querySelectorAll('[data-practice-check]').forEach(btn=>{
+    btn.addEventListener('click',async()=>{
+      const feedback=document.getElementById(btn.getAttribute('data-feedback-id'));
+      const answer=practiceFieldValue(btn.getAttribute('data-field-name'),btn.getAttribute('data-question-type'));
+      if(!answer){if(feedback){feedback.hidden=false;feedback.className='practice-feedback error';feedback.textContent='Choose or enter an answer first.';}return;}
+      btn.disabled=true;const old=btn.textContent;btn.textContent='Checking…';
+      try{
+        const res=await fetch('/student/practice/check-answer',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify({attempt_id:Number(btn.getAttribute('data-attempt-id')),ref_key:btn.getAttribute('data-ref-key'),answer})});
+        const data=await res.json();
+        if(!res.ok) throw new Error(data.error||'Could not check answer');
+        if(feedback){feedback.hidden=false;feedback.className=`practice-feedback ${data.correct?'correct':'incorrect'}`;feedback.innerHTML=`<strong>${data.correct?'Correct':'Not correct'}</strong><div>${data.correct?'':`Correct answer: ${escapeHtml(data.correct_answer)}<br>`}${escapeHtml(data.explanation)}</div>`;}
+      }catch(err){if(feedback){feedback.hidden=false;feedback.className='practice-feedback error';feedback.textContent=err.message||'Could not check answer.';}}
+      finally{btn.disabled=false;btn.textContent=old;}
+    });
+  });
+}
+function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initPracticeFeedback); else initPracticeFeedback();
+
+function initPracticeTimer(){
+  const form=document.querySelector('[data-practice-end-epoch]');
+  const display=document.getElementById('practice-timer-value');
+  if(!form || !display) return;
+  const end=Number(form.getAttribute('data-practice-end-epoch'))*1000;
+  let submitted=false;
+  const tick=()=>{
+    const remaining=Math.max(0,Math.floor((end-Date.now())/1000));
+    const m=Math.floor(remaining/60),s=remaining%60;display.textContent=`${m}:${String(s).padStart(2,'0')}`;
+    if(remaining<=60) display.classList.add('urgent');
+    if(remaining<=0 && !submitted){submitted=true;display.textContent='0:00';form.requestSubmit();return;}
+    if(!submitted)setTimeout(tick,1000);
+  };
+  form.addEventListener('submit',()=>{submitted=true;});tick();
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initPracticeTimer); else initPracticeTimer();

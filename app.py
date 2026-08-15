@@ -1,4 +1,4 @@
-import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time
+import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -9,7 +9,7 @@ from flask import Flask, render_template, request, redirect, url_for, session as
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
-from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, UniqueConstraint, Text, select, func, or_, delete
+from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, UniqueConstraint, Text, select, func, or_, delete, inspect, text, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, scoped_session, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from openpyxl import load_workbook, Workbook
@@ -18,13 +18,17 @@ import qrcode
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from enterprise_core import QUESTION_TYPE_LABELS, canonical_question_type, normalize_answer, normalized_key, is_answer_correct, validate_question_definition
+from security_core import generate_totp_secret, verify_totp, totp_uri
+from edge_package import seal_envelope, open_sealed_envelope
+from audit_core import audit_event_hash, verify_audit_rows
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.02'
+APP_VERSION='2.11'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -34,6 +38,13 @@ OFFLINE_DOWNLOAD_URL=os.getenv('OFFLINE_DOWNLOAD_URL',DEFAULT_OFFLINE_DOWNLOAD_U
 OFFLINE_REQUIRE_SETUP=os.getenv('OFFLINE_REQUIRE_SETUP','0').strip().lower() in {'1','true','yes','on'}
 SESSION_TIMEOUT_MINUTES=max(10,int(os.getenv('SESSION_TIMEOUT_MINUTES','45')))
 BACKUP_KDF_ITERATIONS=max(100000,int(os.getenv('BACKUP_KDF_ITERATIONS','390000')))
+LOGIN_MAX_FAILURES=max(3,int(os.getenv('LOGIN_MAX_FAILURES','5')))
+LOGIN_WINDOW_MINUTES=max(1,int(os.getenv('LOGIN_WINDOW_MINUTES','10')))
+LOGIN_LOCK_MINUTES=max(1,int(os.getenv('LOGIN_LOCK_MINUTES','10')))
+HEARTBEAT_STALE_SECONDS=max(20,int(os.getenv('HEARTBEAT_STALE_SECONDS','45')))
+MAX_ANSWER_LENGTH=max(100,int(os.getenv('MAX_ANSWER_LENGTH','4000')))
+INTEGRATION_API_KEY=os.getenv('INTEGRATION_API_KEY','').strip()
+EXAM_PACKAGE_SIGNING_KEY=os.getenv('EXAM_PACKAGE_SIGNING_KEY','').strip()
 
 # All user-facing dates/times use an explicit timezone so cloud hosts such as
 # Render (which commonly run in UTC) and offline Windows builds show the same time.
@@ -85,7 +96,15 @@ cookie_secure=os.getenv('COOKIE_SECURE','1' if APP_MODE=='online' else '0').stri
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=cookie_secure,MAX_CONTENT_LENGTH=10*1024*1024)
 if APP_MODE=='online': app.wsgi_app=ProxyFix(app.wsgi_app,x_for=1,x_proto=1,x_host=1,x_port=1)
 
-engine=create_engine(DATABASE_URL,pool_pre_ping=True,connect_args={'check_same_thread':False} if DATABASE_URL.startswith('sqlite') else {})
+engine=create_engine(DATABASE_URL,pool_pre_ping=True,connect_args={'check_same_thread':False,'timeout':10} if DATABASE_URL.startswith('sqlite') else {})
+if DATABASE_URL.startswith('sqlite'):
+    @event.listens_for(engine,'connect')
+    def _sqlite_connection_pragmas(dbapi_connection,_connection_record):
+        cursor=dbapi_connection.cursor()
+        try:
+            cursor.execute('PRAGMA foreign_keys=ON');cursor.execute('PRAGMA busy_timeout=5000')
+        finally:
+            cursor.close()
 DB=scoped_session(sessionmaker(bind=engine,autoflush=False,expire_on_commit=False))
 
 class Base(DeclarativeBase): pass
@@ -95,6 +114,8 @@ class Admin(Base):
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
     username:Mapped[str]=mapped_column(String,unique=True,nullable=False)
     password_hash:Mapped[str]=mapped_column(String,nullable=False)
+    mfa_secret:Mapped[str]=mapped_column(String,nullable=False,default='')
+    mfa_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
 
 class Faculty(Base):
     __tablename__='faculty_users'
@@ -104,6 +125,8 @@ class Faculty(Base):
     password_hash:Mapped[str]=mapped_column(String,nullable=False)
     is_active:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
     created_at:Mapped[str]=mapped_column(String,nullable=False)
+    mfa_secret:Mapped[str]=mapped_column(String,nullable=False,default='')
+    mfa_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
 
 class Student(Base):
     __tablename__='students'
@@ -131,6 +154,10 @@ class Question(Base):
     option_c:Mapped[str]=mapped_column(String,nullable=False)
     option_d:Mapped[str]=mapped_column(String,nullable=False)
     correct_answer:Mapped[str]=mapped_column(String(1),nullable=False)
+    question_type:Mapped[str]=mapped_column(String,nullable=False,default='single_choice')
+    answer_key:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    answer_tolerance:Mapped[str]=mapped_column(String,nullable=False,default='')
+    answer_case_sensitive:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     marks:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
 
 class Attempt(Base):
@@ -145,6 +172,7 @@ class Attempt(Base):
     status:Mapped[str]=mapped_column(String,nullable=False,default='in_progress')
     score:Mapped[int|None]=mapped_column(Integer,nullable=True)
     total_marks:Mapped[int|None]=mapped_column(Integer,nullable=True)
+    grading_status:Mapped[str]=mapped_column(String,nullable=False,default='complete')
     question_order:Mapped[str]=mapped_column(String,nullable=False)
 
 class Answer(Base):
@@ -154,6 +182,11 @@ class Answer(Base):
     attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False)
     question_id:Mapped[int]=mapped_column(ForeignKey('questions.id'),nullable=False)
     selected_answer:Mapped[str|None]=mapped_column(String(1),nullable=True)
+    answer_value:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    manual_score:Mapped[int|None]=mapped_column(Integer,nullable=True)
+    grader_comment:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    graded_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    graded_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     saved_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class BankQuestion(Base):
@@ -170,11 +203,18 @@ class BankQuestion(Base):
     option_c:Mapped[str]=mapped_column(String,nullable=False)
     option_d:Mapped[str]=mapped_column(String,nullable=False)
     correct_answer:Mapped[str]=mapped_column(String(1),nullable=False)
+    answer_key:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    answer_tolerance:Mapped[str]=mapped_column(String,nullable=False,default='')
+    answer_case_sensitive:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     marks:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
     difficulty:Mapped[str]=mapped_column(String,nullable=False,default='Medium')
     bloom_level:Mapped[str]=mapped_column(String,nullable=False,default='Understand')
     co_mapping:Mapped[str]=mapped_column(String,nullable=False,default='')
+    po_mapping:Mapped[str]=mapped_column(String,nullable=False,default='')
+    pso_mapping:Mapped[str]=mapped_column(String,nullable=False,default='')
     tags:Mapped[str]=mapped_column(String,nullable=False,default='')
+    practice_visibility:Mapped[str]=mapped_column(String,nullable=False,default='official_only')
+    explanation:Mapped[str]=mapped_column(Text,nullable=False,default='')
     status:Mapped[str]=mapped_column(String,nullable=False,default='draft')
     version:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
     created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
@@ -254,6 +294,8 @@ class AuditLog(Base):
     entity_id:Mapped[str]=mapped_column(String,nullable=False,default='')
     details:Mapped[str]=mapped_column(String,nullable=False,default='')
     created_at:Mapped[str]=mapped_column(String,nullable=False)
+    prev_hash:Mapped[str]=mapped_column(String(64),nullable=False,default='')
+    event_hash:Mapped[str]=mapped_column(String(64),nullable=False,default='')
 
 class InstitutionProfile(Base):
     __tablename__='institution_profile'
@@ -322,6 +364,313 @@ class ExamApproval(Base):
     comments:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 
+class ExamPracticeRelease(Base):
+    __tablename__='exam_practice_releases'
+    __table_args__=(UniqueConstraint('exam_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    is_released:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    release_after:Mapped[str]=mapped_column(String,nullable=False,default='')
+    show_solutions:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    allow_mock:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    updated_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class PracticeAttempt(Base):
+    __tablename__='practice_attempts'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    mode:Mapped[str]=mapped_column(String,nullable=False,default='practice')
+    subject:Mapped[str]=mapped_column(String,nullable=False,default='')
+    unit_filter:Mapped[str]=mapped_column(String,nullable=False,default='')
+    difficulty_filter:Mapped[str]=mapped_column(String,nullable=False,default='')
+    exam_id:Mapped[int|None]=mapped_column(ForeignKey('exams.id'),nullable=True)
+    duration_minutes:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    started_at:Mapped[str]=mapped_column(String,nullable=False)
+    ends_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    submitted_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    status:Mapped[str]=mapped_column(String,nullable=False,default='in_progress')
+    score:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    total_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    question_refs_json:Mapped[str]=mapped_column(Text,nullable=False,default='[]')
+    answers_json:Mapped[str]=mapped_column(Text,nullable=False,default='[]')
+    incorrect_bank_ids_json:Mapped[str]=mapped_column(Text,nullable=False,default='[]')
+
+class PracticeBookmark(Base):
+    __tablename__='practice_bookmarks'
+    __table_args__=(UniqueConstraint('student_id','bank_question_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    bank_question_id:Mapped[int]=mapped_column(ForeignKey('bank_questions.id'),nullable=False)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class ExamSecurityPolicy(Base):
+    __tablename__='exam_security_policies'
+    __table_args__=(UniqueConstraint('exam_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    require_candidate_checkin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    heartbeat_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=15)
+    updated_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class ExamCandidateCheckin(Base):
+    __tablename__='exam_candidate_checkins'
+    __table_args__=(UniqueConstraint('exam_id','student_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    status:Mapped[str]=mapped_column(String,nullable=False,default='verified')
+    verified_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    verified_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    notes:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class AttemptHeartbeat(Base):
+    __tablename__='attempt_heartbeats'
+    __table_args__=(UniqueConstraint('attempt_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False)
+    last_seen_at:Mapped[str]=mapped_column(String,nullable=False)
+    answer_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    client_state:Mapped[str]=mapped_column(String,nullable=False,default='active')
+    client_fingerprint:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class AuthThrottle(Base):
+    __tablename__='auth_throttles'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    auth_key:Mapped[str]=mapped_column(String,unique=True,nullable=False)
+    failure_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    first_failed_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    locked_until:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+
+class EdgePackageReceipt(Base):
+    __tablename__='edge_package_receipts'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    package_id:Mapped[str]=mapped_column(String,unique=True,nullable=False)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    source_mode:Mapped[str]=mapped_column(String,nullable=False,default='')
+    source_exam_id:Mapped[str]=mapped_column(String,nullable=False,default='')
+    imported_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    imported_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class EdgeResultReceipt(Base):
+    __tablename__='edge_result_receipts'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    package_id:Mapped[str]=mapped_column(String,unique=True,nullable=False)
+    source_mode:Mapped[str]=mapped_column(String,nullable=False,default='')
+    source_exam_id:Mapped[str]=mapped_column(String,nullable=False,default='')
+    origin_exam_id:Mapped[str]=mapped_column(String,nullable=False,default='')
+    target_exam_id:Mapped[int|None]=mapped_column(ForeignKey('exams.id'),nullable=True)
+    exam_title:Mapped[str]=mapped_column(String,nullable=False,default='')
+    attempts_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    submitted_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    imported_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    imported_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class EdgeResultAttempt(Base):
+    __tablename__='edge_result_attempts'
+    __table_args__=(UniqueConstraint('receipt_id','roll_no'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    receipt_id:Mapped[int]=mapped_column(ForeignKey('edge_result_receipts.id'),nullable=False)
+    roll_no:Mapped[str]=mapped_column(String,nullable=False)
+    name:Mapped[str]=mapped_column(String,nullable=False,default='')
+    status:Mapped[str]=mapped_column(String,nullable=False,default='')
+    grading_status:Mapped[str]=mapped_column(String,nullable=False,default='')
+    score:Mapped[int|None]=mapped_column(Integer,nullable=True)
+    total_marks:Mapped[int|None]=mapped_column(Integer,nullable=True)
+    integrity_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    payload_json:Mapped[str]=mapped_column(Text,nullable=False,default='{}')
+
+
+def _configure_database_reliability():
+    if not DATABASE_URL.startswith('sqlite'):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql('PRAGMA journal_mode=WAL')
+            conn.exec_driver_sql('PRAGMA synchronous=NORMAL')
+            conn.exec_driver_sql('PRAGMA busy_timeout=5000')
+            conn.exec_driver_sql('PRAGMA foreign_keys=ON')
+    except Exception:
+        pass
+
+
+def _ensure_column(table_name,column_name,ddl):
+    columns={c['name'] for c in inspect(engine).get_columns(table_name)}
+    if column_name in columns:
+        return False
+    with engine.begin() as conn:
+        conn.execute(text(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}'))
+    return True
+
+
+def run_schema_upgrades():
+    """Idempotent in-app migration for V2.10 enterprise columns.
+
+    Existing V26 SQLite/PostgreSQL deployments can start without losing data.
+    New installations receive the columns directly from SQLAlchemy create_all().
+    """
+    upgrades=(
+        ('questions','question_type',"VARCHAR NOT NULL DEFAULT 'single_choice'"),
+        ('questions','answer_key',"TEXT NOT NULL DEFAULT ''"),
+        ('questions','answer_tolerance',"VARCHAR NOT NULL DEFAULT ''"),
+        ('questions','answer_case_sensitive',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('answers','answer_value',"TEXT NOT NULL DEFAULT ''"),
+        ('answers','manual_score',"INTEGER"),
+        ('answers','grader_comment',"TEXT NOT NULL DEFAULT ''"),
+        ('answers','graded_by',"VARCHAR NOT NULL DEFAULT ''"),
+        ('answers','graded_at',"VARCHAR NOT NULL DEFAULT ''"),
+        ('attempts','grading_status',"VARCHAR NOT NULL DEFAULT 'complete'"),
+        ('bank_questions','answer_key',"TEXT NOT NULL DEFAULT ''"),
+        ('bank_questions','answer_tolerance',"VARCHAR NOT NULL DEFAULT ''"),
+        ('bank_questions','answer_case_sensitive',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('bank_questions','po_mapping',"VARCHAR NOT NULL DEFAULT ''"),
+        ('bank_questions','pso_mapping',"VARCHAR NOT NULL DEFAULT ''"),
+        ('bank_questions','practice_visibility',"VARCHAR NOT NULL DEFAULT 'official_only'"),
+        ('bank_questions','explanation',"TEXT NOT NULL DEFAULT ''"),
+        ('admins','mfa_secret',"VARCHAR NOT NULL DEFAULT ''"),
+        ('admins','mfa_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('faculty_users','mfa_secret',"VARCHAR NOT NULL DEFAULT ''"),
+        ('faculty_users','mfa_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('audit_logs','prev_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
+        ('audit_logs','event_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
+    )
+    for table_name,column_name,ddl in upgrades:
+        _ensure_column(table_name,column_name,ddl)
+    # Backfill new answer keys from the legacy one-letter columns.
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
+        conn.execute(text("UPDATE bank_questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
+        conn.execute(text("UPDATE answers SET answer_value=selected_answer WHERE (answer_value IS NULL OR answer_value='') AND selected_answer IS NOT NULL"))
+
+
+def get_exam_security_policy(s,exam_id,create=False):
+    row=s.scalar(select(ExamSecurityPolicy).where(ExamSecurityPolicy.exam_id==exam_id))
+    if not row and create:
+        row=ExamSecurityPolicy(exam_id=exam_id,require_candidate_checkin=False,heartbeat_seconds=15,updated_at=now_iso())
+        s.add(row);s.flush()
+    return row
+
+
+def candidate_is_checked_in(s,exam_id,student_id):
+    row=s.scalar(select(ExamCandidateCheckin).where(ExamCandidateCheckin.exam_id==exam_id,ExamCandidateCheckin.student_id==student_id))
+    return bool(row and row.status=='verified')
+
+
+PRACTICE_VISIBILITY_LABELS={
+    'official_only':'Official Exam Only',
+    'practice_only':'Practice Only',
+    'both':'Official + Practice',
+}
+
+def normalize_practice_visibility(value):
+    value=(value or 'official_only').strip().lower()
+    aliases={'official':'official_only','exam':'official_only','practice':'practice_only','published':'practice_only','all':'both'}
+    value=aliases.get(value,value)
+    return value if value in PRACTICE_VISIBILITY_LABELS else 'official_only'
+
+def get_exam_practice_release(s,exam_id,create=False):
+    row=s.scalar(select(ExamPracticeRelease).where(ExamPracticeRelease.exam_id==exam_id))
+    if not row and create:
+        row=ExamPracticeRelease(exam_id=exam_id,is_released=False,release_after='',show_solutions=True,allow_mock=True,updated_by='',updated_at=now_iso())
+        s.add(row);s.flush()
+    return row
+
+def practice_release_is_available(row):
+    if not row or not row.is_released:return False
+    if not (row.release_after or '').strip():return True
+    try:return now_dt()>=parse_dt(row.release_after)
+    except Exception:return False
+
+def question_is_practice_eligible(q):
+    return bool(q and q.status=='approved' and normalize_practice_visibility(q.practice_visibility) in {'practice_only','both'} and canonical_question_type(q.question_type)!='essay')
+
+def question_is_official_eligible(q):
+    return bool(q and q.status=='approved' and normalize_practice_visibility(q.practice_visibility) in {'official_only','both'})
+
+def safe_json_load(value,default):
+    try:
+        parsed=json.loads(value or '')
+        return parsed if isinstance(parsed,type(default)) else default
+    except Exception:return default
+
+def question_definition_from_form(form):
+    qtype=canonical_question_type(form.get('question_type','single_choice'))
+    options={key:(form.get(f'option_{key.lower()}') or '').strip() for key in 'ABCD'}
+    if qtype=='single_choice':
+        answer_key=(form.get('correct_answer') or '').strip().upper()
+    elif qtype=='multiple_select':
+        selected=form.getlist('correct_answers') if hasattr(form,'getlist') else []
+        answer_key=','.join(selected) if selected else (form.get('answer_key') or '')
+    elif qtype=='true_false':
+        answer_key=(form.get('true_false_answer') or '').strip()
+    elif qtype=='numerical':
+        answer_key=(form.get('numerical_answer_key') or form.get('answer_key') or '').strip()
+    elif qtype=='short_text':
+        answer_key=(form.get('short_answer_key') or form.get('answer_key') or '').strip()
+    elif qtype=='essay':
+        answer_key=''
+    else:
+        answer_key=(form.get('answer_key') or '').strip()
+    tolerance=(form.get('answer_tolerance') or '').strip()
+    case_sensitive=form.get('answer_case_sensitive')=='on'
+    error=validate_question_definition(qtype,form.get('question',''),options,answer_key,tolerance)
+    legacy=(answer_key[:1].upper() if qtype=='single_choice' and answer_key[:1].upper() in {'A','B','C','D'} else 'A')
+    return {'question_type':qtype,'options':options,'answer_key':answer_key,'answer_tolerance':tolerance,'answer_case_sensitive':case_sensitive,'legacy_correct_answer':legacy,'error':error}
+
+
+def answer_record_value(answer):
+    return (getattr(answer,'answer_value','') or getattr(answer,'selected_answer','') or '').strip()
+
+
+def _request_identity_key(kind,username):
+    ip=(request.remote_addr or 'unknown').strip()
+    digest=hmac.new(app.secret_key.encode('utf-8'),f'{kind}|{username}|{ip}'.encode('utf-8'),hashlib.sha256).hexdigest()
+    return digest
+
+
+def auth_is_locked(s,key):
+    row=s.scalar(select(AuthThrottle).where(AuthThrottle.auth_key==key))
+    if not row or not row.locked_until:
+        return False,0
+    try:
+        until=parse_dt(row.locked_until)
+    except Exception:
+        return False,0
+    remaining=int((until-now_dt()).total_seconds())
+    return remaining>0,max(0,remaining)
+
+
+def record_auth_failure(s,key):
+    now=now_dt();row=s.scalar(select(AuthThrottle).where(AuthThrottle.auth_key==key))
+    if not row:
+        row=AuthThrottle(auth_key=key,failure_count=0,first_failed_at=now.isoformat(timespec='seconds'),locked_until='');s.add(row);s.flush()
+    try:first=parse_dt(row.first_failed_at) if row.first_failed_at else now
+    except Exception:first=now
+    if (now-first).total_seconds()>LOGIN_WINDOW_MINUTES*60:
+        row.failure_count=0;row.first_failed_at=now.isoformat(timespec='seconds');row.locked_until=''
+    row.failure_count+=1
+    if row.failure_count>=LOGIN_MAX_FAILURES:
+        row.locked_until=(now+timedelta(minutes=LOGIN_LOCK_MINUTES)).isoformat(timespec='seconds')
+    s.commit()
+
+
+def clear_auth_failures(s,key):
+    row=s.scalar(select(AuthThrottle).where(AuthThrottle.auth_key==key))
+    if row:s.delete(row);s.commit()
+
+
+def heartbeat_status(last_seen):
+    if not last_seen:return 'unknown'
+    try:age=(now_dt()-parse_dt(last_seen)).total_seconds()
+    except Exception:return 'unknown'
+    if age<=HEARTBEAT_STALE_SECONDS:return 'online'
+    if age<=HEARTBEAT_STALE_SECONDS*3:return 'stale'
+    return 'offline'
+
+
 def now_dt():
     """Current application time in the configured institutional timezone."""
     return datetime.now(DISPLAY_TZ)
@@ -351,7 +700,18 @@ def actor_label(s=None):
     return role
 
 def audit_event(s,action,entity_type='',entity_id='',details=''):
-    s.add(AuditLog(actor=actor_label(s),action=action,entity_type=str(entity_type or ''),entity_id=str(entity_id or ''),details=str(details or '')[:1500],created_at=now_iso()))
+    actor=actor_label(s);action=str(action or '');entity_type=str(entity_type or '');entity_id=str(entity_id or '');details=str(details or '')[:1500];created_at=now_iso()
+    previous=s.scalar(select(AuditLog).where(AuditLog.event_hash!='').order_by(AuditLog.id.desc()).limit(1))
+    prev_hash=previous.event_hash if previous else ''
+    event_hash=audit_event_hash(prev_hash=prev_hash,actor=actor,action=action,entity_type=entity_type,entity_id=entity_id,details=details,created_at=created_at)
+    s.add(AuditLog(actor=actor,action=action,entity_type=entity_type,entity_id=entity_id,details=details,created_at=created_at,prev_hash=prev_hash,event_hash=event_hash))
+
+def audit_chain_status(s):
+    sealed=s.scalars(select(AuditLog).where(AuditLog.event_hash!='').order_by(AuditLog.id.asc())).all()
+    legacy=s.scalar(select(func.count()).select_from(AuditLog).where(or_(AuditLog.event_hash=='',AuditLog.event_hash.is_(None)))) or 0
+    rows=[{'prev_hash':r.prev_hash,'event_hash':r.event_hash,'actor':r.actor,'action':r.action,'entity_type':r.entity_type,'entity_id':r.entity_id,'details':r.details,'created_at':r.created_at} for r in sealed]
+    result=verify_audit_rows(rows);result['legacy_count']=legacy
+    return result
 
 ROLE_LABELS={'super_admin':'Super Admin','exam_controller':'Exam Controller','hod':'HOD','faculty':'Faculty'}
 APPROVER_ROLES={'super_admin','exam_controller','hod'}
@@ -653,6 +1013,9 @@ def parse_local_schedule(value):
 
 
 def exam_access_for_student(s,student_id,exam):
+    security=get_exam_security_policy(s,exam.id,create=False)
+    if security and security.require_candidate_checkin and not candidate_is_checked_in(s,exam.id,student_id):
+        return False,'Identity check-in required at the exam centre',None
     sessions=s.scalars(select(ExamSession).where(ExamSession.exam_id==exam.id)).all()
     if not sessions:return True,'Available',None
     membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student_id))
@@ -708,6 +1071,13 @@ def qr_data_uri(text):
     return 'data:image/png;base64,'+base64.b64encode(buf.getvalue()).decode('ascii')
 
 
+def current_staff_account(s=None):
+    s=s or DB();role=web_session.get('role');uid=web_session.get('user_id')
+    if role=='admin':return s.get(Admin,uid) if uid else s.scalar(select(Admin).where(Admin.username==web_session.get('username','')))
+    if role=='faculty':return s.get(Faculty,uid) if uid else s.scalar(select(Faculty).where(Faculty.username==web_session.get('username','')))
+    return None
+
+
 def backup_key(password,salt):
     kdf=PBKDF2HMAC(algorithm=hashes.SHA256(),length=32,salt=salt,iterations=BACKUP_KDF_ITERATIONS)
     return base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8')))
@@ -755,13 +1125,13 @@ def activate_preloaded_pack(s,pack):
             course_semester=(row.get('course_semester') or pack.get('course_semester') or '').strip(),
             unit=str(row.get('unit') or '').strip(),
             topic=(row.get('topic') or row.get('unit_title') or '').strip(),
-            question_type='MCQ',
+            question_type='single_choice',
             question=question,
             option_a=str(row.get('option_a') or '').strip(),
             option_b=str(row.get('option_b') or '').strip(),
             option_c=str(row.get('option_c') or '').strip(),
             option_d=str(row.get('option_d') or '').strip(),
-            correct_answer=ans,
+            correct_answer=ans,answer_key=ans,answer_tolerance='',answer_case_sensitive=False,
             marks=max(1,int(row.get('marks') or 1)),
             difficulty=canonical_difficulty(row.get('difficulty')),
             bloom_level=canonical_bloom(row.get('bloom_level')),
@@ -887,6 +1257,8 @@ def ensure_super_admin_identity(s):
 
 def init_db():
     Base.metadata.create_all(engine)
+    _configure_database_reliability()
+    run_schema_upgrades()
     s=DB()
     try:
         seed_subject_catalog(s)
@@ -929,7 +1301,7 @@ def globals_for_templates():
         s=DB();institution=get_institution(s,create=True);staff_role=current_staff_role(s) if web_session.get('role') in {'admin','faculty'} else web_session.get('role','');staff_display_name=current_staff_name(s) if web_session.get('role') in {'admin','faculty'} else ''
     except Exception:
         institution=None;staff_role=web_session.get('role','');staff_display_name=(web_session.get('username') or '').replace('.',' ').replace('_',' ').strip().title()
-    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'is_online':APP_MODE=='online','app_version':APP_VERSION,'institution':institution,'staff_role':staff_role,'staff_role_label':ROLE_LABELS.get(staff_role,staff_role.replace('_',' ').title() if staff_role else ''),'staff_display_name':staff_display_name}
+    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'is_online':APP_MODE=='online','app_version':APP_VERSION,'institution':institution,'staff_role':staff_role,'staff_role_label':ROLE_LABELS.get(staff_role,staff_role.replace('_',' ').title() if staff_role else ''),'staff_display_name':staff_display_name,'edge_package_enabled':len(EXAM_PACKAGE_SIGNING_KEY.encode('utf-8'))>=32}
 
 @app.before_request
 def offline_first_run_guard():
@@ -943,7 +1315,11 @@ def security_headers(response):
     response.headers.setdefault('X-Content-Type-Options','nosniff')
     response.headers.setdefault('X-Frame-Options','DENY')
     response.headers.setdefault('Referrer-Policy','same-origin')
-    response.headers.setdefault('Permissions-Policy','camera=(), microphone=(), geolocation=()')
+    response.headers.setdefault('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=(), usb=()')
+    response.headers.setdefault('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    response.headers.setdefault('Cross-Origin-Opener-Policy','same-origin')
+    response.headers.setdefault('Cross-Origin-Resource-Policy','same-origin')
+    if APP_MODE=='online' and request.is_secure: response.headers.setdefault('Strict-Transport-Security','max-age=31536000; includeSubDomains')
     response.headers.setdefault('Cache-Control','no-store' if request.path.startswith('/admin') or request.path.startswith('/student') else 'no-cache')
     return response
 
@@ -979,6 +1355,19 @@ def format_dt(v):
     if not v:return '-'
     try:return display_dt(v).strftime('%d %b %Y, %I:%M %p')
     except Exception:return v
+
+def integration_api_required(fn):
+    @wraps(fn)
+    def inner(*a,**kw):
+        if len(INTEGRATION_API_KEY)<24:
+            return jsonify(error='Integration API is disabled.'),503
+        supplied=request.headers.get('Authorization','')
+        token=supplied[7:].strip() if supplied.lower().startswith('bearer ') else ''
+        if not token or not secrets.compare_digest(token,INTEGRATION_API_KEY):
+            return jsonify(error='Unauthorized'),401
+        return fn(*a,**kw)
+    return inner
+
 
 def admin_required(fn):
     @wraps(fn)
@@ -1051,18 +1440,43 @@ def attempt_question_ids(s,attempt):
     if rows: return [r.question_id for r in rows]
     return [int(x) for x in (attempt.question_order or '').split(',') if x]
 
-def save_answer_record(s,attempt_id,question_id,answer):
+def save_answer_record(s,attempt_id,question_id,answer,question=None):
+    question=question or s.get(Question,question_id)
+    if not question:raise ValueError('Question not found.')
     row=s.scalar(select(Answer).where(Answer.attempt_id==attempt_id,Answer.question_id==question_id))
-    if row: row.selected_answer=answer; row.saved_at=now_iso()
-    else: s.add(Answer(attempt_id=attempt_id,question_id=question_id,selected_answer=answer,saved_at=now_iso()))
+    raw='' if answer is None else str(answer).strip()
+    # Free-response and multi-select controls can legitimately be cleared. Delete the
+    # previously autosaved row so a stale answer is never submitted by accident.
+    if not raw:
+        if row:s.delete(row)
+        return
+    normalized=normalize_answer(question,raw)
+    if not normalized:raise ValueError('Answer format is invalid for this question.')
+    legacy=normalized if canonical_question_type(question.question_type)=='single_choice' and normalized in {'A','B','C','D'} else None
+    if row:
+        row.selected_answer=legacy;row.answer_value=normalized;row.saved_at=now_iso()
+    else:
+        s.add(Answer(attempt_id=attempt_id,question_id=question_id,selected_answer=legacy,answer_value=normalized,saved_at=now_iso()))
+
+def recalculate_attempt_score(s,attempt,questions=None,saved=None):
+    qids=attempt_question_ids(s,attempt)
+    questions=questions if questions is not None else (s.scalars(select(Question).where(Question.id.in_(qids))).all() if qids else [])
+    saved=saved if saved is not None else s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all()
+    amap={a.question_id:a for a in saved};score=0;pending=False
+    for q in questions:
+        answer=amap.get(q.id);value=answer_record_value(answer) if answer else ''
+        if canonical_question_type(q.question_type)=='essay':
+            if value:
+                if answer.manual_score is None:pending=True
+                else:score+=max(0,min(int(answer.manual_score),int(q.marks or 0)))
+        elif is_answer_correct(q,value):score+=q.marks
+    attempt.score=score;attempt.total_marks=sum(q.marks for q in questions);attempt.grading_status='pending' if pending else 'complete'
+    return attempt
+
 
 def finalize_attempt(s,attempt):
     if attempt.status=='submitted': return attempt
-    qids=attempt_question_ids(s,attempt)
-    questions=s.scalars(select(Question).where(Question.id.in_(qids))).all() if qids else []
-    saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all(); amap={a.question_id:a.selected_answer for a in saved}
-    attempt.score=sum(q.marks for q in questions if amap.get(q.id)==q.correct_answer)
-    attempt.total_marks=sum(q.marks for q in questions); attempt.status='submitted'; attempt.submitted_at=now_iso(); s.commit(); return attempt
+    recalculate_attempt_score(s,attempt);attempt.status='submitted';attempt.submitted_at=now_iso();s.commit();return attempt
 
 def canonical_difficulty(value):
     v=(value or 'Medium').strip().lower()
@@ -1124,8 +1538,37 @@ def choose_blueprint_questions(candidates,total,unit_weights,diff_weights):
 
 def copy_bank_question_to_exam(s,bq,exam_id):
     if s.scalar(select(ExamBankMap).where(ExamBankMap.exam_id==exam_id,ExamBankMap.bank_question_id==bq.id)): return False
-    q=Question(exam_id=exam_id,question=bq.question,option_a=bq.option_a,option_b=bq.option_b,option_c=bq.option_c,option_d=bq.option_d,correct_answer=bq.correct_answer,marks=bq.marks)
+    q=Question(exam_id=exam_id,question=bq.question,option_a=bq.option_a,option_b=bq.option_b,option_c=bq.option_c,option_d=bq.option_d,correct_answer=bq.correct_answer,question_type=canonical_question_type(bq.question_type),answer_key=(bq.answer_key or bq.correct_answer),answer_tolerance=bq.answer_tolerance or '',answer_case_sensitive=bool(bq.answer_case_sensitive),marks=bq.marks)
     s.add(q); s.flush(); s.add(ExamBankMap(exam_id=exam_id,exam_question_id=q.id,bank_question_id=bq.id)); return True
+
+def edge_exam_payload(s,exam):
+    cfg=get_exam_config(s,exam.id,create=False);security=get_exam_security_policy(s,exam.id,create=False);questions=s.scalars(select(Question).where(Question.exam_id==exam.id).order_by(Question.id)).all();inst=get_institution(s,create=True)
+    return {
+        'kind':'exam','schema_version':1,'issued_at':now_iso(),
+        'source':{'mode':APP_MODE,'exam_id':exam.id,'institution':inst.short_name if inst else ''},
+        'exam':{'title':exam.title,'duration_minutes':exam.duration_minutes,'created_at':exam.created_at},
+        'config':({
+            'subject':cfg.subject,'course_semester':cfg.course_semester,'question_count':cfg.question_count,'pool_size':cfg.pool_size,
+            'easy_pct':cfg.easy_pct,'medium_pct':cfg.medium_pct,'hard_pct':cfg.hard_pct,'unit_weights':cfg.unit_weights,
+            'randomize_questions':bool(cfg.randomize_questions),'shuffle_options':bool(cfg.shuffle_options),'require_fullscreen':bool(cfg.require_fullscreen),'tab_switch_limit':cfg.tab_switch_limit
+        } if cfg else {}),
+        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'heartbeat_seconds':security.heartbeat_seconds} if security else {}),
+        'questions':[{'question':q.question,'question_type':canonical_question_type(q.question_type),'option_a':q.option_a,'option_b':q.option_b,'option_c':q.option_c,'option_d':q.option_d,'correct_answer':q.correct_answer,'answer_key':q.answer_key,'answer_tolerance':q.answer_tolerance,'answer_case_sensitive':bool(q.answer_case_sensitive),'marks':q.marks} for q in questions],
+    }
+
+
+def edge_results_payload(s,exam):
+    attempts=s.scalars(select(Attempt).where(Attempt.exam_id==exam.id).order_by(Attempt.id)).all();student_ids={a.student_id for a in attempts};students={x.id:x for x in (s.scalars(select(Student).where(Student.id.in_(student_ids))).all() if student_ids else [])};attempt_ids={a.id for a in attempts};answers=s.scalars(select(Answer).where(Answer.attempt_id.in_(attempt_ids))).all() if attempt_ids else [];events=s.scalars(select(IntegrityEvent).where(IntegrityEvent.attempt_id.in_(attempt_ids)).order_by(IntegrityEvent.id)).all() if attempt_ids else [];answers_by={};events_by={}
+    for a in answers:answers_by.setdefault(a.attempt_id,[]).append(a)
+    for ev in events:events_by.setdefault(ev.attempt_id,[]).append(ev)
+    link=s.scalar(select(EdgePackageReceipt).where(EdgePackageReceipt.exam_id==exam.id).order_by(EdgePackageReceipt.id.desc()).limit(1))
+    origin={'exam_package_id':link.package_id,'exam_id':link.source_exam_id,'mode':link.source_mode} if link else {}
+    return {'kind':'results','schema_version':1,'issued_at':now_iso(),'source':{'mode':APP_MODE,'exam_id':exam.id},'origin':origin,'exam':{'id':exam.id,'title':exam.title},'attempts':[{'attempt_id':a.id,'roll_no':students.get(a.student_id).roll_no if students.get(a.student_id) else str(a.student_id),'name':students.get(a.student_id).name if students.get(a.student_id) else '','status':a.status,'grading_status':a.grading_status,'score':a.score,'total_marks':a.total_marks,'started_at':a.started_at,'submitted_at':a.submitted_at,'answers':[{'question_id':x.question_id,'answer_value':answer_record_value(x),'manual_score':x.manual_score,'grader_comment':x.grader_comment,'graded_by':x.graded_by,'graded_at':x.graded_at} for x in answers_by.get(a.id,[])],'integrity':[{'event_type':e.event_type,'details':e.details,'created_at':e.created_at} for e in events_by.get(a.id,[])]} for a in attempts]}
+
+
+def _edge_filename(text):
+    cleaned=''.join(ch if ch.isalnum() else '_' for ch in str(text or '')).strip('_')
+    return cleaned[:80] or 'exam'
 
 def _cell_text(value):
     if value is None:return ''
@@ -1161,36 +1604,132 @@ def _rows_from_upload(upload):
         if any(values.values()): values['_row_number']=row_number; rows.append(values)
     return headers,rows
 
+def complete_staff_session(s,row,role):
+    csrf=web_session.get('_csrf_token');web_session.clear();web_session['_csrf_token']=csrf
+    web_session.update(role=role,user_id=row.id,username=row.username,display_name=((getattr(row,'name','') or row.username).strip()),_last_activity=int(time.time()))
+    audit_event(s,'staff_login','user',row.id,role);s.commit()
+    return redirect(url_for('admin_dashboard'))
+
+
+def begin_staff_mfa(row,role):
+    csrf=web_session.get('_csrf_token');web_session.clear();web_session['_csrf_token']=csrf
+    web_session.update(_mfa_pending_role=role,_mfa_pending_user_id=row.id,_mfa_pending_username=row.username,_mfa_pending_expires=int(time.time())+300,_mfa_failures=0)
+    return redirect(url_for('mfa_verify'))
+
+
 @app.route('/',methods=['GET','POST'])
 def home():
     if web_session.get('role') in {'admin','faculty'}: return redirect(url_for('admin_dashboard'))
     if web_session.get('role')=='student': return redirect(url_for('student_dashboard'))
     if request.method=='POST':
-        s=DB(); typ=request.form.get('login_type')
+        s=DB();typ=request.form.get('login_type');kind='staff' if typ=='admin' else 'student'
+        username=(request.form.get('username','') if typ=='admin' else request.form.get('roll_no','')).strip()
+        password=request.form.get('password','')
+        throttle_key=_request_identity_key(kind,username.casefold())
+        locked,remaining=auth_is_locked(s,throttle_key)
+        if locked:
+            flash(f'Too many failed sign-in attempts. Try again in {max(1,math.ceil(remaining/60))} minute(s).','error')
+            return render_template('login.html',login_page=True),429
+        row=None;role='student'
         if typ=='admin':
-            username=request.form.get('username','').strip(); password=request.form.get('password','')
-            row=s.scalar(select(Admin).where(Admin.username==username))
-            role='admin'
-            if not row:
-                row=s.scalar(select(Faculty).where(Faculty.username==username,Faculty.is_active==True)); role='faculty'
-            if row and check_password_hash(row.password_hash,password):
-                csrf=web_session.get('_csrf_token'); web_session.clear(); web_session['_csrf_token']=csrf; web_session.update(role=role,user_id=row.id,username=row.username,display_name=((getattr(row,'name','') or row.username).strip()),_last_activity=int(time.time()))
-                audit_event(s,'staff_login','user',row.id,role); s.commit(); return redirect(url_for('admin_dashboard'))
+            row=s.scalar(select(Admin).where(Admin.username==username));role='admin'
+            if not row:row=s.scalar(select(Faculty).where(Faculty.username==username,Faculty.is_active==True));role='faculty'
         else:
-            row=s.scalar(select(Student).where(Student.roll_no==request.form.get('roll_no','').strip()))
-            if row and check_password_hash(row.password_hash,request.form.get('password','')):
-                csrf=web_session.get('_csrf_token'); web_session.clear(); web_session['_csrf_token']=csrf; web_session.update(role='student',user_id=row.id,username=row.roll_no,_last_activity=int(time.time())); return redirect(url_for('student_dashboard'))
+            row=s.scalar(select(Student).where(Student.roll_no==username))
+        valid=bool(row and check_password_hash(row.password_hash,password))
+        if valid:
+            clear_auth_failures(s,throttle_key)
+            if role=='student':
+                csrf=web_session.get('_csrf_token');web_session.clear();web_session['_csrf_token']=csrf
+                web_session.update(role='student',user_id=row.id,username=row.roll_no,_last_activity=int(time.time()));audit_event(s,'student_login','user',row.id,'student')
+                s.commit();return redirect(url_for('student_dashboard'))
+            if bool(getattr(row,'mfa_enabled',False)) and (getattr(row,'mfa_secret','') or '').strip():
+                return begin_staff_mfa(row,role)
+            return complete_staff_session(s,row,role)
+        record_auth_failure(s,throttle_key)
         flash('Invalid login credentials.','error')
     return render_template('login.html',login_page=True)
+
+@app.route('/mfa-verify',methods=['GET','POST'])
+def mfa_verify():
+    role=web_session.get('_mfa_pending_role');uid=web_session.get('_mfa_pending_user_id');expires=int(web_session.get('_mfa_pending_expires') or 0)
+    if role not in {'admin','faculty'} or not uid or expires<int(time.time()):
+        for key in ['_mfa_pending_role','_mfa_pending_user_id','_mfa_pending_username','_mfa_pending_expires','_mfa_failures']:web_session.pop(key,None)
+        flash('Your verification session expired. Sign in again.','error');return redirect(url_for('home'))
+    s=DB();row=s.get(Admin,uid) if role=='admin' else s.get(Faculty,uid)
+    if not row or not bool(getattr(row,'mfa_enabled',False)) or not (getattr(row,'mfa_secret','') or '').strip():
+        flash('Multi-factor authentication is not available for this account.','error');return redirect(url_for('home'))
+    if request.method=='POST':
+        code=request.form.get('code','')
+        if verify_totp(row.mfa_secret,code):
+            return complete_staff_session(s,row,role)
+        failures=int(web_session.get('_mfa_failures') or 0)+1;web_session['_mfa_failures']=failures
+        audit_event(s,'staff_mfa_failed','user',row.id,role);s.commit()
+        if failures>=5:
+            csrf=web_session.get('_csrf_token');web_session.clear();web_session['_csrf_token']=csrf
+            flash('Too many invalid verification codes. Sign in again.','error');return redirect(url_for('home'))
+        flash('Invalid authentication code.','error')
+    return render_template('mfa_verify.html',login_page=True,username=getattr(row,'username',''))
+
+
+@app.route('/admin/security/mfa',methods=['GET','POST'])
+@staff_required
+def staff_mfa_settings():
+    s=DB();account=current_staff_account(s)
+    if not account:abort(404)
+    enabled=bool(getattr(account,'mfa_enabled',False) and (getattr(account,'mfa_secret','') or '').strip())
+    if request.method=='POST':
+        action=request.form.get('action','')
+        password=request.form.get('password','')
+        if not check_password_hash(account.password_hash,password):
+            flash('Current password is incorrect.','error');return redirect(url_for('staff_mfa_settings'))
+        if action=='enable':
+            secret_value=(web_session.get('_mfa_enroll_secret') or '').strip();code=request.form.get('code','')
+            if not secret_value or not verify_totp(secret_value,code):
+                flash('Enter the current 6-digit code from your authenticator app.','error');return redirect(url_for('staff_mfa_settings'))
+            account.mfa_secret=secret_value;account.mfa_enabled=True;web_session.pop('_mfa_enroll_secret',None);audit_event(s,'staff_mfa_enabled','user',account.id,current_staff_role(s));s.commit();flash('Multi-factor authentication is now enabled.');return redirect(url_for('staff_mfa_settings'))
+        if action=='disable':
+            code=request.form.get('code','')
+            if not enabled or not verify_totp(account.mfa_secret,code):
+                flash('Enter a valid authenticator code to disable MFA.','error');return redirect(url_for('staff_mfa_settings'))
+            account.mfa_enabled=False;account.mfa_secret='';web_session.pop('_mfa_enroll_secret',None);audit_event(s,'staff_mfa_disabled','user',account.id,current_staff_role(s));s.commit();flash('Multi-factor authentication has been disabled.');return redirect(url_for('staff_mfa_settings'))
+        abort(400)
+    secret_value=''
+    qr_uri=''
+    if not enabled:
+        secret_value=(web_session.get('_mfa_enroll_secret') or '').strip()
+        if not secret_value:
+            secret_value=generate_totp_secret();web_session['_mfa_enroll_secret']=secret_value
+        qr_uri=qr_data_uri(totp_uri(secret_value,account.username))
+    return render_template('mfa_settings.html',enabled=enabled,secret_value=secret_value,qr_uri=qr_uri,account=account)
+
 
 @app.route('/logout')
 def logout(): web_session.clear(); return redirect(url_for('home'))
 
 @app.route('/health')
 def health():
+    started=time.perf_counter()
     try:
-        s=DB(); s.execute(select(1)); return jsonify(status='ok',mode=APP_MODE,database='postgresql' if DATABASE_URL.startswith('postgresql') else 'sqlite')
-    except Exception:return jsonify(status='error'),503
+        s=DB();s.execute(select(1));latency_ms=round((time.perf_counter()-started)*1000,1)
+        active=s.scalar(select(func.count()).select_from(Exam).where(Exam.is_active==True)) or 0
+        in_progress=s.scalar(select(func.count()).select_from(Attempt).where(Attempt.status=='in_progress')) or 0
+        return jsonify(status='ok',version=APP_VERSION,mode=APP_MODE,database='postgresql' if DATABASE_URL.startswith('postgresql') else 'sqlite',db_latency_ms=latency_ms,active_exams=active,in_progress_attempts=in_progress)
+    except Exception as exc:return jsonify(status='error',version=APP_VERSION,detail=type(exc).__name__),503
+
+@app.route('/api/v1/exams')
+@integration_api_required
+def integration_exams():
+    s=DB();rows=s.scalars(select(Exam).order_by(Exam.id.desc())).all()
+    return jsonify(exams=[{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':bool(e.is_active),'created_at':e.created_at} for e in rows])
+
+
+@app.route('/api/v1/results')
+@integration_api_required
+def integration_results():
+    exam_id=request.args.get('exam_id',type=int);s=DB();rows=result_rows(s,exam_id)
+    return jsonify(results=[{'attempt_id':r.attempt_id,'roll_no':r.roll_no,'name':r.name,'batch_section':r.group_label,'exam_id':r.exam_id,'exam':r.title,'status':r.status,'grading_status':r.grading_status,'score':r.score,'total_marks':r.total_marks,'percentage':r.percentage if r.status=='submitted' else None,'grade':r.grade if r.status=='submitted' else None,'integrity_events':r.violations,'started_at':r.started_at,'submitted_at':r.submitted_at} for r in rows])
+
 
 @app.route('/admin')
 @staff_required
@@ -1295,24 +1834,25 @@ def question_bank():
     s=DB()
     seed_subject_catalog(s)
     if request.method=='POST':
-        question=request.form.get('question','').strip(); ans=request.form.get('correct_answer','A').upper()
+        question=request.form.get('question','').strip();qdef=question_definition_from_form(request.form)
         subject_name=request.form.get('subject','').strip()
         catalog_subject=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True)) if subject_name else None
-        if not question: flash('Question text is required.','error')
-        elif not catalog_subject: flash('Choose a subject from the Subject Catalog, or add your custom subject first.','error')
-        elif ans not in {'A','B','C','D'}: flash('Correct answer must be A, B, C or D.','error')
+        duplicate=s.scalar(select(BankQuestion).where(BankQuestion.subject==subject_name,func.lower(BankQuestion.question)==question.lower())) if question and subject_name else None
+        if qdef['error']:flash(qdef['error'],'error')
+        elif not catalog_subject:flash('Choose a subject from the Subject Catalog, or add your custom subject first.','error')
+        elif duplicate:flash(f'A duplicate question already exists in this subject (Question #{duplicate.id}).','error')
         else:
-            try: marks=max(1,int(request.form.get('marks','1')))
-            except ValueError: marks=1
+            try:marks=max(1,int(request.form.get('marks','1')))
+            except ValueError:marks=1
             status='approved' if can_approve_content(s) and request.form.get('status')=='approved' else 'draft'
             course_semester=request.form.get('course_semester','').strip() or catalog_subject.course_semester
-            bq=BankQuestion(
-                subject=catalog_subject.name,course_semester=course_semester,unit=request.form.get('unit','').strip(),topic=request.form.get('topic','').strip(),question_type='MCQ',question=question,
-                option_a=request.form.get('option_a','').strip(),option_b=request.form.get('option_b','').strip(),option_c=request.form.get('option_c','').strip(),option_d=request.form.get('option_d','').strip(),correct_answer=ans,marks=marks,
-                difficulty=canonical_difficulty(request.form.get('difficulty')),bloom_level=canonical_bloom(request.form.get('bloom_level')),co_mapping=request.form.get('co_mapping','').strip(),tags=request.form.get('tags','').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso())
-            s.add(bq); s.flush(); audit_event(s,'bank_question_created','bank_question',bq.id,f'status={status}, subject={catalog_subject.name}, category={catalog_subject.category}'); s.commit(); flash('Question added to the bank.')
+            opts=qdef['options']
+            bq=BankQuestion(subject=catalog_subject.name,course_semester=course_semester,unit=request.form.get('unit','').strip(),topic=request.form.get('topic','').strip(),question_type=qdef['question_type'],question=question,
+                option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks,
+                difficulty=canonical_difficulty(request.form.get('difficulty')),bloom_level=canonical_bloom(request.form.get('bloom_level')),co_mapping=request.form.get('co_mapping','').strip(),po_mapping=request.form.get('po_mapping','').strip(),pso_mapping=request.form.get('pso_mapping','').strip(),tags=request.form.get('tags','').strip(),practice_visibility=normalize_practice_visibility(request.form.get('practice_visibility')),explanation=request.form.get('explanation','').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso())
+            s.add(bq);s.flush();audit_event(s,'bank_question_created','bank_question',bq.id,f'status={status}, type={qdef["question_type"]}, subject={catalog_subject.name}, category={catalog_subject.category}');s.commit();flash('Question added to the bank.')
             return redirect(url_for('question_bank',subject=catalog_subject.name)+'#subject-workspace')
-    q=(request.args.get('q') or '').strip(); category=(request.args.get('category') or '').strip(); subject=(request.args.get('subject') or '').strip(); unit=(request.args.get('unit') or '').strip(); difficulty=(request.args.get('difficulty') or '').strip(); status=(request.args.get('status') or '').strip()
+    q=(request.args.get('q') or '').strip(); category=(request.args.get('category') or '').strip(); subject=(request.args.get('subject') or '').strip(); unit=(request.args.get('unit') or '').strip(); difficulty=(request.args.get('difficulty') or '').strip(); status=(request.args.get('status') or '').strip(); practice_visibility=normalize_practice_visibility(request.args.get('practice_visibility')) if request.args.get('practice_visibility') else ''
     catalog_rows=s.scalars(select(SubjectCatalog).where(SubjectCatalog.is_active==True).order_by(SubjectCatalog.category,SubjectCatalog.name)).all()
     catalog_map={row.name:row for row in catalog_rows}
     stmt=select(BankQuestion)
@@ -1324,6 +1864,7 @@ def question_bank():
     if unit: stmt=stmt.where(BankQuestion.unit==unit)
     if difficulty: stmt=stmt.where(BankQuestion.difficulty==canonical_difficulty(difficulty))
     if status: stmt=stmt.where(BankQuestion.status==status)
+    if practice_visibility: stmt=stmt.where(BankQuestion.practice_visibility==practice_visibility)
     rows=s.scalars(stmt.order_by(BankQuestion.id.desc())).all()
     units=s.scalars(select(BankQuestion.unit).where(BankQuestion.unit!='').distinct().order_by(BankQuestion.unit)).all(); exams_list=s.scalars(select(Exam).order_by(Exam.id.desc())).all()
     usage=dict(s.execute(select(ExamBankMap.bank_question_id,func.count(func.distinct(ExamBankMap.exam_id))).group_by(ExamBankMap.bank_question_id)).all())
@@ -1336,9 +1877,11 @@ def question_bank():
     selected_subject_stats=None
     if selected_catalog_subject:
         approved_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved')) or 0
+        official_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))) or 0
+        practice_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))) or 0
         draft_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='draft')) or 0
-        selected_subject_stats={'total':approved_count+draft_count,'approved':approved_count,'draft':draft_count}
-    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,units=units,exams=exams_list,usage=usage,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
+        selected_subject_stats={'total':approved_count+draft_count,'approved':approved_count,'official':official_count,'practice':practice_count,'draft':draft_count}
+    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,units=units,exams=exams_list,usage=usage,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
 
 @app.route('/admin/question-bank/subjects',methods=['POST'])
 @staff_required
@@ -1384,7 +1927,8 @@ def create_exam_from_catalog_subject(subject_id):
 
     bank_rows=s.scalars(select(BankQuestion).where(
         BankQuestion.subject==subject.name,
-        BankQuestion.status=='approved'
+        BankQuestion.status=='approved',
+        BankQuestion.practice_visibility.in_(['official_only','both'])
     ).order_by(BankQuestion.unit,BankQuestion.id)).all()
     if not bank_rows:
         flash(f'Add and approve at least one question for {subject.name} before creating an exam.','error')
@@ -1508,7 +2052,7 @@ def create_exam_from_preloaded_bank(slug):
         added,_=activate_preloaded_pack(s,pack)
         if added: s.flush()
         marker=f'preloaded:{slug}'
-        bank_rows=s.scalars(select(BankQuestion).where(BankQuestion.created_by==marker,BankQuestion.status=='approved').order_by(BankQuestion.unit,BankQuestion.id)).all()
+        bank_rows=s.scalars(select(BankQuestion).where(BankQuestion.created_by==marker,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both'])).order_by(BankQuestion.unit,BankQuestion.id)).all()
         if not bank_rows:
             flash('This subject bank has no approved questions.','error'); s.rollback()
             return redirect(url_for('question_bank'))
@@ -1554,6 +2098,7 @@ def create_unit_set_exam_from_preloaded_bank(slug,unit,set_code):
         bank_rows=s.scalars(select(BankQuestion).where(
             BankQuestion.created_by==marker,
             BankQuestion.status=='approved',
+            BankQuestion.practice_visibility.in_(['official_only','both']),
             BankQuestion.unit==unit,
             BankQuestion.tags.contains(set_marker)
         ).order_by(BankQuestion.id)).all()
@@ -1605,46 +2150,54 @@ def import_question_bank():
         target_catalog=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==target_subject,SubjectCatalog.is_active==True))
         if not target_catalog:
             flash('The selected Subject Catalog entry is not active.','error');return redirect(url_for('question_bank'))
-    required={'question','option_a','option_b','option_c','option_d','correct_answer','marks'}
-    if not target_catalog: required.add('subject')
+    required={'question','marks'}
+    if not target_catalog:required.add('subject')
     if not required.issubset(set(headers)):
-        flash('Question bank file is missing required columns. Download the template and try again.','error');return redirect(redirect_url)
-    added=invalid=0
+        flash('Question bank file is missing required columns. Download the new template and try again.','error');return redirect(redirect_url)
+    added=invalid=duplicates=0
     for r in rows:
-        ans=(r.get('correct_answer') or '').upper().strip(); question=(r.get('question') or '').strip()
-        if not question or ans not in {'A','B','C','D'}: invalid+=1;continue
+        question=(r.get('question') or '').strip();qtype=canonical_question_type(r.get('question_type') or 'single_choice')
+        options={key:(r.get(f'option_{key.lower()}') or '').strip() for key in 'ABCD'}
+        if qtype=='single_choice':answer_key=(r.get('answer_key') or r.get('correct_answer') or '').strip()
+        elif qtype=='multiple_select':answer_key=(r.get('answer_key') or r.get('correct_answer') or '').strip()
+        elif qtype=='true_false':answer_key=(r.get('answer_key') or r.get('correct_answer') or '').strip()
+        else:answer_key=(r.get('answer_key') or '').strip()
+        tolerance=(r.get('answer_tolerance') or '').strip()
+        error=validate_question_definition(qtype,question,options,answer_key,tolerance)
+        if error:invalid+=1;continue
         try:marks=max(1,int(r.get('marks') or 1))
         except ValueError:marks=1
-        requested_status=(r.get('status') or 'draft').lower(); status='approved' if can_approve_content(s) and requested_status=='approved' else 'draft'
+        requested_status=(r.get('status') or 'draft').lower();status='approved' if can_approve_content(s) and requested_status=='approved' else 'draft'
         if target_catalog:
-            subject_name=target_catalog.name
-            course=(r.get('course_semester') or '').strip() or target_catalog.course_semester
-            category=target_catalog.category
+            subject_name=target_catalog.name;course=(r.get('course_semester') or '').strip() or target_catalog.course_semester;category=target_catalog.category
         else:
-            subject_name=(r.get('subject') or 'General').strip() or 'General'; course=(r.get('course_semester') or '').strip(); category=(r.get('category') or '').strip() or 'Imported / Other'
-            ensure_subject_catalog_entry(s,subject_name,category,course,actor_label(s))
-        s.add(BankQuestion(subject=subject_name,course_semester=course,unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type='MCQ',question=question,option_a=(r.get('option_a') or '').strip(),option_b=(r.get('option_b') or '').strip(),option_c=(r.get('option_c') or '').strip(),option_d=(r.get('option_d') or '').strip(),correct_answer=ans,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso()));added+=1
-    audit_event(s,'question_bank_bulk_import','bank_question','',f'added={added}, invalid={invalid}, target_subject={target_subject or "mixed"}')
-    s.commit();flash(f'Imported {added} question(s).'+(f' Skipped {invalid} invalid row(s).' if invalid else ''));return redirect(redirect_url)
+            subject_name=(r.get('subject') or 'General').strip() or 'General';course=(r.get('course_semester') or '').strip();category=(r.get('category') or '').strip() or 'Imported / Other';ensure_subject_catalog_entry(s,subject_name,category,course,actor_label(s))
+        if s.scalar(select(BankQuestion.id).where(BankQuestion.subject==subject_name,func.lower(BankQuestion.question)==question.lower())):
+            duplicates+=1;continue
+        legacy=answer_key.strip().upper() if qtype=='single_choice' else 'A';legacy=legacy if legacy in {'A','B','C','D'} else 'A'
+        case_sensitive=str(r.get('answer_case_sensitive') or '').strip().lower() in {'1','true','yes','y','on'}
+        s.add(BankQuestion(subject=subject_name,course_semester=course,unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type=qtype,question=question,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=case_sensitive,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),po_mapping=(r.get('po_mapping') or '').strip(),pso_mapping=(r.get('pso_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),practice_visibility=normalize_practice_visibility(r.get('practice_visibility')),explanation=(r.get('explanation') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso()));added+=1
+    audit_event(s,'question_bank_bulk_import','bank_question','',f'added={added}, invalid={invalid}, duplicates={duplicates}, target_subject={target_subject or "mixed"}')
+    s.commit();flash(f'Imported {added} question(s).'+(f' Skipped {invalid} invalid row(s).' if invalid else '')+(f' Skipped {duplicates} duplicate(s).' if duplicates else ''));return redirect(redirect_url)
 
 @app.route('/admin/question-bank/template/<fmt>')
 @staff_required
 def question_bank_template(fmt):
-    headers=['category','subject','course_semester','unit','topic','question','option_a','option_b','option_c','option_d','correct_answer','marks','difficulty','bloom_level','co_mapping','tags','status']
+    headers=['category','subject','course_semester','unit','topic','question_type','question','option_a','option_b','option_c','option_d','correct_answer','answer_key','answer_tolerance','answer_case_sensitive','marks','difficulty','bloom_level','co_mapping','po_mapping','pso_mapping','tags','practice_visibility','explanation','status']
     subject_name=(request.args.get('subject') or '').strip()
     category='Computer Science'; course='B.Tech CSE / Sem 5'
     if subject_name:
         s=DB(); row=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True))
         if row: category=row.category; course=row.course_semester; subject_name=row.name
         else: subject_name=''
-    example=[category,subject_name or 'Mobile Application Development',course or 'B.Tech CSE / Sem 5','1','Introduction','Replace this sample with your question','Option A','Option B','Option C','Option D','A','1','Medium','Understand','CO1','custom','approved']
+    example=[category,subject_name or 'Mobile Application Development',course or 'B.Tech CSE / Sem 5','1','Introduction','single_choice','Replace this sample with your question','Option A','Option B','Option C','Option D','A','A','','false','1','Medium','Understand','CO1','PO1','PSO1','custom','official_only','Explain why option A is correct.','approved']
     safe_name=''.join(ch if ch.isalnum() else '_' for ch in (subject_name or 'question_bank')).strip('_') or 'question_bank'
     if fmt=='csv':
         out=io.StringIO(newline='');writer=csv.writer(out);writer.writerow(headers);writer.writerow(example);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{safe_name}_question_bank_template.csv')
     if fmt=='xlsx':
         wb=Workbook();ws=wb.active;ws.title='Question Bank';ws.append(headers);ws.append(example)
         for cell in ws[1]:cell.font=Font(bold=True)
-        for col,width in {'A':22,'B':28,'C':24,'D':10,'E':24,'F':58,'G':26,'H':26,'I':26,'J':26,'K':15,'L':10,'M':14,'N':16,'O':14,'P':26,'Q':12}.items():ws.column_dimensions[col].width=width
+        for idx,width in enumerate([22,28,24,10,24,18,58,26,26,26,26,15,20,16,18,10,14,16,14,14,14,26,18,46,12],1):ws.column_dimensions[chr(64+idx) if idx<=26 else 'A'].width=width
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{safe_name}_question_bank_template.xlsx')
     abort(404)
 
@@ -1657,14 +2210,16 @@ def edit_bank_question(question_id):
     if request.method=='POST':
         snapshot={c.name:getattr(q,c.name) for c in BankQuestion.__table__.columns if c.name not in {'id','updated_at'}}
         s.add(QuestionRevision(bank_question_id=q.id,version=q.version,snapshot_json=json.dumps(snapshot,ensure_ascii=False),changed_by=actor_label(s),changed_at=now_iso()))
-        subject_name=request.form.get('subject','').strip(); catalog_subject=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True)); q.subject=catalog_subject.name if catalog_subject else q.subject;q.course_semester=request.form.get('course_semester','').strip() or (catalog_subject.course_semester if catalog_subject else q.course_semester);q.unit=request.form.get('unit','').strip();q.topic=request.form.get('topic','').strip();q.question=request.form.get('question','').strip();q.option_a=request.form.get('option_a','').strip();q.option_b=request.form.get('option_b','').strip();q.option_c=request.form.get('option_c','').strip();q.option_d=request.form.get('option_d','').strip();q.correct_answer=request.form.get('correct_answer','A').upper()
+        qdef=question_definition_from_form(request.form)
+        if qdef['error']:flash(qdef['error'],'error');return redirect(url_for('edit_bank_question',question_id=q.id))
+        subject_name=request.form.get('subject','').strip();catalog_subject=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True));q.subject=catalog_subject.name if catalog_subject else q.subject;q.course_semester=request.form.get('course_semester','').strip() or (catalog_subject.course_semester if catalog_subject else q.course_semester);q.unit=request.form.get('unit','').strip();q.topic=request.form.get('topic','').strip();q.question=request.form.get('question','').strip();q.question_type=qdef['question_type'];q.option_a=qdef['options']['A'];q.option_b=qdef['options']['B'];q.option_c=qdef['options']['C'];q.option_d=qdef['options']['D'];q.correct_answer=qdef['legacy_correct_answer'];q.answer_key=qdef['answer_key'];q.answer_tolerance=qdef['answer_tolerance'];q.answer_case_sensitive=qdef['answer_case_sensitive']
         try:q.marks=max(1,int(request.form.get('marks','1')))
         except ValueError:q.marks=1
-        q.difficulty=canonical_difficulty(request.form.get('difficulty'));q.bloom_level=canonical_bloom(request.form.get('bloom_level'));q.co_mapping=request.form.get('co_mapping','').strip();q.tags=request.form.get('tags','').strip();q.version+=1;q.updated_at=now_iso()
+        q.difficulty=canonical_difficulty(request.form.get('difficulty'));q.bloom_level=canonical_bloom(request.form.get('bloom_level'));q.co_mapping=request.form.get('co_mapping','').strip();q.po_mapping=request.form.get('po_mapping','').strip();q.pso_mapping=request.form.get('pso_mapping','').strip();q.tags=request.form.get('tags','').strip();q.practice_visibility=normalize_practice_visibility(request.form.get('practice_visibility'));q.explanation=request.form.get('explanation','').strip();q.version+=1;q.updated_at=now_iso()
         if can_approve_content(s):q.status=request.form.get('status','draft') if request.form.get('status') in {'draft','approved'} else 'draft'
         else:q.status='draft'
         audit_event(s,'bank_question_edited','bank_question',q.id,f'version={q.version}, status={q.status}');s.commit();flash('Question updated. Previous version was preserved.');return redirect(url_for('edit_bank_question',question_id=q.id))
-    seed_subject_catalog(s); return render_template('question_bank_edit.html',question=q,revisions=revisions,subject_groups=subject_catalog_groups(s))
+    seed_subject_catalog(s); return render_template('question_bank_edit.html',question=q,question_type=canonical_question_type(q.question_type),revisions=revisions,subject_groups=subject_catalog_groups(s))
 
 @app.route('/admin/question-bank/<int:question_id>/approve',methods=['POST'])
 @approver_required
@@ -1684,10 +2239,29 @@ def bank_add_to_exam():
         except ValueError:pass
     s=DB();exam=s.get(Exam,exam_id)
     if not exam or not ids:flash('Select an exam and at least one bank question.','error');return redirect(url_for('question_bank'))
-    rows=s.scalars(select(BankQuestion).where(BankQuestion.id.in_(ids),BankQuestion.status=='approved')).all();added=0
+    rows=s.scalars(select(BankQuestion).where(BankQuestion.id.in_(ids),BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))).all();added=0
     for q in rows:
         if copy_bank_question_to_exam(s,q,exam_id):added+=1
     audit_event(s,'bank_questions_added_to_exam','exam',exam_id,f'added={added}');s.commit();flash(f'Added {added} approved question(s) to {exam.title}.');return redirect(url_for('questions',exam_id=exam_id))
+
+@app.route('/admin/question-bank/practice-visibility',methods=['POST'])
+@staff_required
+def set_question_practice_visibility():
+    visibility=normalize_practice_visibility(request.form.get('practice_visibility'))
+    ids=[]
+    for value in request.form.getlist('question_ids'):
+        try:ids.append(int(value))
+        except ValueError:pass
+    if not ids:
+        flash('Select at least one question to update its student-practice visibility.','error');return redirect(request.referrer or url_for('question_bank'))
+    s=DB();rows=s.scalars(select(BankQuestion).where(BankQuestion.id.in_(ids))).all();updated=0;draft_count=0
+    for row in rows:
+        row.practice_visibility=visibility;row.updated_at=now_iso();updated+=1
+        if row.status!='approved' and visibility in {'practice_only','both'}:draft_count+=1
+    audit_event(s,'practice_visibility_bulk_updated','bank_question','',f'visibility={visibility}, updated={updated}');s.commit()
+    message=f'Updated {updated} question(s) to {PRACTICE_VISIBILITY_LABELS[visibility]}.'
+    if draft_count:message+=f' {draft_count} draft question(s) remain hidden from students until approved.'
+    flash(message);return redirect(request.referrer or url_for('question_bank'))
 
 @app.route('/admin/exams',methods=['GET','POST'])
 @staff_required
@@ -1769,25 +2343,148 @@ def delete_exam_session(exam_id,session_id):
     if row and row.exam_id==exam_id:s.delete(row);audit_event(s,'exam_session_deleted','exam',exam_id,f'session={session_id}');s.commit();flash('Exam session removed.')
     return redirect(url_for('exam_builder',exam_id=exam_id))
 
+@app.route('/admin/exam/<int:exam_id>/edge-package')
+@staff_required
+def export_edge_exam_package(exam_id):
+    if len(EXAM_PACKAGE_SIGNING_KEY.encode('utf-8'))<32:abort(503,'Set EXAM_PACKAGE_SIGNING_KEY (32+ characters) before using Edge packages.')
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    payload=edge_exam_payload(s,exam)
+    if not payload['questions']:flash('Add questions before exporting an Edge package.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+    envelope=seal_envelope(payload,EXAM_PACKAGE_SIGNING_KEY);raw=json.dumps(envelope,ensure_ascii=False,separators=(',',':')).encode('utf-8');audit_event(s,'edge_exam_package_exported','exam',exam.id,f'package={envelope["package_id"]}');s.commit();data=io.BytesIO(raw)
+    return send_file(data,mimetype='application/octet-stream',as_attachment=True,download_name=f'{_edge_filename(exam.title)}_{envelope["package_id"]}.lwhexam')
+
+
+@app.route('/admin/exam/<int:exam_id>/edge-results-package')
+@staff_required
+def export_edge_results_package(exam_id):
+    if len(EXAM_PACKAGE_SIGNING_KEY.encode('utf-8'))<32:abort(503,'Set EXAM_PACKAGE_SIGNING_KEY (32+ characters) before using Edge packages.')
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    payload=edge_results_payload(s,exam);envelope=seal_envelope(payload,EXAM_PACKAGE_SIGNING_KEY);raw=json.dumps(envelope,ensure_ascii=False,separators=(',',':')).encode('utf-8');audit_event(s,'edge_results_package_exported','exam',exam.id,f'package={envelope["package_id"]}');s.commit();data=io.BytesIO(raw)
+    return send_file(data,mimetype='application/octet-stream',as_attachment=True,download_name=f'{_edge_filename(exam.title)}_results_{envelope["package_id"]}.lwhresults')
+
+
+@app.route('/admin/edge-package/import',methods=['POST'])
+@approver_required
+def import_edge_exam_package():
+    if len(EXAM_PACKAGE_SIGNING_KEY.encode('utf-8'))<32:abort(503,'Set EXAM_PACKAGE_SIGNING_KEY (32+ characters) before importing Edge packages.')
+    upload=request.files.get('edge_package')
+    if not upload or not upload.filename:flash('Choose an encrypted .lwhexam Edge package.','error');return redirect(url_for('exam_centre'))
+    s=DB()
+    try:
+        raw=upload.read()
+        if not raw or len(raw)>10*1024*1024:raise ValueError('The Edge package is empty or exceeds the 10 MB import limit.')
+        envelope=json.loads(raw.decode('utf-8'));payload=open_sealed_envelope(envelope,EXAM_PACKAGE_SIGNING_KEY);pid=str(envelope.get('package_id') or '')
+        if payload.get('kind')!='exam' or int(payload.get('schema_version') or 0)!=1:raise ValueError('This file is not a supported exam Edge package.')
+        existing=s.scalar(select(EdgePackageReceipt).where(EdgePackageReceipt.package_id==pid))
+        if existing:
+            flash(f'This Edge package was already imported as Exam #{existing.exam_id}.');return redirect(url_for('exam_builder',exam_id=existing.exam_id))
+        meta=payload.get('exam') or {};title=str(meta.get('title') or '').strip();duration=int(meta.get('duration_minutes') or 0);qrows=payload.get('questions') or []
+        if not title or duration<=0 or not isinstance(qrows,list) or not qrows:raise ValueError('The Edge package is missing required exam details or questions.')
+        exam=Exam(title=title,duration_minutes=max(1,duration),is_active=False,created_at=now_iso());s.add(exam);s.flush()
+        cfg_data=payload.get('config') or {};cfg=get_exam_config(s,exam.id,create=True);cfg.subject=str(cfg_data.get('subject') or '')[:200];cfg.course_semester=str(cfg_data.get('course_semester') or '')[:200];cfg.question_count=max(1,min(len(qrows),int(cfg_data.get('question_count') or len(qrows))));cfg.pool_size=max(cfg.question_count,min(len(qrows),int(cfg_data.get('pool_size') or len(qrows))))
+        easy=int(cfg_data.get('easy_pct') or 30);medium=int(cfg_data.get('medium_pct') or 50);hard=int(cfg_data.get('hard_pct') or 20)
+        if easy+medium+hard!=100:easy,medium,hard=30,50,20
+        cfg.easy_pct=max(0,easy);cfg.medium_pct=max(0,medium);cfg.hard_pct=max(0,hard);cfg.unit_weights=str(cfg_data.get('unit_weights') or '')[:2000];cfg.randomize_questions=bool(cfg_data.get('randomize_questions',True));cfg.shuffle_options=bool(cfg_data.get('shuffle_options',True));cfg.require_fullscreen=bool(cfg_data.get('require_fullscreen',False));cfg.tab_switch_limit=max(0,min(100,int(cfg_data.get('tab_switch_limit') or 3)));cfg.last_generation_summary=f'Imported from encrypted Edge package {pid}.';cfg.updated_at=now_iso()
+        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.heartbeat_seconds=max(10,min(60,int(security_data.get('heartbeat_seconds') or 15)));security.updated_at=now_iso()
+        for idx,item in enumerate(qrows,1):
+            if not isinstance(item,dict):raise ValueError(f'Question {idx} is malformed.')
+            qtype=canonical_question_type(item.get('question_type'));question_text=str(item.get('question') or '').strip();options={key:str(item.get(f'option_{key.lower()}') or '').strip() for key in 'ABCD'};answer_key=str(item.get('answer_key') or item.get('correct_answer') or '').strip() if qtype!='essay' else '';tolerance=str(item.get('answer_tolerance') or '').strip();error=validate_question_definition(qtype,question_text,options,answer_key,tolerance)
+            if error:raise ValueError(f'Question {idx}: {error}')
+            try:marks=max(1,int(item.get('marks') or 1))
+            except Exception:marks=1
+            legacy=str(item.get('correct_answer') or '').upper();legacy=legacy if legacy in {'A','B','C','D'} else (answer_key[:1].upper() if qtype=='single_choice' and answer_key[:1].upper() in {'A','B','C','D'} else 'A')
+            s.add(Question(exam_id=exam.id,question=question_text,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,question_type=qtype,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=bool(item.get('answer_case_sensitive',False)),marks=marks))
+        source=payload.get('source') or {};s.add(EdgePackageReceipt(package_id=pid,exam_id=exam.id,source_mode=str(source.get('mode') or '')[:20],source_exam_id=str(source.get('exam_id') or '')[:80],imported_by=actor_label(s),imported_at=now_iso()));audit_event(s,'edge_exam_package_imported','exam',exam.id,f'package={pid}, source={source.get("mode","")}:{source.get("exam_id","")}');s.commit();flash(f'Encrypted Edge package verified and imported as Draft Exam #{exam.id}. Assign the local batch/session, then approve and activate it.');return redirect(url_for('exam_builder',exam_id=exam.id))
+    except (ValueError,TypeError,json.JSONDecodeError,UnicodeDecodeError) as exc:
+        s.rollback();flash(f'Edge package rejected: {exc}','error');return redirect(url_for('exam_centre'))
+    except Exception:
+        s.rollback();flash('Edge package import failed safely. The database was not changed.','error');return redirect(url_for('exam_centre'))
+
+
+@app.route('/admin/edge-results/import',methods=['POST'])
+@approver_required
+def import_edge_results_package():
+    if len(EXAM_PACKAGE_SIGNING_KEY.encode('utf-8'))<32:abort(503,'Set EXAM_PACKAGE_SIGNING_KEY (32+ characters) before importing Edge result packages.')
+    upload=request.files.get('edge_results_package')
+    if not upload or not upload.filename:flash('Choose an encrypted .lwhresults package.','error');return redirect(url_for('exam_centre'))
+    s=DB()
+    try:
+        raw=upload.read()
+        if not raw or len(raw)>10*1024*1024:raise ValueError('The results package is empty or exceeds the 10 MB import limit.')
+        envelope=json.loads(raw.decode('utf-8'));payload=open_sealed_envelope(envelope,EXAM_PACKAGE_SIGNING_KEY);pid=str(envelope.get('package_id') or '')
+        if payload.get('kind')!='results' or int(payload.get('schema_version') or 0)!=1:raise ValueError('This file is not a supported Edge results package.')
+        existing=s.scalar(select(EdgeResultReceipt).where(EdgeResultReceipt.package_id==pid))
+        if existing:flash('This results package was already reconciled.');return redirect(url_for('edge_results_reconciliation',receipt_id=existing.id))
+        attempts=payload.get('attempts') or []
+        if not isinstance(attempts,list) or len(attempts)>50000:raise ValueError('The results package contains an invalid attempt collection.')
+        source=payload.get('source') or {};origin=payload.get('origin') or {};exam_meta=payload.get('exam') or {}
+        origin_exam_id=str(origin.get('exam_id') or '')[:80];target_exam=None
+        if origin_exam_id.isdigit():target_exam=s.get(Exam,int(origin_exam_id))
+        receipt=EdgeResultReceipt(package_id=pid,source_mode=str(source.get('mode') or '')[:20],source_exam_id=str(source.get('exam_id') or '')[:80],origin_exam_id=origin_exam_id,target_exam_id=target_exam.id if target_exam else None,exam_title=str(exam_meta.get('title') or '')[:250],attempts_count=len(attempts),submitted_count=sum(1 for a in attempts if isinstance(a,dict) and a.get('status')=='submitted'),imported_by=actor_label(s),imported_at=now_iso());s.add(receipt);s.flush()
+        seen=set()
+        for idx,item in enumerate(attempts,1):
+            if not isinstance(item,dict):raise ValueError(f'Attempt {idx} is malformed.')
+            roll=str(item.get('roll_no') or '').strip()
+            if not roll:raise ValueError(f'Attempt {idx} has no roll number.')
+            if roll in seen:raise ValueError(f'Duplicate roll number in package: {roll}.')
+            seen.add(roll)
+            score=item.get('score');total=item.get('total_marks')
+            try:score=None if score in {None,''} else int(score)
+            except Exception:raise ValueError(f'Attempt {idx} has an invalid score.')
+            try:total=None if total in {None,''} else int(total)
+            except Exception:raise ValueError(f'Attempt {idx} has invalid total marks.')
+            integrity=item.get('integrity') or []
+            if not isinstance(integrity,list):integrity=[]
+            s.add(EdgeResultAttempt(receipt_id=receipt.id,roll_no=roll[:100],name=str(item.get('name') or '')[:250],status=str(item.get('status') or '')[:30],grading_status=str(item.get('grading_status') or '')[:30],score=score,total_marks=total,integrity_count=len(integrity),payload_json=json.dumps(item,ensure_ascii=False,separators=(',',':'))))
+        audit_event(s,'edge_results_package_imported','edge_result_receipt',receipt.id,f'package={pid}, attempts={len(attempts)}, target_exam={target_exam.id if target_exam else "unmapped"}');s.commit();flash(f'Encrypted Edge results verified. {len(attempts)} candidate record(s) added to reconciliation without overwriting primary exam data.');return redirect(url_for('edge_results_reconciliation',receipt_id=receipt.id))
+    except (ValueError,TypeError,json.JSONDecodeError,UnicodeDecodeError) as exc:
+        s.rollback();flash(f'Edge results package rejected: {exc}','error');return redirect(url_for('exam_centre'))
+    except Exception:
+        s.rollback();flash('Edge results import failed safely. Primary exam data was not changed.','error');return redirect(url_for('exam_centre'))
+
+
+@app.route('/admin/edge-results')
+@staff_required
+def edge_results_reconciliation():
+    s=DB();receipts=s.scalars(select(EdgeResultReceipt).order_by(EdgeResultReceipt.id.desc()).limit(100)).all();selected=None;attempts=[]
+    rid=request.args.get('receipt_id','').strip()
+    if rid.isdigit():selected=s.get(EdgeResultReceipt,int(rid))
+    elif receipts:selected=receipts[0]
+    if selected:attempts=s.scalars(select(EdgeResultAttempt).where(EdgeResultAttempt.receipt_id==selected.id).order_by(EdgeResultAttempt.roll_no)).all()
+    return render_template('edge_results.html',receipts=receipts,selected=selected,attempts=attempts)
+
+
+@app.route('/admin/edge-results/<int:receipt_id>/csv')
+@staff_required
+def edge_results_reconciliation_csv(receipt_id):
+    s=DB();receipt=s.get(EdgeResultReceipt,receipt_id)
+    if not receipt:abort(404)
+    rows=s.scalars(select(EdgeResultAttempt).where(EdgeResultAttempt.receipt_id==receipt.id).order_by(EdgeResultAttempt.roll_no)).all();out=io.StringIO(newline='');writer=csv.writer(out);writer.writerow(['roll_no','name','status','grading_status','score','total_marks','integrity_events']);
+    for row in rows:writer.writerow([row.roll_no,row.name,row.status,row.grading_status,row.score if row.score is not None else '',row.total_marks if row.total_marks is not None else '',row.integrity_count])
+    data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'edge_reconciliation_{receipt.package_id}.csv')
+
+
 @app.route('/admin/exam/<int:exam_id>/builder',methods=['GET','POST'])
 @staff_required
 def exam_builder(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
-    cfg=get_exam_config(s,exam_id,create=True)
+    cfg=get_exam_config(s,exam_id,create=True);security=get_exam_security_policy(s,exam_id,create=True)
     if request.method=='POST':
         action=request.form.get('action','save')
         try:
             qcount=max(1,int(request.form.get('question_count','20')));pool_size=max(qcount,int(request.form.get('pool_size',str(qcount))))
-            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')))
+            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(10,min(60,int(request.form.get('heartbeat_seconds','15') or 15)))
         except ValueError:flash('Blueprint numeric values are invalid.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         if easy+medium+hard!=100:flash('Difficulty distribution must total 100%.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         try:unit_weights=parse_unit_weights(request.form.get('unit_weights',''))
         except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
-        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();s.flush()
+        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.updated_at=now_iso();s.flush()
         if action=='generate':
             if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)>0:flash('This exam already has attempts. The question pool is locked to protect result integrity.','error');s.rollback();return redirect(url_for('exam_builder',exam_id=exam_id))
-            stmt=select(BankQuestion).where(BankQuestion.status=='approved')
+            stmt=select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
             if cfg.subject:stmt=stmt.where(BankQuestion.subject==cfg.subject)
             if cfg.course_semester:stmt=stmt.where(BankQuestion.course_semester==cfg.course_semester)
             candidates=s.scalars(stmt).all()
@@ -1807,10 +2504,27 @@ def exam_builder(exam_id):
             if added<pool_size:summary+=' Bank does not yet contain enough approved questions for the requested blueprint.'
             cfg.last_generation_summary=summary;audit_event(s,'exam_pool_generated','exam',exam_id,summary);s.commit();flash(summary);return redirect(url_for('exam_builder',exam_id=exam_id))
         audit_event(s,'exam_blueprint_saved','exam',exam_id,f'questions={qcount}, pool={pool_size}');s.commit();flash('Exam blueprint and integrity settings saved.');return redirect(url_for('exam_builder',exam_id=exam_id))
-    subjects=s.scalars(select(BankQuestion.subject).where(BankQuestion.status=='approved').distinct().order_by(BankQuestion.subject)).all();pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0;attempt_count=s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0
+    subjects=s.scalars(select(BankQuestion.subject).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both'])).distinct().order_by(BankQuestion.subject)).all();pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0;attempt_count=s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0
     try:unit_weights_display=', '.join(f'{k}:{v}' for k,v in json.loads(cfg.unit_weights or '{}').items())
     except Exception:unit_weights_display=''
-    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);approval_policy=exam_approval_policy(s,exam);return render_template('exam_builder.html',exam=exam,cfg=cfg,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,approval_policy=approval_policy,group_label=group_label,can_approve=can_approve_exams(s))
+    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);approval_policy=exam_approval_policy(s,exam);practice_release=get_exam_practice_release(s,exam_id,create=True);s.commit();return render_template('exam_builder.html',exam=exam,cfg=cfg,security=security,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,approval_policy=approval_policy,practice_release=practice_release,group_label=group_label,can_approve=can_approve_exams(s))
+
+@app.route('/admin/exam/<int:exam_id>/practice-release',methods=['POST'])
+@staff_required
+def update_exam_practice_release(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    role=current_staff_role(s);owner=exam_owner_actor(s,exam_id)
+    if role=='faculty' and owner!=actor_label(s):abort(403)
+    row=get_exam_practice_release(s,exam_id,create=True)
+    wants_release=request.form.get('is_released')=='on';release_after=(request.form.get('release_after') or '').strip()
+    if wants_release and exam.is_active and not release_after:
+        flash('An active official exam cannot be released immediately as a practice paper. Set a future release time or deactivate the exam first.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+    if release_after:
+        try:parse_dt(release_after)
+        except Exception:flash('The practice-paper release date/time is invalid.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+    row.is_released=wants_release;row.release_after=release_after;row.show_solutions=request.form.get('show_solutions')=='on';row.allow_mock=request.form.get('allow_mock')=='on';row.updated_by=actor_label(s);row.updated_at=now_iso()
+    audit_event(s,'exam_practice_release_updated','exam',exam.id,f'released={row.is_released}, release_after={row.release_after}, solutions={row.show_solutions}, mock={row.allow_mock}');s.commit();flash('Previous-paper practice settings updated.');return redirect(url_for('exam_builder',exam_id=exam_id))
 
 @app.route('/admin/exam/<int:exam_id>/questions',methods=['GET','POST'])
 @staff_required
@@ -1818,11 +2532,11 @@ def questions(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
     if request.method=='POST':
+        qdef=question_definition_from_form(request.form)
+        if qdef['error']:flash(qdef['error'],'error');return redirect(url_for('questions',exam_id=exam_id))
         try:marks=max(1,int(request.form.get('marks','1')))
         except ValueError:marks=1
-        ans=request.form.get('correct_answer','A').upper()
-        if ans not in {'A','B','C','D'}:ans='A'
-        q=Question(exam_id=exam_id,question=request.form.get('question','').strip(),option_a=request.form.get('option_a','').strip(),option_b=request.form.get('option_b','').strip(),option_c=request.form.get('option_c','').strip(),option_d=request.form.get('option_d','').strip(),correct_answer=ans,marks=marks);s.add(q);s.flush();audit_event(s,'exam_question_added','exam',exam_id,f'question_id={q.id}');s.commit();flash('Question added.')
+        opts=qdef['options'];q=Question(exam_id=exam_id,question=request.form.get('question','').strip(),option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],question_type=qdef['question_type'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks);s.add(q);s.flush();audit_event(s,'exam_question_added','exam',exam_id,f'question_id={q.id}, type={qdef["question_type"]}');s.commit();flash('Question added.')
     qs=s.scalars(select(Question).where(Question.exam_id==exam_id).order_by(Question.id)).all();mapped=set(s.scalars(select(ExamBankMap.exam_question_id).where(ExamBankMap.exam_id==exam_id)).all());return render_template('questions.html',exam=exam,questions=qs,mapped=mapped)
 
 @app.route('/admin/exam/<int:exam_id>/import',methods=['POST'])
@@ -1841,7 +2555,7 @@ def import_questions(exam_id):
         try:marks=max(1,int(r.get('marks') or 1))
         except ValueError:marks=1
         if not (r.get('question') or '').strip():continue
-        s.add(Question(exam_id=exam_id,question=r['question'].strip(),option_a=(r.get('option_a') or '').strip(),option_b=(r.get('option_b') or '').strip(),option_c=(r.get('option_c') or '').strip(),option_d=(r.get('option_d') or '').strip(),correct_answer=ans,marks=marks));count+=1
+        s.add(Question(exam_id=exam_id,question=r['question'].strip(),option_a=(r.get('option_a') or '').strip(),option_b=(r.get('option_b') or '').strip(),option_c=(r.get('option_c') or '').strip(),option_d=(r.get('option_d') or '').strip(),correct_answer=ans,question_type='single_choice',answer_key=ans,answer_tolerance='',answer_case_sensitive=False,marks=marks));count+=1
     audit_event(s,'exam_questions_csv_import','exam',exam_id,f'count={count}');s.commit();flash(f'Imported {count} questions.');return redirect(url_for('questions',exam_id=exam_id))
 
 def result_rows(s,exam_id=None):
@@ -1860,6 +2574,8 @@ def result_rows(s,exam_id=None):
         tab_switches=sum(1 for ev in events if ev.event_type=='tab_hidden')
         fullscreen_exits=sum(1 for ev in events if ev.event_type=='fullscreen_exit')
         pct,grade,_grade_class=result_performance(a.score,a.total_marks) if a.status=='submitted' else (0,'-','')
+        grading_status=getattr(a,'grading_status','complete') or 'complete'
+        if a.status=='submitted' and grading_status=='pending':grade='Pending grading'
         grp=student_group(s,st.id)
         rows.append(type('ResultRow',(),{
             'attempt_id':a.id,
@@ -1869,6 +2585,7 @@ def result_rows(s,exam_id=None):
             'title':e.title,
             'exam_id':e.id,
             'status':a.status,
+            'grading_status':grading_status,
             'score':a.score,
             'total_marks':a.total_marks,
             'percentage':pct,
@@ -1887,11 +2604,37 @@ def result_rows(s,exam_id=None):
 def results():
     s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);exams_list=s.scalars(select(Exam).order_by(Exam.title)).all();return render_template('results.html',rows=rows,exams=exams_list,selected_exam_id=exam_id)
 
+@app.route('/admin/attempt/<int:attempt_id>/grade',methods=['GET','POST'])
+@staff_required
+def manual_grade_attempt(attempt_id):
+    s=DB();attempt=s.get(Attempt,attempt_id)
+    if not attempt or attempt.status!='submitted':abort(404)
+    student=s.get(Student,attempt.student_id);exam=s.get(Exam,attempt.exam_id);qids=attempt_question_ids(s,attempt)
+    questions=s.scalars(select(Question).where(Question.id.in_(qids))).all() if qids else [];qmap={q.id:q for q in questions};essay_questions=[qmap[qid] for qid in qids if qid in qmap and canonical_question_type(qmap[qid].question_type)=='essay']
+    answers=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();amap={a.question_id:a for a in answers}
+    if not essay_questions:flash('This attempt has no descriptive questions.');return redirect(url_for('results',exam_id=attempt.exam_id))
+    if request.method=='POST':
+        errors=[]
+        for q in essay_questions:
+            ans=amap.get(q.id);value=answer_record_value(ans) if ans else ''
+            if not ans or not value:continue
+            raw=(request.form.get(f'score_{q.id}') or '').strip();comment=(request.form.get(f'comment_{q.id}') or '').strip()[:1500]
+            if raw=='':ans.manual_score=None;ans.grader_comment=comment;ans.graded_by='';ans.graded_at='';continue
+            try:score=int(raw)
+            except ValueError:errors.append(f'Q{q.id}: marks must be a whole number.');continue
+            if score<0 or score>q.marks:errors.append(f'Q{q.id}: marks must be between 0 and {q.marks}.');continue
+            ans.manual_score=score;ans.grader_comment=comment;ans.graded_by=actor_label(s);ans.graded_at=now_iso()
+        if errors:
+            s.rollback();flash(' '.join(errors),'error');return redirect(url_for('manual_grade_attempt',attempt_id=attempt.id))
+        recalculate_attempt_score(s,attempt,questions,answers);audit_event(s,'attempt_manual_graded','attempt',attempt.id,f'status={attempt.grading_status}, score={attempt.score}/{attempt.total_marks}');s.commit();flash('Manual grading saved.');return redirect(url_for('manual_grade_attempt',attempt_id=attempt.id))
+    return render_template('manual_grade.html',attempt=attempt,student=student,exam=exam,questions=essay_questions,answers=amap)
+
+
 @app.route('/admin/results/export/<fmt>')
 @staff_required
 def export_results(fmt):
-    s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);headers=['roll_no','name','batch_section','exam','status','score','total_marks','percentage','grade','tab_switches','fullscreen_exits','total_integrity_events','started','submitted']
-    matrix=[[r.roll_no,r.name,r.group_label,r.title,r.status,r.score if r.score is not None else '',r.total_marks if r.total_marks is not None else '',r.percentage if r.status=='submitted' else '',r.grade if r.status=='submitted' else '',r.tab_switches,r.fullscreen_exits,r.violations,r.started_at,r.submitted_at or ''] for r in rows]
+    s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);headers=['roll_no','name','batch_section','exam','status','grading_status','score','total_marks','percentage','grade','tab_switches','fullscreen_exits','total_integrity_events','started','submitted']
+    matrix=[[r.roll_no,r.name,r.group_label,r.title,r.status,r.grading_status,r.score if r.score is not None else '',r.total_marks if r.total_marks is not None else '',r.percentage if r.status=='submitted' else '',r.grade if r.status=='submitted' else '',r.tab_switches,r.fullscreen_exits,r.violations,r.started_at,r.submitted_at or ''] for r in rows]
     suffix=f'_exam_{exam_id}' if exam_id else '_all'
     if fmt=='csv':
         out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'exam_results{suffix}.csv')
@@ -1899,7 +2642,7 @@ def export_results(fmt):
         wb=Workbook();ws=wb.active;ws.title='Results';ws.append(headers)
         for row in matrix:ws.append(row)
         for cell in ws[1]:cell.font=Font(bold=True)
-        widths=[16,28,34,30,14,10,12,12,16,14,16,20,24,24]
+        widths=[16,28,34,30,14,18,10,12,12,16,14,16,20,24,24]
         for idx,width in enumerate(widths,1):ws.column_dimensions[chr(64+idx)].width=width
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'exam_results{suffix}.xlsx')
     abort(404)
@@ -1911,8 +2654,12 @@ def _score_summary(percentages):
     return {'count':n,'average':round(sum(vals)/n,1),'highest':round(max(vals),1),'lowest':round(min(vals),1),'pass_pct':round(sum(1 for x in vals if x>=40)*100/n,1),'outstanding':sum(1 for x in vals if x>=90),'very_good':sum(1 for x in vals if 75<=x<90),'good':sum(1 for x in vals if 60<=x<75),'average_grade':sum(1 for x in vals if 40<=x<60),'poor':sum(1 for x in vals if x<40)}
 
 
+def outcome_mapping_tokens(value):
+    return [x.strip().upper() for x in str(value or '').replace(';',',').split(',') if x.strip()]
+
+
 def institutional_analytics_data(s):
-    raw=s.execute(select(Attempt,Student,Exam).join(Student,Student.id==Attempt.student_id).join(Exam,Exam.id==Attempt.exam_id).where(Attempt.status=='submitted')).all()
+    raw=s.execute(select(Attempt,Student,Exam).join(Student,Student.id==Attempt.student_id).join(Exam,Exam.id==Attempt.exam_id).where(Attempt.status=='submitted',Attempt.grading_status=='complete')).all()
     percentages=[];exam_pcts={};student_pcts={}
     for a,st,e in raw:
         pct=((a.score or 0)/(a.total_marks or 1))*100;percentages.append(pct);exam_pcts.setdefault(e.id,[]).append(pct);student_pcts.setdefault(st.id,[]).append(pct)
@@ -1931,33 +2678,48 @@ def institutional_analytics_data(s):
         for sid in student_ids:vals.extend(student_pcts.get(sid,[]))
         summary=_score_summary(vals);group_rows.append({'label':group_label(g),'students':len(student_ids),'attempts':summary['count'],'average':summary['average'],'pass_pct':summary['pass_pct']})
     # Academic attainment from reusable bank metadata.
-    maps=s.scalars(select(ExamBankMap)).all();bank_by_exam_q={m.exam_question_id:m.bank_question_id for m in maps};bank_ids=set(bank_by_exam_q.values());banks={b.id:b for b in (s.scalars(select(BankQuestion).where(BankQuestion.id.in_(bank_ids))).all() if bank_ids else [])};questions={q.id:q for q in (s.scalars(select(Question).where(Question.id.in_(list(bank_by_exam_q)))).all() if bank_by_exam_q else [])};submitted_ids={a.id for a,_,_ in raw};unit_stats={};co_stats={}
+    maps=s.scalars(select(ExamBankMap)).all();bank_by_exam_q={m.exam_question_id:m.bank_question_id for m in maps};bank_ids=set(bank_by_exam_q.values());banks={b.id:b for b in (s.scalars(select(BankQuestion).where(BankQuestion.id.in_(bank_ids))).all() if bank_ids else [])};questions={q.id:q for q in (s.scalars(select(Question).where(Question.id.in_(list(bank_by_exam_q)))).all() if bank_by_exam_q else [])};submitted_ids={a.id for a,_,_ in raw};unit_stats={};co_stats={};po_stats={};pso_stats={}
     if submitted_ids and bank_by_exam_q:
         answers=s.scalars(select(Answer).where(Answer.attempt_id.in_(submitted_ids),Answer.question_id.in_(list(bank_by_exam_q)))).all()
         for ans in answers:
             bank=banks.get(bank_by_exam_q.get(ans.question_id));q=questions.get(ans.question_id)
             if not bank or not q:continue
-            ok=1 if ans.selected_answer==q.correct_answer else 0
+            if canonical_question_type(q.question_type)=='essay':
+                if ans.manual_score is None:continue
+                ok=(max(0,min(ans.manual_score,q.marks))/q.marks) if q.marks else 0
+            else:ok=1 if is_answer_correct(q,answer_record_value(ans)) else 0
             if bank.unit:
                 key=f'{bank.subject} · Unit {bank.unit}';st=unit_stats.setdefault(key,[0,0]);st[0]+=1;st[1]+=ok
             if bank.co_mapping:
                 key=f'{bank.subject} · {bank.co_mapping}';st=co_stats.setdefault(key,[0,0]);st[0]+=1;st[1]+=ok
+            for token in outcome_mapping_tokens(getattr(bank,'po_mapping','')):
+                key=f'{bank.subject} · {token}';st=po_stats.setdefault(key,[0,0]);st[0]+=1;st[1]+=ok
+            for token in outcome_mapping_tokens(getattr(bank,'pso_mapping','')):
+                key=f'{bank.subject} · {token}';st=pso_stats.setdefault(key,[0,0]);st[0]+=1;st[1]+=ok
     unit_rows=[{'label':k,'responses':v[0],'attainment':round(v[1]*100/v[0],1) if v[0] else 0} for k,v in sorted(unit_stats.items())]
     co_rows=[{'label':k,'responses':v[0],'attainment':round(v[1]*100/v[0],1) if v[0] else 0} for k,v in sorted(co_stats.items())]
-    return overall,exam_rows,group_rows,unit_rows,co_rows
+    po_rows=[{'label':k,'responses':v[0],'attainment':round(v[1]*100/v[0],1) if v[0] else 0} for k,v in sorted(po_stats.items())]
+    pso_rows=[{'label':k,'responses':v[0],'attainment':round(v[1]*100/v[0],1) if v[0] else 0} for k,v in sorted(pso_stats.items())]
+    return overall,exam_rows,group_rows,unit_rows,co_rows,po_rows,pso_rows
 
 @app.route('/admin/analytics')
 @staff_required
 def analytics():
     s=DB();bank=s.scalars(select(BankQuestion).order_by(BankQuestion.subject,BankQuestion.unit,BankQuestion.id)).all();maps=s.scalars(select(ExamBankMap)).all();bank_by_exam_q={m.exam_question_id:m.bank_question_id for m in maps};exam_q_ids=list(bank_by_exam_q)
-    qcorrect={q.id:q.correct_answer for q in (s.scalars(select(Question).where(Question.id.in_(exam_q_ids))).all() if exam_q_ids else [])};attempts=s.scalars(select(Attempt).where(Attempt.status=='submitted')).all();attempt_pct={a.id:((a.score or 0)/(a.total_marks or 1)) for a in attempts};submitted_ids=set(attempt_pct)
+    qmap={q.id:q for q in (s.scalars(select(Question).where(Question.id.in_(exam_q_ids))).all() if exam_q_ids else [])};attempts=s.scalars(select(Attempt).where(Attempt.status=='submitted',Attempt.grading_status=='complete')).all();attempt_pct={a.id:((a.score or 0)/(a.total_marks or 1)) for a in attempts};submitted_ids=set(attempt_pct)
     stats={q.id:{'responses':0,'correct':0,'samples':[]} for q in bank}
     if exam_q_ids and submitted_ids:
         answers=s.scalars(select(Answer).where(Answer.question_id.in_(exam_q_ids),Answer.attempt_id.in_(submitted_ids))).all()
         for a in answers:
             bid=bank_by_exam_q.get(a.question_id)
             if bid not in stats:continue
-            ok=a.selected_answer==qcorrect.get(a.question_id);stats[bid]['responses']+=1;stats[bid]['correct']+=1 if ok else 0;stats[bid]['samples'].append((attempt_pct.get(a.attempt_id,0),1 if ok else 0))
+            question=qmap.get(a.question_id)
+            if not question:continue
+            if canonical_question_type(question.question_type)=='essay':
+                if a.manual_score is None:continue
+                ok=(max(0,min(a.manual_score,question.marks))/question.marks) if question.marks else 0
+            else:ok=1 if is_answer_correct(question,answer_record_value(a)) else 0
+            stats[bid]['responses']+=1;stats[bid]['correct']+=ok;stats[bid]['samples'].append((attempt_pct.get(a.attempt_id,0),ok))
     usage=dict(s.execute(select(ExamBankMap.bank_question_id,func.count(func.distinct(ExamBankMap.exam_id))).group_by(ExamBankMap.bank_question_id)).all());rows=[]
     for q in bank:
         st=stats[q.id];rate=(st['correct']/st['responses']) if st['responses'] else None;disc=None
@@ -1966,7 +2728,7 @@ def analytics():
             n=max(1,round(len(samples)*0.27));bottom=samples[:n];top=samples[-n:];disc=(sum(x[1] for x in top)/n)-(sum(x[1] for x in bottom)/n)
         observed='-' if rate is None else ('Easy' if rate>=0.75 else 'Medium' if rate>=0.4 else 'Hard')
         rows.append(type('AnalyticsRow',(),{'id':q.id,'subject':q.subject,'unit':q.unit,'topic':q.topic,'question':q.question,'declared_difficulty':q.difficulty,'times_used':usage.get(q.id,0),'responses':st['responses'],'correct_rate':rate,'observed_difficulty':observed,'discrimination':disc})())
-    overall,exam_rows,group_rows,unit_rows,co_rows=institutional_analytics_data(s);return render_template('analytics.html',rows=rows,overall=overall,exam_rows=exam_rows,group_rows=group_rows,unit_rows=unit_rows,co_rows=co_rows)
+    overall,exam_rows,group_rows,unit_rows,co_rows,po_rows,pso_rows=institutional_analytics_data(s);return render_template('analytics.html',rows=rows,overall=overall,exam_rows=exam_rows,group_rows=group_rows,unit_rows=unit_rows,co_rows=co_rows,po_rows=po_rows,pso_rows=pso_rows)
 
 
 @app.route('/admin/institution',methods=['GET','POST'])
@@ -1992,12 +2754,56 @@ def exam_centre_network_details():
     return {'mode':APP_MODE,'lan_ip':lan_ip,'port':port,'student_url':student_url,'qr_uri':qr_data_uri(student_url)}
 
 
+def exam_centre_live_payload(s):
+    raw=s.execute(select(Attempt,Student,Exam).join(Student,Student.id==Attempt.student_id).join(Exam,Exam.id==Attempt.exam_id).where(Attempt.status=='in_progress').order_by(Attempt.id.desc()).limit(300)).all()
+    attempt_ids=[a.id for a,_,_ in raw]
+    heartbeats={h.attempt_id:h for h in (s.scalars(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id.in_(attempt_ids))).all() if attempt_ids else [])}
+    events=dict(s.execute(select(IntegrityEvent.attempt_id,func.count()).where(IntegrityEvent.attempt_id.in_(attempt_ids)).group_by(IntegrityEvent.attempt_id)).all()) if attempt_ids else {}
+    answers=dict(s.execute(select(Answer.attempt_id,func.count()).where(Answer.attempt_id.in_(attempt_ids)).group_by(Answer.attempt_id)).all()) if attempt_ids else {}
+    rows=[]
+    now=now_dt()
+    for attempt,student,exam in raw:
+        hb=heartbeats.get(attempt.id);state=heartbeat_status(hb.last_seen_at if hb else '')
+        try:remaining=max(0,int((parse_dt(attempt.end_at)-now).total_seconds()))
+        except Exception:remaining=0
+        rows.append({'attempt_id':attempt.id,'roll_no':student.roll_no,'name':student.name,'exam_id':exam.id,'exam':exam.title,'connection':state,'last_seen':hb.last_seen_at if hb else '','answers':int(answers.get(attempt.id,0)),'integrity':int(events.get(attempt.id,0)),'remaining_seconds':remaining})
+    counts={'online':sum(1 for x in rows if x['connection']=='online'),'stale':sum(1 for x in rows if x['connection']=='stale'),'offline':sum(1 for x in rows if x['connection'] in {'offline','unknown'})}
+    return {'generated_at':now_iso(),'rows':rows,'counts':counts}
+
+
 @app.route('/admin/exam-centre')
 @staff_required
 def exam_centre():
-    s=DB();network=exam_centre_network_details()
-    stats={'students':s.scalar(select(func.count()).select_from(Student)) or 0,'active_exams':s.scalar(select(func.count()).select_from(Exam).where(Exam.is_active==True)) or 0,'in_progress':s.scalar(select(func.count()).select_from(Attempt).where(Attempt.status=='in_progress')) or 0}
-    return render_template('exam_centre.html',mode=network['mode'],db_name='PostgreSQL' if DATABASE_URL.startswith('postgresql') else 'SQLite',student_url=network['student_url'],qr_uri=network['qr_uri'],lan_ip=network['lan_ip'],port=network['port'],stats=stats)
+    s=DB();network=exam_centre_network_details();active_exams=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.title)).all();live=exam_centre_live_payload(s)
+    stats={'students':s.scalar(select(func.count()).select_from(Student)) or 0,'active_exams':len(active_exams),'in_progress':len(live['rows']),'online_now':live['counts']['online']}
+    return render_template('exam_centre.html',mode=network['mode'],db_name='PostgreSQL' if DATABASE_URL.startswith('postgresql') else 'SQLite',student_url=network['student_url'],qr_uri=network['qr_uri'],lan_ip=network['lan_ip'],port=network['port'],stats=stats,active_exams=active_exams,live=live)
+
+
+@app.route('/admin/exam-centre/live-data')
+@staff_required
+def exam_centre_live_data():
+    response=jsonify(exam_centre_live_payload(DB()));response.headers['Cache-Control']='no-store';return response
+
+
+@app.route('/admin/exam-centre/check-in',methods=['POST'])
+@staff_required
+def exam_centre_check_in():
+    s=DB();exam_id=request.form.get('exam_id',type=int);roll_no=(request.form.get('roll_no') or '').strip();exam=s.get(Exam,exam_id) if exam_id else None;student=s.scalar(select(Student).where(Student.roll_no==roll_no)) if roll_no else None
+    if not exam or not student:flash('Choose a valid exam and student roll number.','error');return redirect(url_for('exam_centre'))
+    row=s.scalar(select(ExamCandidateCheckin).where(ExamCandidateCheckin.exam_id==exam.id,ExamCandidateCheckin.student_id==student.id))
+    if not row:row=ExamCandidateCheckin(exam_id=exam.id,student_id=student.id,status='verified',verified_by=actor_label(s),verified_at=now_iso(),notes=(request.form.get('notes') or '').strip()[:250]);s.add(row)
+    else:row.status='verified';row.verified_by=actor_label(s);row.verified_at=now_iso();row.notes=(request.form.get('notes') or '').strip()[:250]
+    audit_event(s,'candidate_identity_verified','student',student.id,f'exam={exam.id}, roll={student.roll_no}');s.commit();flash(f'{student.roll_no} verified for {exam.title}.');return redirect(url_for('exam_centre'))
+
+
+@app.route('/admin/exam-centre/check-in/revoke',methods=['POST'])
+@staff_required
+def exam_centre_revoke_checkin():
+    s=DB();exam_id=request.form.get('exam_id',type=int);roll_no=(request.form.get('roll_no') or '').strip();student=s.scalar(select(Student).where(Student.roll_no==roll_no)) if roll_no else None
+    row=s.scalar(select(ExamCandidateCheckin).where(ExamCandidateCheckin.exam_id==exam_id,ExamCandidateCheckin.student_id==student.id)) if exam_id and student else None
+    if row:row.status='revoked';audit_event(s,'candidate_identity_revoked','student',student.id,f'exam={exam_id}');s.commit();flash(f'Check-in revoked for {student.roll_no}.')
+    else:flash('No verified check-in was found.','error')
+    return redirect(url_for('exam_centre'))
 
 
 @app.route('/admin/exam-centre/network-info')
@@ -2064,6 +2870,18 @@ def reset_faculty_password(faculty_id):
     flash(f'Password updated for {target.username}.')
     return redirect(url_for('faculty_users'))
 
+@app.route('/admin/faculty/<int:faculty_id>/mfa-reset',methods=['POST'])
+@staff_required
+def reset_faculty_mfa(faculty_id):
+    s=DB();actor_role=current_staff_role(s)
+    if actor_role not in {'super_admin','hod'}:abort(403)
+    target=s.get(Faculty,faculty_id)
+    if not target:abort(404)
+    role_row=s.scalar(select(FacultyRole).where(FacultyRole.faculty_id==faculty_id));target_role=role_row.role if role_row and role_row.role in ROLE_LABELS else 'faculty'
+    if actor_role=='hod' and target_role!='faculty':abort(403)
+    target.mfa_enabled=False;target.mfa_secret='';audit_event(s,'staff_mfa_admin_reset','faculty',target.id,f'target={target.username}, role={target_role}');s.commit();flash(f'MFA reset for {target.username}. They can sign in with their password and enroll again.');return redirect(url_for('faculty_users'))
+
+
 @app.route('/admin/faculty/<int:faculty_id>/toggle',methods=['POST'])
 @admin_required
 def toggle_faculty(faculty_id):
@@ -2087,7 +2905,7 @@ def update_faculty_role(faculty_id):
 @app.route('/admin/audit')
 @admin_required
 def audit_logs():
-    s=DB();rows=s.scalars(select(AuditLog).order_by(AuditLog.id.desc()).limit(300)).all();return render_template('audit.html',rows=rows)
+    s=DB();rows=s.scalars(select(AuditLog).order_by(AuditLog.id.desc()).limit(300)).all();chain_status=audit_chain_status(s);return render_template('audit.html',rows=rows,chain_status=chain_status)
 
 @app.route('/admin/system')
 @admin_required
@@ -2152,6 +2970,287 @@ def system_restore():
         except OSError:pass
     return redirect(url_for('system_tools'))
 
+# ------------------------- Student Practice & Learning Centre -------------------------
+def _practice_ref_key(ref):
+    return f"{ref.get('source','bank')}:{int(ref.get('id') or 0)}"
+
+
+def _practice_ref_field(ref):
+    return f"q_{ref.get('source','bank')}_{int(ref.get('id') or 0)}"
+
+
+def _practice_question_view(s,ref):
+    source=str(ref.get('source') or 'bank')
+    source_id=int(ref.get('id') or 0)
+    bank=None
+    if source=='bank':
+        question=s.get(BankQuestion,source_id);bank=question
+    elif source=='exam':
+        question=s.get(Question,source_id)
+        map_row=s.scalar(select(ExamBankMap).where(ExamBankMap.exam_question_id==source_id))
+        bank=s.get(BankQuestion,map_row.bank_question_id) if map_row else None
+    else:
+        question=None
+    if not question:return None
+    qtype=canonical_question_type(question.question_type)
+    order=str(ref.get('option_order') or 'ABCD')
+    if len(order)!=4 or set(order)!=set('ABCD'):order='ABCD'
+    text_map={'A':question.option_a,'B':question.option_b,'C':question.option_c,'D':question.option_d}
+    options=[]
+    if qtype in {'single_choice','multiple_select'}:
+        options=[{'label':chr(65+i),'key':key,'text':text_map.get(key,'')} for i,key in enumerate(order)]
+    subject=(bank.subject if bank else '')
+    unit=(bank.unit if bank else '')
+    topic=(bank.topic if bank else '')
+    return {
+        'source':source,'source_id':source_id,'ref_key':_practice_ref_key(ref),'field_name':_practice_ref_field(ref),
+        'bank_id':bank.id if bank else None,'question':question.question,'question_type':qtype,
+        'question_type_label':QUESTION_TYPE_LABELS.get(qtype,qtype.replace('_',' ').title()),'display_options':options,
+        'marks':int(question.marks or 1),'subject':subject,'unit':unit,'topic':topic,
+        'difficulty':bank.difficulty if bank else '','co_mapping':bank.co_mapping if bank else '',
+        'explanation':(bank.explanation or '').strip() if bank else '',
+        'question_obj':question,'option_order':order,
+    }
+
+
+def _practice_answer_display(view,value):
+    value=(value or '').strip();qtype=view['question_type']
+    if not value:return 'Not answered'
+    if qtype in {'single_choice','multiple_select'}:
+        selected={part.strip().upper() for part in value.split(',') if part.strip()}
+        return '; '.join(f"{opt['label']}. {opt['text']}" for opt in view['display_options'] if opt['key'] in selected) or value
+    if qtype=='true_false':return value.title()
+    return value
+
+
+def _practice_correct_display(view):
+    q=view['question_obj'];qtype=view['question_type'];value=normalized_key(q)
+    if qtype=='essay':return 'Self-review question (not automatically graded)'
+    return _practice_answer_display(view,value)
+
+
+def _practice_bank_refs(rows):
+    refs=[]
+    for row in rows:
+        keys=list('ABCD')
+        if canonical_question_type(row.question_type) in {'single_choice','multiple_select'}:random.shuffle(keys)
+        refs.append({'source':'bank','id':row.id,'bank_id':row.id,'option_order':''.join(keys)})
+    return refs
+
+
+def _create_practice_attempt(s,student_id,refs,mode,subject='',unit_filter='',difficulty_filter='',exam_id=None,duration_minutes=0):
+    started=now_dt();duration=max(0,int(duration_minutes or 0));ends=(started+timedelta(minutes=duration)).isoformat(timespec='seconds') if duration else ''
+    attempt=PracticeAttempt(student_id=student_id,mode=mode,subject=subject or 'Mixed Practice',unit_filter=unit_filter or '',difficulty_filter=difficulty_filter or '',exam_id=exam_id,duration_minutes=duration,started_at=started.isoformat(timespec='seconds'),ends_at=ends,submitted_at='',status='in_progress',score=0,total_marks=0,question_refs_json=json.dumps(refs,separators=(',',':')),answers_json='[]',incorrect_bank_ids_json='[]')
+    s.add(attempt);s.flush();return attempt
+
+
+def _practice_wrong_bank_ids(s,student_id):
+    ids=set()
+    rows=s.scalars(select(PracticeAttempt).where(PracticeAttempt.student_id==student_id,PracticeAttempt.status=='submitted')).all()
+    for row in rows:
+        for value in safe_json_load(row.incorrect_bank_ids_json,[]):
+            try:ids.add(int(value))
+            except Exception:pass
+    return ids
+
+
+def _practice_student_metrics(s,student_id):
+    rows=s.scalars(select(PracticeAttempt).where(PracticeAttempt.student_id==student_id,PracticeAttempt.status=='submitted').order_by(PracticeAttempt.id.desc())).all()
+    subject_stats={};unit_stats={};total_answered=total_correct=0
+    for attempt in rows:
+        for item in safe_json_load(attempt.answers_json,[]):
+            if item.get('is_manual'):continue
+            marks=max(1,int(item.get('marks') or 1));earned=max(0,int(item.get('earned') or 0));total_answered+=1
+            if earned>=marks:total_correct+=1
+            subject=(item.get('subject') or attempt.subject or 'General').strip() or 'General'
+            unit=(item.get('unit') or '').strip()
+            for key,bucket in [(subject,subject_stats),(f'{subject} · Unit {unit}' if unit else subject,unit_stats)]:
+                stat=bucket.setdefault(key,{'label':key,'earned':0,'marks':0,'questions':0})
+                stat['earned']+=earned;stat['marks']+=marks;stat['questions']+=1
+    def finish(mapping):
+        out=[]
+        for stat in mapping.values():
+            stat['percentage']=round(100*stat['earned']/stat['marks']) if stat['marks'] else 0;out.append(stat)
+        return out
+    subjects=sorted(finish(subject_stats),key=lambda x:(x['percentage'],x['label']))
+    units=sorted(finish(unit_stats),key=lambda x:(x['percentage'],x['label']))
+    return {'attempts':len(rows),'answered':total_answered,'correct':total_correct,'accuracy':round(100*total_correct/total_answered) if total_answered else 0,'subjects':subjects,'units':units,'weak_areas':units[:5]}
+
+
+def _practice_released_exams(s):
+    releases=s.scalars(select(ExamPracticeRelease).where(ExamPracticeRelease.is_released==True).order_by(ExamPracticeRelease.id.desc())).all();rows=[]
+    for release in releases:
+        if not practice_release_is_available(release):continue
+        exam=s.get(Exam,release.exam_id)
+        if not exam or exam.is_active:continue
+        qcount=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam.id)) or 0
+        rows.append({'exam':exam,'release':release,'question_count':qcount})
+    return rows
+
+
+@app.route('/student/practice')
+@student_required
+def practice_centre():
+    s=DB();student=s.get(Student,web_session['user_id'])
+    eligible=s.scalars(select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both'])).order_by(BankQuestion.subject,BankQuestion.unit,BankQuestion.id)).all()
+    eligible=[q for q in eligible if canonical_question_type(q.question_type)!='essay']
+    subject_counts={};units_by_subject={}
+    for q in eligible:
+        subject_counts[q.subject]=subject_counts.get(q.subject,0)+1
+        if q.unit:units_by_subject.setdefault(q.subject,set()).add(q.unit)
+    subjects=[{'name':name,'count':count,'units':sorted(units_by_subject.get(name,set()))} for name,count in sorted(subject_counts.items())]
+    recent=s.scalars(select(PracticeAttempt).where(PracticeAttempt.student_id==student.id).order_by(PracticeAttempt.id.desc()).limit(10)).all()
+    metrics=_practice_student_metrics(s,student.id)
+    bookmarks=s.scalar(select(func.count()).select_from(PracticeBookmark).where(PracticeBookmark.student_id==student.id)) or 0
+    wrong_ids=_practice_wrong_bank_ids(s,student.id)
+    published_ids={q.id for q in eligible};wrong_available=len(wrong_ids & published_ids)
+    return render_template('practice_centre.html',student=student,subjects=subjects,published_count=len(eligible),recent=recent,metrics=metrics,bookmark_count=bookmarks,wrong_count=wrong_available,released_exams=_practice_released_exams(s))
+
+
+@app.route('/student/practice/start',methods=['POST'])
+@student_required
+def start_practice():
+    s=DB();subject=(request.form.get('subject') or '').strip();unit=(request.form.get('unit') or '').strip();difficulty=(request.form.get('difficulty') or '').strip();mode=(request.form.get('mode') or 'practice').strip().lower()
+    if mode not in {'practice','mock'}:mode='practice'
+    try:count=max(1,min(50,int(request.form.get('question_count') or 10)))
+    except ValueError:count=10
+    stmt=select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))
+    if subject:stmt=stmt.where(BankQuestion.subject==subject)
+    if unit:stmt=stmt.where(BankQuestion.unit==unit)
+    if difficulty:stmt=stmt.where(BankQuestion.difficulty==canonical_difficulty(difficulty))
+    rows=[q for q in s.scalars(stmt).all() if canonical_question_type(q.question_type)!='essay']
+    if not rows:flash('No approved questions are currently published for that practice selection. Ask your faculty to publish practice questions.','error');return redirect(url_for('practice_centre'))
+    selected=random.sample(rows,min(count,len(rows)));refs=_practice_bank_refs(selected)
+    duration=0
+    if mode=='mock':
+        try:duration=max(5,min(180,int(request.form.get('duration_minutes') or max(10,len(refs)))))
+        except ValueError:duration=max(10,len(refs))
+    attempt=_create_practice_attempt(s,web_session['user_id'],refs,mode,subject or 'Mixed Practice',unit,difficulty,None,duration);s.commit();return redirect(url_for('practice_attempt',attempt_id=attempt.id))
+
+
+@app.route('/student/practice/previous/<int:exam_id>/start',methods=['POST'])
+@student_required
+def start_previous_paper_practice(exam_id):
+    s=DB();exam=s.get(Exam,exam_id);release=get_exam_practice_release(s,exam_id,create=False)
+    if not exam or exam.is_active or not practice_release_is_available(release):abort(404)
+    questions=s.scalars(select(Question).where(Question.exam_id==exam.id).order_by(Question.id)).all()
+    if not questions:flash('This released paper does not contain any questions.','error');return redirect(url_for('practice_centre'))
+    maps={m.exam_question_id:m.bank_question_id for m in s.scalars(select(ExamBankMap).where(ExamBankMap.exam_id==exam.id)).all()}
+    refs=[]
+    for q in questions:
+        refs.append({'source':'exam','id':q.id,'bank_id':maps.get(q.id),'option_order':'ABCD'})
+    timed=request.form.get('timed')=='1' and bool(release.allow_mock);duration=exam.duration_minutes if timed else 0
+    attempt=_create_practice_attempt(s,web_session['user_id'],refs,'previous',exam.title,'','',exam.id,duration);s.commit();return redirect(url_for('practice_attempt',attempt_id=attempt.id))
+
+
+@app.route('/student/practice/wrong/start',methods=['POST'])
+@student_required
+def start_wrong_answer_practice():
+    s=DB();ids=_practice_wrong_bank_ids(s,web_session['user_id'])
+    if not ids:flash('You do not have any incorrect practice questions to retry yet.');return redirect(url_for('practice_centre'))
+    rows=[q for q in s.scalars(select(BankQuestion).where(BankQuestion.id.in_(ids),BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))).all() if canonical_question_type(q.question_type)!='essay']
+    if not rows:flash('Your previously missed questions are no longer published for practice.','error');return redirect(url_for('practice_centre'))
+    random.shuffle(rows);rows=rows[:min(30,len(rows))];attempt=_create_practice_attempt(s,web_session['user_id'],_practice_bank_refs(rows),'wrong','My Wrong Answers');s.commit();return redirect(url_for('practice_attempt',attempt_id=attempt.id))
+
+
+@app.route('/student/practice/bookmarks/start',methods=['POST'])
+@student_required
+def start_bookmarked_practice():
+    s=DB();ids=s.scalars(select(PracticeBookmark.bank_question_id).where(PracticeBookmark.student_id==web_session['user_id'])).all()
+    if not ids:flash('You have not bookmarked any practice questions yet.');return redirect(url_for('practice_centre'))
+    rows=[q for q in s.scalars(select(BankQuestion).where(BankQuestion.id.in_(list(ids)),BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))).all() if canonical_question_type(q.question_type)!='essay']
+    if not rows:flash('Your bookmarked questions are not currently published for practice.','error');return redirect(url_for('practice_centre'))
+    random.shuffle(rows);rows=rows[:min(30,len(rows))];attempt=_create_practice_attempt(s,web_session['user_id'],_practice_bank_refs(rows),'bookmarks','Bookmarked Questions');s.commit();return redirect(url_for('practice_attempt',attempt_id=attempt.id))
+
+
+@app.route('/student/practice/<int:attempt_id>')
+@student_required
+def practice_attempt(attempt_id):
+    s=DB();attempt=s.get(PracticeAttempt,attempt_id)
+    if not attempt or attempt.student_id!=web_session['user_id']:abort(404)
+    if attempt.status=='submitted':return redirect(url_for('practice_result',attempt_id=attempt.id))
+    refs=safe_json_load(attempt.question_refs_json,[]);views=[]
+    for ref in refs:
+        view=_practice_question_view(s,ref)
+        if view:views.append(view)
+    if not views:flash('This practice set is no longer available.','error');return redirect(url_for('practice_centre'))
+    feedback_enabled=attempt.mode in {'practice','wrong','bookmarks'}
+    end_epoch=parse_dt(attempt.ends_at).timestamp() if attempt.ends_at else 0
+    return render_template('practice_attempt.html',attempt=attempt,questions=views,feedback_enabled=feedback_enabled,end_epoch=end_epoch)
+
+
+@app.route('/student/practice/check-answer',methods=['POST'])
+@student_required
+def practice_check_answer():
+    data=request.get_json(silent=True) or {}
+    try:attempt_id=int(data.get('attempt_id') or 0)
+    except Exception:return jsonify(error='Invalid practice attempt'),400
+    ref_key=str(data.get('ref_key') or '');value=str(data.get('answer') or '')[:MAX_ANSWER_LENGTH]
+    s=DB();attempt=s.get(PracticeAttempt,attempt_id)
+    if not attempt or attempt.student_id!=web_session['user_id'] or attempt.status!='in_progress':return jsonify(error='Practice attempt not available'),404
+    if attempt.mode not in {'practice','wrong','bookmarks'}:return jsonify(error='Immediate feedback is disabled in timed/previous-paper mode'),403
+    ref=next((r for r in safe_json_load(attempt.question_refs_json,[]) if _practice_ref_key(r)==ref_key),None)
+    if not ref:return jsonify(error='Question is not part of this practice set'),400
+    view=_practice_question_view(s,ref)
+    if not view:return jsonify(error='Question unavailable'),404
+    correct=is_answer_correct(view['question_obj'],value)
+    return jsonify(correct=bool(correct),correct_answer=_practice_correct_display(view),explanation=view['explanation'] or 'No explanation has been added by the faculty yet.')
+
+
+@app.route('/student/practice/<int:attempt_id>/submit',methods=['POST'])
+@student_required
+def submit_practice_attempt(attempt_id):
+    s=DB();attempt=s.get(PracticeAttempt,attempt_id)
+    if not attempt or attempt.student_id!=web_session['user_id']:abort(404)
+    if attempt.status=='submitted':return redirect(url_for('practice_result',attempt_id=attempt.id))
+    refs=safe_json_load(attempt.question_refs_json,[]);answers=[];score=total=0;incorrect=[]
+    late_submission=False
+    if attempt.ends_at:
+        try:late_submission=now_dt()>parse_dt(attempt.ends_at)+timedelta(seconds=60)
+        except Exception:late_submission=False
+    for ref in refs:
+        view=_practice_question_view(s,ref)
+        if not view:continue
+        values=[] if late_submission else request.form.getlist(view['field_name']);qtype=view['question_type']
+        value=','.join(values) if qtype=='multiple_select' else (values[0] if values else '')
+        is_manual=qtype=='essay';correct=False if is_manual else is_answer_correct(view['question_obj'],value)
+        marks=int(view['marks'] or 1);earned=0 if is_manual else (marks if correct else 0)
+        if not is_manual:total+=marks;score+=earned
+        bank_id=view['bank_id']
+        if bank_id and not is_manual and not correct:incorrect.append(int(bank_id))
+        answers.append({'ref_key':view['ref_key'],'source':view['source'],'source_id':view['source_id'],'bank_id':bank_id,'question':view['question'],'question_type':qtype,'question_type_label':view['question_type_label'],'student_answer':_practice_answer_display(view,value),'correct_answer':_practice_correct_display(view),'raw_answer':value,'is_correct':bool(correct),'is_manual':bool(is_manual),'marks':marks,'earned':earned,'subject':view['subject'],'unit':view['unit'],'topic':view['topic'],'difficulty':view['difficulty'],'co_mapping':view['co_mapping'],'explanation':view['explanation'],'options':view['display_options']})
+    attempt.score=score;attempt.total_marks=total;attempt.answers_json=json.dumps(answers,ensure_ascii=False,separators=(',',':'));attempt.incorrect_bank_ids_json=json.dumps(sorted(set(incorrect)),separators=(',',':'));attempt.status='submitted';attempt.submitted_at=now_iso();s.commit()
+    if late_submission:flash('The timed practice window had already expired, so late answer changes were not accepted.','error')
+    return redirect(url_for('practice_result',attempt_id=attempt.id))
+
+
+@app.route('/student/practice/<int:attempt_id>/result')
+@student_required
+def practice_result(attempt_id):
+    s=DB();attempt=s.get(PracticeAttempt,attempt_id)
+    if not attempt or attempt.student_id!=web_session['user_id'] or attempt.status!='submitted':abort(404)
+    answers=safe_json_load(attempt.answers_json,[]);bookmarked=set(s.scalars(select(PracticeBookmark.bank_question_id).where(PracticeBookmark.student_id==web_session['user_id'])).all())
+    bank_ids={int(item.get('bank_id')) for item in answers if item.get('bank_id')}
+    bookmarkable_ids=set(s.scalars(select(BankQuestion.id).where(BankQuestion.id.in_(bank_ids),BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))).all()) if bank_ids else set()
+    show_solutions=True
+    if attempt.mode=='previous' and attempt.exam_id:
+        release=get_exam_practice_release(s,attempt.exam_id,create=False);show_solutions=bool(release and release.show_solutions)
+    percentage=round(100*attempt.score/attempt.total_marks) if attempt.total_marks else 0
+    return render_template('practice_result.html',attempt=attempt,answers=answers,percentage=percentage,show_solutions=show_solutions,bookmarked=bookmarked,bookmarkable_ids=bookmarkable_ids)
+
+
+@app.route('/student/practice/bookmark/<int:bank_question_id>',methods=['POST'])
+@student_required
+def toggle_practice_bookmark(bank_question_id):
+    s=DB();question=s.get(BankQuestion,bank_question_id)
+    if not question or not question_is_practice_eligible(question):abort(404)
+    row=s.scalar(select(PracticeBookmark).where(PracticeBookmark.student_id==web_session['user_id'],PracticeBookmark.bank_question_id==bank_question_id))
+    if row:s.delete(row);flash('Bookmark removed.')
+    else:s.add(PracticeBookmark(student_id=web_session['user_id'],bank_question_id=bank_question_id,created_at=now_iso()));flash('Question bookmarked for later practice.')
+    s.commit();return redirect(request.referrer or url_for('practice_centre'))
+
+# ----------------------- End Student Practice & Learning Centre -----------------------
+
 @app.route('/student')
 @student_required
 def student_dashboard():
@@ -2182,7 +3281,7 @@ def take_exam(exam_id):
         if _session and _session.scheduled_end:
             session_end=datetime.fromisoformat(_session.scheduled_end).astimezone() if datetime.fromisoformat(_session.scheduled_end).tzinfo else datetime.fromisoformat(_session.scheduled_end).replace(tzinfo=started.tzinfo)
             if session_end<end:end=session_end
-        attempt=Attempt(student_id=web_session['user_id'],exam_id=exam_id,started_at=started.isoformat(timespec='seconds'),end_at=end.isoformat(timespec='seconds'),status='in_progress',question_order=','.join(map(str,qids)));s.add(attempt);s.flush()
+        attempt=Attempt(student_id=web_session['user_id'],exam_id=exam_id,started_at=started.isoformat(timespec='seconds'),end_at=end.isoformat(timespec='seconds'),status='in_progress',question_order=','.join(map(str,qids)));s.add(attempt);s.flush();s.add(AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=0,client_state='active',client_fingerprint=''))
         for pos,qid in enumerate(qids,1):
             keys=list('ABCD')
             if cfg and cfg.shuffle_options:random.shuffle(keys)
@@ -2199,10 +3298,11 @@ def take_exam(exam_id):
     for aq in aq_rows:
         q=qmap.get(aq.question_id)
         if not q:continue
-        text={'A':q.option_a,'B':q.option_b,'C':q.option_c,'D':q.option_d};display=[(chr(65+i),key,text[key]) for i,key in enumerate(aq.option_order or 'ABCD')]
-        views.append(type('QuestionView',(),{'id':q.id,'question':q.question,'display_options':display})())
-    saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();answers={a.question_id:a.selected_answer for a in saved}
-    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),cfg=cfg)
+        qtype=canonical_question_type(q.question_type);text={'A':q.option_a,'B':q.option_b,'C':q.option_c,'D':q.option_d};order=aq.option_order or 'ABCD';display=[(chr(65+i),key,text[key]) for i,key in enumerate(order)] if qtype in {'single_choice','multiple_select'} else []
+        views.append(type('QuestionView',(),{'id':q.id,'question':q.question,'question_type':qtype,'question_type_label':QUESTION_TYPE_LABELS.get(qtype,qtype),'display_options':display,'marks':q.marks})())
+    saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();answers={a.question_id:answer_record_value(a) for a in saved}
+    security=get_exam_security_policy(s,exam_id,create=False)
+    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),cfg=cfg,security=security)
 
 @app.route('/student/save-answer',methods=['POST'])
 @student_required
@@ -2210,14 +3310,16 @@ def save_answer():
     data=request.get_json(silent=True) or {}
     try:exam_id=int(data.get('exam_id'));qid=int(data.get('question_id'))
     except Exception:return jsonify(error='Invalid request'),400
-    ans=str(data.get('answer','')).upper()
-    if ans not in {'A','B','C','D'}:return jsonify(error='Invalid answer'),400
+    ans=str(data.get('answer',''))[:MAX_ANSWER_LENGTH]
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt:return jsonify(error='Attempt not found'),404
     if attempt.status=='submitted':return jsonify(saved=False,submitted=True)
     if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt);return jsonify(saved=False,submitted=True)
     if qid not in attempt_question_ids(s,attempt):return jsonify(error='Question not part of this attempt'),400
-    save_answer_record(s,attempt.id,qid,ans);s.commit();return jsonify(saved=True)
+    question=s.get(Question,qid)
+    try:save_answer_record(s,attempt.id,qid,ans,question)
+    except ValueError as exc:return jsonify(error=str(exc)),400
+    s.commit();return jsonify(saved=True)
 
 @app.route('/student/integrity-event',methods=['POST'])
 @student_required
@@ -2226,10 +3328,24 @@ def integrity_event():
     try:exam_id=int(data.get('exam_id'))
     except Exception:return jsonify(saved=False),400
     event_type=str(data.get('event_type',''))[:50]
-    if event_type not in {'tab_hidden','fullscreen_exit'}:return jsonify(saved=False),400
+    if event_type not in {'tab_hidden','fullscreen_exit','copy_attempt','paste_attempt','context_menu'}:return jsonify(saved=False),400
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt or attempt.status=='submitted':return jsonify(saved=False),404
     s.add(IntegrityEvent(attempt_id=attempt.id,event_type=event_type,details=str(data.get('details',''))[:250],created_at=now_iso()));s.commit();count=s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0;return jsonify(saved=True,count=count)
+
+@app.route('/student/heartbeat',methods=['POST'])
+@student_required
+def student_heartbeat():
+    data=request.get_json(silent=True) or {}
+    try:exam_id=int(data.get('exam_id'))
+    except Exception:return jsonify(saved=False),400
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
+    if not attempt or attempt.status=='submitted':return jsonify(saved=False),404
+    count=s.scalar(select(func.count()).select_from(Answer).where(Answer.attempt_id==attempt.id)) or 0
+    row=s.scalar(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id==attempt.id));fingerprint=hashlib.sha256(((request.headers.get('User-Agent') or '')+'|'+(request.remote_addr or '')).encode('utf-8')).hexdigest()[:24]
+    if not row:row=AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=int(count),client_state=str(data.get('state') or 'active')[:30],client_fingerprint=fingerprint);s.add(row)
+    else:row.last_seen_at=now_iso();row.answer_count=int(count);row.client_state=str(data.get('state') or 'active')[:30];row.client_fingerprint=fingerprint
+    s.commit();return jsonify(saved=True,server_time=now_iso())
 
 @app.route('/student/exam/<int:exam_id>/submit',methods=['POST'])
 @student_required
@@ -2238,11 +3354,13 @@ def submit_exam(exam_id):
     if not attempt:flash('Attempt not found.','error');return redirect(url_for('student_dashboard'))
     allowed=set(attempt_question_ids(s,attempt))
     if attempt.status!='submitted':
-        for key,value in request.form.items():
-            if key.startswith('q_') and value in {'A','B','C','D'}:
-                try:qid=int(key[2:])
-                except ValueError:continue
-                if qid in allowed:save_answer_record(s,attempt.id,qid,value)
+        questions={q.id:q for q in (s.scalars(select(Question).where(Question.id.in_(allowed))).all() if allowed else [])}
+        for qid,question in questions.items():
+            field=f'q_{qid}';values=request.form.getlist(field)
+            if not values:continue
+            value=','.join(values) if canonical_question_type(question.question_type)=='multiple_select' else values[0]
+            try:save_answer_record(s,attempt.id,qid,value[:MAX_ANSWER_LENGTH],question)
+            except ValueError:continue
         s.commit();finalize_attempt(s,attempt)
     return redirect(url_for('submitted',exam_id=exam_id))
 
@@ -2260,53 +3378,26 @@ def submitted(exam_id):
 @student_required
 def submitted_answers(exam_id):
     s=DB();exam=s.get(Exam,exam_id);attempt=get_attempt(s,web_session['user_id'],exam_id)
-    # Answer review is deliberately available only after this student's exam has been submitted.
     if not exam or not attempt or attempt.status!='submitted':abort(404)
-
     aq_rows=s.scalars(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id).order_by(AttemptQuestion.position)).all()
-    if aq_rows:
-        ordered=[(row.position,row.question_id,row.option_order or 'ABCD') for row in aq_rows]
-    else:
-        ordered=[(pos,qid,'ABCD') for pos,qid in enumerate(attempt_question_ids(s,attempt),1)]
-
-    qids=[qid for _pos,qid,_order in ordered]
-    qrows=s.scalars(select(Question).where(Question.id.in_(qids))).all() if qids else []
-    qmap={q.id:q for q in qrows}
-    saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all()
-    amap={a.question_id:a.selected_answer for a in saved}
-    views=[]
-
+    ordered=[(row.position,row.question_id,row.option_order or 'ABCD') for row in aq_rows] if aq_rows else [(pos,qid,'ABCD') for pos,qid in enumerate(attempt_question_ids(s,attempt),1)]
+    qids=[qid for _pos,qid,_order in ordered];qrows=s.scalars(select(Question).where(Question.id.in_(qids))).all() if qids else [];qmap={q.id:q for q in qrows}
+    saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();aobj={a.question_id:a for a in saved};amap={a.question_id:answer_record_value(a) for a in saved};views=[]
     for position,qid,option_order in ordered:
         q=qmap.get(qid)
         if not q:continue
-        text={'A':q.option_a,'B':q.option_b,'C':q.option_c,'D':q.option_d}
-        order=option_order if len(option_order)==4 and set(option_order)==set('ABCD') else 'ABCD'
-        display_label={key:chr(65+i) for i,key in enumerate(order)}
-        student_key=amap.get(q.id)
-        correct_key=q.correct_answer
-        options=[]
-        for i,key in enumerate(order):
-            options.append(type('AnswerOptionView',(),{
-                'label':chr(65+i),
-                'key':key,
-                'text':text[key],
-                'is_student':student_key==key,
-                'is_correct':correct_key==key,
-            })())
-        views.append(type('AnswerReviewView',(),{
-            'position':position,
-            'question':q.question,
-            'marks':q.marks,
-            'student_key':student_key,
-            'student_label':display_label.get(student_key,'') if student_key else '',
-            'student_text':text.get(student_key,'') if student_key else '',
-            'correct_key':correct_key,
-            'correct_label':display_label.get(correct_key,correct_key),
-            'correct_text':text.get(correct_key,''),
-            'is_correct':bool(student_key and student_key==correct_key),
-            'options':options,
-        })())
-
+        qtype=canonical_question_type(q.question_type);student_value=amap.get(q.id,'');correct_value=normalized_key(q);options=[]
+        student_display=student_value or 'Not answered';correct_display=correct_value
+        if qtype in {'single_choice','multiple_select'}:
+            text_map={'A':q.option_a,'B':q.option_b,'C':q.option_c,'D':q.option_d};order=option_order if len(option_order)==4 and set(option_order)==set('ABCD') else 'ABCD';label_map={key:chr(65+i) for i,key in enumerate(order)};student_set=set(student_value.split(',')) if student_value else set();correct_set=set(correct_value.split(',')) if correct_value else set()
+            for i,key in enumerate(order):options.append(type('AnswerOptionView',(),{'label':chr(65+i),'key':key,'text':text_map[key],'is_student':key in student_set,'is_correct':key in correct_set})())
+            if student_set:student_display='; '.join(f'{label_map.get(key,key)}. {text_map.get(key,"")}' for key in order if key in student_set)
+            correct_display='; '.join(f'{label_map.get(key,key)}. {text_map.get(key,"")}' for key in order if key in correct_set)
+        elif qtype=='true_false':
+            student_display=student_value.title() if student_value else 'Not answered';correct_display=correct_value.title()
+        ans_obj=aobj.get(q.id);is_manual=qtype=='essay';manual_score=(ans_obj.manual_score if ans_obj else None);grader_comment=(ans_obj.grader_comment if ans_obj else '')
+        if is_manual:correct_display='Manually assessed by faculty' if manual_score is not None else 'Awaiting manual grading'
+        views.append(type('AnswerReviewView',(),{'position':position,'question':q.question,'marks':q.marks,'question_type':qtype,'question_type_label':QUESTION_TYPE_LABELS.get(qtype,qtype),'student_answer':student_display,'correct_answer':correct_display,'is_correct':is_answer_correct(q,student_value),'is_manual':is_manual,'manual_score':manual_score,'grader_comment':grader_comment,'options':options})())
     return render_template('submitted_answers.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,questions=views,answer_review_exam_id=exam.id)
 
 @app.errorhandler(400)

@@ -1,4 +1,9 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div class="eyebrow">Governance</div><h1>Audit Trail</h1><p class="muted">Recent staff actions are recorded for accountability and troubleshooting.</p></div>
-<div class="card"><div class="table-wrap"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Entity</th><th>Details</th></tr>{% for r in rows %}<tr><td>{{ r.created_at|dt }}</td><td>{{ r.actor }}</td><td><strong>{{ r.action }}</strong></td><td>{{ r.entity_type }}{% if r.entity_id %} #{{ r.entity_id }}{% endif %}</td><td>{{ r.details }}</td></tr>{% else %}<tr><td colspan="5">No audit events yet.</td></tr>{% endfor %}</table></div></div>
+<div class="page-head"><div class="eyebrow">Governance</div><h1>Audit Trail</h1><p class="muted">Recent staff actions are recorded for accountability and troubleshooting. New events are linked with tamper-evident SHA-256 hashes.</p></div>
+{% if chain_status.valid %}
+<div class="integrity-banner"><strong>Audit chain verified.</strong> {{ chain_status.checked }} sealed event(s) passed hash verification.{% if chain_status.legacy_count %} {{ chain_status.legacy_count }} older event(s) predate tamper-evident sealing and remain marked as legacy.{% endif %}</div>
+{% else %}
+<div class="integrity-banner integrity-danger"><strong>Audit chain warning.</strong> Verification failed after {{ chain_status.checked }} event(s): {{ chain_status.reason }}. Preserve the database and investigate before relying on the audit trail.</div>
+{% endif %}
+<div class="card"><div class="table-wrap"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Entity</th><th>Seal</th><th>Details</th></tr>{% for r in rows %}<tr><td>{{ r.created_at|dt }}</td><td>{{ r.actor }}</td><td><strong>{{ r.action }}</strong></td><td>{{ r.entity_type }}{% if r.entity_id %} #{{ r.entity_id }}{% endif %}</td><td>{% if r.event_hash %}<span title="{{ r.event_hash }}">{{ r.event_hash[:10] }}…</span>{% else %}<span class="muted">Legacy</span>{% endif %}</td><td>{{ r.details }}</td></tr>{% else %}<tr><td colspan="6">No audit events yet.</td></tr>{% endfor %}</table></div></div>
 {% endblock %}

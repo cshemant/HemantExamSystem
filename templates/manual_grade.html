@@ -1,0 +1,10 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div class="eyebrow">Manual assessment</div><h1>Grade Descriptive Answers</h1><p class="muted"><strong>{{ student.roll_no }} · {{ student.name }}</strong> — {{ exam.title }}</p></div>
+<div class="card result-toolbar"><div><span class="badge {{ 'success' if attempt.grading_status=='complete' else 'warning' }}">{{ 'Grading complete' if attempt.grading_status=='complete' else 'Pending grading' }}</span><p class="mini-meta">Current score: {{ attempt.score }} / {{ attempt.total_marks }}</p></div><a class="btn secondary" href="{{ url_for('results',exam_id=exam.id) }}">Back to Results</a></div>
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{% for q in questions %}{% set a=answers.get(q.id) %}<section class="card manual-grade-card"><div class="answer-question-head"><div><div class="mini-meta">Descriptive / Essay · Maximum {{ q.marks }} mark(s)</div><h2>Q{{ loop.index }}. {{ q.question }}</h2></div>{% if a and a.answer_value %}<span class="badge {{ 'success' if a.manual_score is not none else 'warning' }}">{{ (a.manual_score|string) ~ ' / ' ~ (q.marks|string) if a.manual_score is not none else 'Needs grading' }}</span>{% else %}<span class="badge gray">Not answered · 0</span>{% endif %}</div>
+<div class="essay-response"><strong>Student response</strong><div class="essay-response-text">{{ a.answer_value if a and a.answer_value else 'Not answered' }}</div></div>
+{% if a and a.answer_value %}<div class="grid"><div><label>Marks awarded (0–{{ q.marks }})</label><input type="number" name="score_{{ q.id }}" min="0" max="{{ q.marks }}" value="{{ a.manual_score if a.manual_score is not none else '' }}" required></div><div><label>Faculty comment (optional)</label><textarea name="comment_{{ q.id }}" rows="3">{{ a.grader_comment or '' }}</textarea></div></div>{% endif %}
+</section>{% endfor %}
+<button>Save Manual Grading</button></form>
+{% endblock %}

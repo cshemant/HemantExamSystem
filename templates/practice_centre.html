@@ -1,0 +1,54 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div class="eyebrow">Student Practice &amp; Learning Centre</div><h1>Practice Centre</h1><p class="muted">Practice published questions safely. Practice scores never change your official examination result.</p></div>
+
+<div class="grid practice-stats">
+  <div class="stat-card"><strong>{{ published_count }}</strong><span>Published Practice Questions</span></div>
+  <div class="stat-card"><strong>{{ metrics.attempts }}</strong><span>Practice Attempts</span></div>
+  <div class="stat-card"><strong>{{ metrics.accuracy }}%</strong><span>Overall Accuracy</span></div>
+  <div class="stat-card"><strong>{{ bookmark_count }}</strong><span>Bookmarks</span></div>
+</div>
+
+<div class="practice-layout">
+  <div class="card">
+    <div class="eyebrow">Build your own practice</div><h2>Start Practice / Mock Test</h2>
+    {% if subjects %}
+    <form method="post" action="{{ url_for('start_practice') }}" class="practice-builder-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="grid">
+        <div><label>Subject</label><select name="subject" id="practice-subject" required><option value="">Choose subject…</option>{% for item in subjects %}<option value="{{ item.name }}" data-units='{{ item.units|tojson }}'>{{ item.name }} ({{ item.count }})</option>{% endfor %}</select></div>
+        <div><label>Unit</label><select name="unit" id="practice-unit"><option value="">All units</option></select></div>
+        <div><label>Difficulty</label><select name="difficulty"><option value="">Mixed</option><option>Easy</option><option>Medium</option><option>Hard</option></select></div>
+        <div><label>Questions</label><select name="question_count"><option>5</option><option selected>10</option><option>15</option><option>20</option><option>30</option><option>50</option></select></div>
+      </div>
+      <div class="practice-mode-grid">
+        <label class="practice-mode-card"><input type="radio" name="mode" value="practice" checked><span><strong>Practice Mode</strong><small>Check answers while practising and see explanations.</small></span></label>
+        <label class="practice-mode-card"><input type="radio" name="mode" value="mock"><span><strong>Mock Test</strong><small>Timed test. Answers are revealed only after submission.</small></span></label>
+      </div>
+      <div class="practice-duration-row"><label>Mock duration (minutes)</label><input name="duration_minutes" type="number" min="5" max="180" value="15"><span class="mini-meta">Used only when Mock Test is selected.</span></div>
+      <button>Start</button>
+    </form>
+    {% else %}
+    <div class="empty-state"><strong>No questions have been published for student practice yet.</strong><p class="muted">The institutional Question Bank remains confidential by default. Faculty must approve questions and explicitly publish them for practice.</p></div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="eyebrow">Quick revision</div><h2>Smart Practice</h2>
+    <div class="practice-quick-actions">
+      <form method="post" action="{{ url_for('start_wrong_answer_practice') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn secondary practice-action-btn" {% if not wrong_count %}disabled{% endif %}><strong>Practice My Wrong Answers</strong><span>{{ wrong_count }} currently available</span></button></form>
+      <form method="post" action="{{ url_for('start_bookmarked_practice') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn secondary practice-action-btn" {% if not bookmark_count %}disabled{% endif %}><strong>Practice Bookmarks</strong><span>{{ bookmark_count }} saved question{{ '' if bookmark_count==1 else 's' }}</span></button></form>
+    </div>
+    <p class="mini-note">Questions removed from the published practice pool are automatically excluded from these revision sets.</p>
+  </div>
+</div>
+
+<div class="card"><div class="import-header"><div><div class="eyebrow">Faculty-released material</div><h2>Previous Papers</h2><p class="muted">Only papers intentionally released by faculty/authorized staff appear here. Active confidential exams are never exposed automatically.</p></div></div>
+<div class="table-wrap"><table><tr><th>Paper</th><th>Questions</th><th>Solutions</th><th>Practice</th></tr>
+{% for item in released_exams %}<tr><td><strong>{{ item.exam.title }}</strong></td><td>{{ item.question_count }}</td><td>{% if item.release.show_solutions %}<span class="badge success">Available after attempt</span>{% else %}<span class="badge gray">Hidden</span>{% endif %}</td><td><div class="actions"><form method="post" action="{{ url_for('start_previous_paper_practice',exam_id=item.exam.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="timed" value="0"><button class="btn secondary small">Practice Untimed</button></form>{% if item.release.allow_mock %}<form method="post" action="{{ url_for('start_previous_paper_practice',exam_id=item.exam.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="timed" value="1"><button class="small">Timed Paper</button></form>{% endif %}</div></td></tr>{% else %}<tr><td colspan="4">No previous examination paper has been released for practice yet.</td></tr>{% endfor %}
+</table></div></div>
+
+<div class="practice-layout">
+  <div class="card"><div class="eyebrow">Personal analytics</div><h2>Areas to Improve</h2>{% if metrics.weak_areas %}<div class="practice-performance-list">{% for row in metrics.weak_areas %}<div class="practice-performance-row"><div><strong>{{ row.label }}</strong><span>{{ row.questions }} answered</span></div><div class="practice-progress"><span style="width:{{ row.percentage }}%"></span></div><strong>{{ row.percentage }}%</strong></div>{% endfor %}</div>{% else %}<p class="muted">Complete a practice set to see your weakest units here.</p>{% endif %}</div>
+  <div class="card"><div class="eyebrow">History</div><h2>Recent Practice</h2><div class="table-wrap"><table><tr><th>Set</th><th>Mode</th><th>Score</th><th>Action</th></tr>{% for row in recent %}<tr><td>{{ row.subject }}</td><td>{{ row.mode|replace('_',' ')|title }}</td><td>{% if row.status=='submitted' %}{{ row.score }}/{{ row.total_marks }}{% else %}<span class="badge warning">In progress</span>{% endif %}</td><td>{% if row.status=='submitted' %}<a class="btn secondary small" href="{{ url_for('practice_result',attempt_id=row.id) }}">View</a>{% else %}<a class="btn small" href="{{ url_for('practice_attempt',attempt_id=row.id) }}">Resume</a>{% endif %}</td></tr>{% else %}<tr><td colspan="4">No practice attempts yet.</td></tr>{% endfor %}</table></div></div>
+</div>
+{% endblock %}

@@ -1,12 +1,30 @@
+# Environment/secrets
 .env
+
+# Local database and SQLite runtime state
 exam.db
+exam.db-wal
+exam.db-shm
+*.db-wal
+*.db-shm
+
+
+
+# Python/local build
 __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Offline build/release artifacts
 build-offline/
 *.build/
 *.dist/
 *.onefile-build/
 *.exe
+*.zip
 *.zip.sha256
+
+# Edge/result packages
+*.lwhexam
+*.lwhresults

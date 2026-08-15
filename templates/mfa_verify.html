@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block content %}
+<section class="login-shell"><div class="login-card card"><div class="eyebrow">Additional verification</div><h1>Authenticator Code</h1><p class="muted">Enter the 6-digit code from the authenticator app configured for <strong>{{ username }}</strong>.</p>
+<form method="post" autocomplete="off"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>6-digit code</label><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required autofocus><button>Verify & Sign In</button></form>
+<p class="mini-note">The verification session expires after five minutes. After five invalid codes, you must sign in again.</p></div></section>
+{% endblock %}

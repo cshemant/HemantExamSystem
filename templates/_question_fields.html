@@ -1,0 +1,58 @@
+{% set qt = question_type if question_type is defined else 'single_choice' %}
+<div class="grid question-type-grid">
+  <div>
+    <label>Question Type</label>
+    <select name="question_type" data-question-type-selector>
+      <option value="single_choice" {% if qt=='single_choice' %}selected{% endif %}>Single Choice (MCQ)</option>
+      <option value="multiple_select" {% if qt=='multiple_select' %}selected{% endif %}>Multiple Select</option>
+      <option value="true_false" {% if qt=='true_false' %}selected{% endif %}>True / False</option>
+      <option value="numerical" {% if qt=='numerical' %}selected{% endif %}>Numerical Answer</option>
+      <option value="short_text" {% if qt=='short_text' %}selected{% endif %}>Short Text</option>
+      <option value="essay" {% if qt=='essay' %}selected{% endif %}>Descriptive / Essay (Manual Grading)</option>
+    </select>
+  </div>
+  <div><label>Marks</label><input name="marks" type="number" min="1" value="{{ question.marks if question is defined else 1 }}"></div>
+</div>
+<label>Question</label><textarea name="question" required>{{ question.question if question is defined else '' }}</textarea>
+
+<div data-qtype-section="choice">
+  <div class="grid">
+    {% for key in ['a','b','c','d'] %}
+    <div><label>Option {{ key|upper }}</label><input name="option_{{ key }}" value="{{ question|attr('option_' ~ key) if question is defined else '' }}"></div>
+    {% endfor %}
+  </div>
+</div>
+
+<div data-qtype-section="single_choice">
+  <label>Correct Answer</label>
+  <select name="correct_answer">
+    {% for key in ['A','B','C','D'] %}<option value="{{ key }}" {% if question is defined and (question.answer_key or question.correct_answer)==key %}selected{% endif %}>{{ key }}</option>{% endfor %}
+  </select>
+</div>
+
+<div data-qtype-section="multiple_select">
+  <label>Correct Options</label>
+  <div class="multi-answer-grid">
+    {% set multi_key=(question.answer_key if question is defined else '') %}
+    {% for key in ['A','B','C','D'] %}<label class="checkline"><input type="checkbox" name="correct_answers" value="{{ key }}" {% if key in multi_key %}checked{% endif %}> {{ key }}</label>{% endfor %}
+  </div>
+</div>
+
+<div data-qtype-section="true_false">
+  <label>Correct Answer</label>
+  {% set tf=(question.answer_key if question is defined else 'true')|lower %}
+  <div class="multi-answer-grid"><label class="checkline"><input type="radio" name="true_false_answer" value="true" {% if tf!='false' %}checked{% endif %}> True</label><label class="checkline"><input type="radio" name="true_false_answer" value="false" {% if tf=='false' %}checked{% endif %}> False</label></div>
+</div>
+
+<div data-qtype-section="numerical">
+  <div class="grid"><div><label>Correct Numerical Answer</label><input name="numerical_answer_key" inputmode="decimal" value="{{ question.answer_key if question is defined and qt=='numerical' else '' }}" placeholder="e.g. 9.81"></div><div><label>Accepted Tolerance (±)</label><input name="answer_tolerance" inputmode="decimal" value="{{ question.answer_tolerance if question is defined else '' }}" placeholder="0 for exact, or e.g. 0.01"></div></div>
+</div>
+
+<div data-qtype-section="short_text">
+  <label>Accepted Answer(s)</label><input name="short_answer_key" value="{{ question.answer_key if question is defined and qt=='short_text' else '' }}" placeholder="Use | between alternatives, e.g. ART|Android Runtime">
+  <label class="checkline"><input type="checkbox" name="answer_case_sensitive" {% if question is defined and question.answer_case_sensitive %}checked{% endif %}> Case-sensitive marking</label>
+</div>
+
+<div data-qtype-section="essay">
+  <div class="integrity-banner">Descriptive answers are saved during the exam and require manual grading after submission. No automatic answer key is required.</div>
+</div>
