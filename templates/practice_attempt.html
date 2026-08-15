@@ -11,6 +11,6 @@
 {% elif q.question_type=='essay' %}<textarea class="practice-free-answer" name="{{ q.field_name }}" maxlength="4000" placeholder="Write your descriptive response for self-review"></textarea><p class="mini-meta">Descriptive practice is not included in the automatic score.</p>{% endif %}
 {% if feedback_enabled %}<div class="practice-feedback-actions"><button type="button" class="btn secondary small" data-practice-check data-attempt-id="{{ attempt.id }}" data-ref-key="{{ q.ref_key }}" data-field-name="{{ q.field_name }}" data-question-type="{{ q.question_type }}" data-feedback-id="practice-feedback-{{ loop.index }}">Check Answer</button><div class="practice-feedback" id="practice-feedback-{{ loop.index }}" hidden></div></div>{% endif %}
 </div>{% endfor %}
-<div class="practice-submit-bar"><a class="btn secondary" href="{{ url_for('practice_centre') }}">Exit Practice Centre</a><button>Submit Practice Set</button></div>
+<div class="practice-submit-bar"><a class="btn secondary" href="{{ url_for('practice_centre') }}">Exit Practice</a><button>Submit Practice Set</button></div>
 </form>
 {% endblock %}
