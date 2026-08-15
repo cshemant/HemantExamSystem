@@ -1,11 +1,8 @@
 {% extends 'base.html' %}{% block content %}
 <div class="page-head">
-  <div class="eyebrow">Role-based access</div>
   <h1>{% if viewer_role=='hod' %}Faculty Password Management{% else %}Staff Users{% endif %}</h1>
   {% if viewer_role=='hod' %}
     <p class="muted">As HOD, you can reset passwords for Faculty accounts only. HOD, Exam Controller and Super Admin credentials are not available from this page.</p>
-  {% else %}
-    <p class="muted">Super Admin controls staff accounts and can reset passwords for Faculty, HOD and Exam Controller users. The configured Super Admin password remains environment-managed.</p>
   {% endif %}
 </div>
 

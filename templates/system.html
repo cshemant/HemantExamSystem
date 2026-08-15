@@ -1,5 +1,5 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div class="eyebrow">Administration</div><h1>System & Recovery</h1><p class="muted">Manage institutional branding, staff access, audit records and protected offline backups.</p></div>
+<div class="page-head"><h1>System & Recovery</h1></div>
 <div class="grid system-grid">
   <div class="card"><h2>Institution Profile</h2><p class="muted">Configure institution name, logo, department, academic year and exam-controller details.</p><a class="btn" href="{{ url_for('institution_settings') }}">Manage Branding</a></div>
   <div class="card"><h2>Staff Access</h2><p class="muted">Create Faculty, HOD and Exam Controller accounts with controlled privileges.</p><a class="btn" href="{{ url_for('faculty_users') }}">Manage Staff Users</a></div>
