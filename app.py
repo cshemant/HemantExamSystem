@@ -1,4 +1,4 @@
-import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac
+import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -1513,13 +1513,7 @@ def approver_required(fn):
 def get_attempt(s,student_id,exam_id): return s.scalar(select(Attempt).where(Attempt.student_id==student_id,Attempt.exam_id==exam_id))
 
 def student_exam_display_title(s, exam):
-    """Return the exam title without collapsing it into the subject heading.
-
-    Ready Exams keep their explicit title so a subject heading such as
-    ``Artificial Intelligence`` is visually distinct from the exam row
-    ``Artificial Intelligence - Ready Exam``. Duplicate titles are still
-    distinguished with a Part number.
-    """
+    """Return the stored exam title, adding a Part suffix for duplicates."""
     raw=(exam.title or '').strip()
     if not raw:
         return 'Exam'
@@ -1530,6 +1524,20 @@ def student_exam_display_title(s, exam):
         if row.id==exam.id:
             return f"{raw} - Part {idx}"
     return raw
+
+def student_grouped_exam_display_title(s, exam, subject):
+    """Avoid repeating the subject name inside its own dashboard section."""
+    display=student_exam_display_title(s,exam)
+    subject=(subject or '').strip()
+    if not subject or subject.casefold()=='general':
+        return display
+    # Example:
+    #   Subject header: Mobile Application Development
+    #   Stored title:   Mobile Application Development - Unit 1 - Set A
+    #   Row title:      Unit 1 - Set A
+    pattern=r'^'+re.escape(subject)+r'\s*(?:[-–—:|]\s*)+'
+    shortened=re.sub(pattern,'',display,count=1,flags=re.IGNORECASE).strip()
+    return shortened or display
 
 def result_performance(score,total_marks):
     total=total_marks or 0
@@ -3772,7 +3780,7 @@ def student_dashboard():
         if access_label=='Not assigned to your batch/section':continue
         pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=get_exam_config(s,e.id);display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
         subject,unit_label=student_exam_subject_unit(s,e,cfg)
-        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_exam_display_title(s,e),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label})())
+        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_grouped_exam_display_title(s,e,subject),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label})())
 
     grouped={}
     for row in rows:
