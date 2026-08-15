@@ -478,3 +478,15 @@ body{overflow-x:hidden}
   .student-exam-table th:first-child,.student-exam-table td:first-child{padding-left:18px}
   .student-exam-table th:last-child,.student-exam-table td:last-child{padding-right:18px}
 }
+
+
+/* V45 Practical register delete icon */
+.practical-register-leading{display:flex;align-items:center;gap:10px}
+.practical-register-leading form{flex:0 0 auto}
+.practical-delete-icon{
+  width:30px;min-width:30px;height:30px;min-height:30px;padding:0;
+  border:1px solid #f0b4ae;border-radius:8px;background:#fff;color:var(--danger);
+  box-shadow:none;transform:none
+}
+.practical-delete-icon:hover{background:#fff4f3;color:#912018;transform:none;box-shadow:none}
+.practical-delete-icon svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}

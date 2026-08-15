@@ -24,10 +24,20 @@
   <div class="table-wrap"><table>
     <tr><th>Register</th>{% if viewer_role=='super_admin' %}<th>Owner</th>{% endif %}<th>Students</th><th>Experiments</th><th>Marks Entered</th><th>Updated</th><th>Action</th></tr>
     {% for r in registers %}{% set c=counts.get(r.id,{}) %}<tr>
-      <td><strong>{{ r.title }}</strong><div class="muted small-text">{{ r.subject }}{% if r.section %} · {{ r.section }}{% endif %}{% if r.academic_year %} · {{ r.academic_year }}{% endif %}</div></td>
+      <td>
+        <div class="practical-register-leading">
+          <form method="post" action="{{ url_for('delete_practical_register',register_id=r.id) }}" onsubmit="return confirm('Delete this entire practical section? This will permanently delete its students, experiments, marks and related practical data. This action cannot be undone.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="practical-delete-icon" aria-label="Delete {{ r.title }}" title="Delete {{ r.title }}">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 10v6M14 10v6"/></svg>
+            </button>
+          </form>
+          <div><strong>{{ r.title }}</strong><div class="muted small-text">{{ r.subject }}{% if r.section %} · {{ r.section }}{% endif %}{% if r.academic_year %} · {{ r.academic_year }}{% endif %}</div></div>
+        </div>
+      </td>
       {% if viewer_role=='super_admin' %}<td>{{ r.owner_name or '-' }}</td>{% endif %}
       <td>{{ c.get('students',0) }}</td><td>{{ c.get('experiments',0) }}</td><td>{{ c.get('marks',0) }}</td><td>{{ r.updated_at|dt }}</td>
-      <td><div class="actions"><a class="btn small" href="{{ url_for('practical_register_detail',register_id=r.id) }}">Open Register</a><form method="post" action="{{ url_for('delete_practical_register',register_id=r.id) }}" onsubmit="return confirm('Delete this entire practical section? This will permanently delete its students, experiments, marks and related practical data. This action cannot be undone.');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="btn small danger">Delete</button></form></div></td>
+      <td><div class="actions"><a class="btn small" href="{{ url_for('practical_register_detail',register_id=r.id) }}">Open Register</a></div></td>
     </tr>{% else %}<tr><td colspan="{{ 7 if viewer_role=='super_admin' else 6 }}">No practical register has been created yet.</td></tr>{% endfor %}
   </table></div>
 </div>
