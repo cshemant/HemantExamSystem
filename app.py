@@ -2747,6 +2747,90 @@ def set_question_practice_visibility():
     if draft_count:message+=f' {draft_count} draft question(s) remain hidden from students until approved.'
     flash(message);return redirect(request.referrer or url_for('question_bank'))
 
+
+@app.route('/admin/exams/from-subject',methods=['POST'])
+@staff_required
+def create_exam_for_existing_subject():
+    """Create a separate exam from an existing subject without changing its question bank."""
+    s=DB()
+    try:
+        subject_id=int(request.form.get('subject_id','0'))
+    except ValueError:
+        subject_id=0
+    subject=s.get(SubjectCatalog,subject_id)
+    if not subject or not subject.is_active:
+        flash('Choose a valid existing subject.','error')
+        return redirect(url_for('exams'))
+
+    exam_title=(request.form.get('exam_title') or '').strip()
+    if not exam_title:
+        flash('Enter an exam title.','error')
+        return redirect(url_for('exams'))
+
+    selected_unit=(request.form.get('unit') or '').strip()
+    bank_stmt=select(BankQuestion).where(
+        BankQuestion.subject==subject.name,
+        BankQuestion.status=='approved',
+        BankQuestion.practice_visibility.in_(['official_only','both'])
+    )
+    if selected_unit:
+        bank_stmt=bank_stmt.where(BankQuestion.unit==selected_unit)
+    bank_rows=s.scalars(bank_stmt.order_by(BankQuestion.unit,BankQuestion.id)).all()
+    if not bank_rows:
+        unit_text=f' for Unit {selected_unit}' if selected_unit else ''
+        flash(f'No approved official questions are available in {subject.name}{unit_text}.','error')
+        return redirect(url_for('exams'))
+
+    try:
+        duration=max(1,int(request.form.get('duration','20')))
+    except ValueError:
+        duration=20
+    try:
+        requested_count=max(1,int(request.form.get('question_count','10')))
+    except ValueError:
+        requested_count=10
+    per_student=min(requested_count,len(bank_rows))
+
+    exam=Exam(title=exam_title,duration_minutes=duration,is_active=False,created_at=now_iso())
+    s.add(exam);s.flush()
+    cfg=get_exam_config(s,exam.id,create=True)
+    cfg.subject=subject.name
+    cfg.course_semester=subject.course_semester or ''
+    cfg.question_count=per_student
+    cfg.pool_size=len(bank_rows)
+
+    easy=sum(1 for q in bank_rows if canonical_difficulty(q.difficulty)=='Easy')
+    medium=sum(1 for q in bank_rows if canonical_difficulty(q.difficulty)=='Medium')
+    total=max(1,len(bank_rows))
+    cfg.easy_pct=round(easy*100/total)
+    cfg.medium_pct=round(medium*100/total)
+    cfg.hard_pct=max(0,100-cfg.easy_pct-cfg.medium_pct)
+    units=sorted({(q.unit or '').strip() for q in bank_rows if (q.unit or '').strip()})
+    cfg.unit_weights=json.dumps({u:1 for u in units},ensure_ascii=False)
+    cfg.randomize_questions=True
+    cfg.shuffle_options=True
+    cfg.require_fullscreen=False
+    cfg.tab_switch_limit=3
+    source_label=f'{subject.name} / Unit {selected_unit}' if selected_unit else subject.name
+    cfg.last_generation_summary=f'Created as a separate exam from {source_label}: {len(bank_rows)} approved bank questions; each student receives {per_student}.'
+    cfg.updated_at=now_iso()
+    get_exam_approval(s,exam.id,create=True)
+
+    for bank_question in bank_rows:
+        copy_bank_question_to_exam(s,bank_question,exam.id)
+
+    audit_event(
+        s,'catalog_subject_exam_created','exam',exam.id,
+        f'separate_subject_exam=1, subject={subject.name}, unit={selected_unit or "all"}, pool={len(bank_rows)}, per_student={per_student}, title={exam_title}'
+    )
+    s.commit()
+    if requested_count>len(bank_rows):
+        flash(f'Created “{exam_title}” under {subject.name}. Only {len(bank_rows)} approved question(s) were available, so each student will receive {per_student}.')
+    else:
+        flash(f'Created “{exam_title}” under {subject.name} with {per_student} question(s) per student.')
+    return redirect(url_for('exam_builder',exam_id=exam.id))
+
+
 @app.route('/admin/exams',methods=['GET','POST'])
 @staff_required
 def exams():
@@ -2757,13 +2841,38 @@ def exams():
         title=request.form.get('title','').strip()
         if title:
             e=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(e);s.flush();get_exam_config(s,e.id,create=True);get_exam_approval(s,e.id,create=True);audit_event(s,'exam_created','exam',e.id,title);s.commit();flash('Exam created as draft.')
+    subject_exam_options=[]
+    catalog_subjects=s.scalars(select(SubjectCatalog).where(SubjectCatalog.is_active==True).order_by(SubjectCatalog.name)).all()
+    for catalog_subject in catalog_subjects:
+        unit_rows=s.execute(
+            select(BankQuestion.unit,func.count(BankQuestion.id))
+            .where(
+                BankQuestion.subject==catalog_subject.name,
+                BankQuestion.status=='approved',
+                BankQuestion.practice_visibility.in_(['official_only','both'])
+            )
+            .group_by(BankQuestion.unit)
+            .order_by(BankQuestion.unit)
+        ).all()
+        approved_count=sum(int(count or 0) for _unit,count in unit_rows)
+        if not approved_count:
+            continue
+        units=[(unit or '').strip() for unit,count in unit_rows if (unit or '').strip() and int(count or 0)>0]
+        subject_exam_options.append({
+            'id':catalog_subject.id,
+            'name':catalog_subject.name,
+            'course_semester':catalog_subject.course_semester or '',
+            'approved_count':approved_count,
+            'units':units,
+        })
+
     raw=s.execute(select(Exam,func.count(Question.id)).outerjoin(Question,Question.exam_id==Exam.id).group_by(Exam.id).order_by(Exam.id.desc())).all();rows=[]
     for e,count in raw:
         cfg=get_exam_config(s,e.id);target=(cfg.question_count if cfg and cfg.question_count else count)
         approval=get_exam_approval(s,e.id,create=True);session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.exam_id==e.id)) or 0
         policy=exam_approval_policy(s,e)
         rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count']})())
-    return render_template('exams.html',exams=rows)
+    return render_template('exams.html',exams=rows,subject_exam_options=subject_exam_options)
 
 @app.route('/admin/exam/<int:exam_id>/toggle',methods=['POST'])
 @staff_required
