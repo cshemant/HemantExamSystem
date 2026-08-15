@@ -1,1 +1,46 @@
-{% extends 'base.html' %}{% block content %}<div class="page-head"><h1>Welcome, {{ student.name }}</h1></div><div class="card"><div class="table-wrap"><table><tr><th>Exam</th><th>Duration</th><th>Questions</th><th>Status</th><th>Venue</th><th>Action</th></tr>{% for e in exams %}<tr><td><strong>{{ e.display_title }}</strong></td><td>{{ e.duration_minutes }} min</td><td>{{ e.question_count }}</td><td>{% if e.attempt_status %}{{ e.attempt_status }}{% else %}{{ e.access_label }}{% endif %}</td><td>{{ e.venue or '-' }}</td><td>{% if e.attempt_status=='submitted' %}<a class="btn small secondary" href="{{ url_for('submitted',exam_id=e.id) }}">View Result</a>{% elif e.can_start %}<a class="btn small" href="{{ url_for('take_exam',exam_id=e.id) }}">{% if e.attempt_status=='in_progress' %}Resume{% else %}Start{% endif %}</a>{% else %}<span class="badge gray">{{ e.access_label }}</span>{% endif %}</td></tr>{% else %}<tr><td colspan="6">No examinations are currently assigned to you.</td></tr>{% endfor %}</table></div></div>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-head"><h1>Welcome, {{ student.name }}</h1></div>
+
+{% if exam_groups %}
+  <div class="student-exam-groups">
+    {% for subject_group in exam_groups %}
+      <section class="card student-exam-subject">
+        <h2>{{ subject_group.subject }}</h2>
+        {% for unit_group in subject_group.units %}
+          <div class="student-exam-unit">
+            <div class="student-exam-unit-title">{{ unit_group.label }}</div>
+            <div class="table-wrap">
+              <table class="student-exam-table">
+                <tr>
+                  <th>Exam</th><th>Duration</th><th>Questions</th><th>Status</th><th>Venue</th><th>Action</th>
+                </tr>
+                {% for e in unit_group.exams %}
+                  <tr>
+                    <td><strong>{{ e.display_title }}</strong></td>
+                    <td>{{ e.duration_minutes }} min</td>
+                    <td>{{ e.question_count }}</td>
+                    <td>{% if e.attempt_status %}{{ e.attempt_status }}{% else %}{{ e.access_label }}{% endif %}</td>
+                    <td>{{ e.venue or '-' }}</td>
+                    <td>
+                      {% if e.attempt_status=='submitted' %}
+                        <a class="btn small secondary" href="{{ url_for('submitted',exam_id=e.id) }}">View Result</a>
+                      {% elif e.can_start %}
+                        <a class="btn small" href="{{ url_for('take_exam',exam_id=e.id) }}">{% if e.attempt_status=='in_progress' %}Resume{% else %}Start{% endif %}</a>
+                      {% else %}
+                        <span class="badge gray">{{ e.access_label }}</span>
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </table>
+            </div>
+          </div>
+        {% endfor %}
+      </section>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="card">No examinations are currently assigned to you.</div>
+{% endif %}
+{% endblock %}

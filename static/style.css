@@ -461,3 +461,20 @@ body{overflow-x:hidden}
 .practical-component-table .practical-save-state{min-width:0;width:100%;font-size:10px}
 .practical-component-table input[type="hidden"]{display:none}
 @media(max-width:900px){.practical-live-table-card .table-wrap{overflow-x:auto}.practical-component-table{min-width:930px!important}}
+
+/* V40 student exam organization: Subject > Unit > Exam */
+.student-exam-groups{display:grid;gap:18px}
+.student-exam-subject{padding:0;overflow:hidden}
+.student-exam-subject>h2{margin:0;padding:18px 24px;border-bottom:1px solid var(--border);font-size:22px}
+.student-exam-unit+.student-exam-unit{border-top:1px solid var(--border)}
+.student-exam-unit-title{padding:10px 24px;background:#f8fafc;color:#344054;font-size:13px;font-weight:900}
+.student-exam-table{margin:0}
+.student-exam-table th,.student-exam-table td{padding-top:12px;padding-bottom:12px}
+.student-exam-table th:first-child,.student-exam-table td:first-child{padding-left:24px}
+.student-exam-table th:last-child,.student-exam-table td:last-child{padding-right:24px}
+@media(max-width:700px){
+  .student-exam-subject>h2{padding:16px 18px;font-size:20px}
+  .student-exam-unit-title{padding:9px 18px}
+  .student-exam-table th:first-child,.student-exam-table td:first-child{padding-left:18px}
+  .student-exam-table th:last-child,.student-exam-table td:last-child{padding-right:18px}
+}

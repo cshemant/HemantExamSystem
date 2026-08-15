@@ -3663,6 +3663,56 @@ def toggle_practice_bookmark(bank_question_id):
 
 # ----------------------- End Student Practice & Learning Centre -----------------------
 
+def student_exam_subject_unit(s, exam, cfg):
+    """Return stable subject/unit labels for the student exam dashboard.
+
+    Prefer ExamConfig metadata, then fall back to the mapped Question Bank rows.
+    No schema change is required, so older production exams remain compatible.
+    """
+    subject=((cfg.subject if cfg else '') or '').strip()
+    mapped=s.execute(
+        select(BankQuestion.subject,BankQuestion.unit)
+        .join(ExamBankMap,ExamBankMap.bank_question_id==BankQuestion.id)
+        .where(ExamBankMap.exam_id==exam.id)
+    ).all()
+    mapped_subjects=sorted({(row[0] or '').strip() for row in mapped if (row[0] or '').strip()},key=str.casefold)
+    mapped_units=sorted({(row[1] or '').strip() for row in mapped if (row[1] or '').strip()},key=lambda value:(int(value) if str(value).isdigit() else 10**9,str(value).casefold()))
+    if not subject and mapped_subjects:
+        subject=mapped_subjects[0] if len(mapped_subjects)==1 else 'General'
+
+    units=list(mapped_units)
+    if not units and cfg and cfg.unit_weights:
+        weights=safe_json_load(cfg.unit_weights,{})
+        if isinstance(weights,dict):
+            units=[str(key).strip() for key,value in weights.items() if str(key).strip() and value not in (0,'0',None,'')]
+
+    def unit_display(value):
+        value=str(value or '').strip()
+        if not value:return ''
+        return value if value.lower().startswith('unit ') else f'Unit {value}'
+
+    if len(units)==1:
+        unit_label=unit_display(units[0])
+    elif len(units)>1:
+        unit_label='All Units'
+    else:
+        unit_label='General'
+
+    if not subject:
+        subject=student_exam_display_title(s,exam) or 'General'
+    return subject,unit_label
+
+def student_exam_unit_sort_key(label):
+    text=(label or '').strip()
+    lower=text.lower()
+    if lower.startswith('unit '):
+        value=text[5:].strip()
+        try:return (0,int(value),'')
+        except ValueError:return (0,10**9,value.casefold())
+    if lower=='all units':return (1,0,'')
+    if lower=='general':return (2,0,'')
+    return (3,0,lower)
+
 @app.route('/student')
 @student_required
 def student_dashboard():
@@ -3671,8 +3721,19 @@ def student_dashboard():
         allowed,access_label,session_row=exam_access_for_student(s,st.id,e)
         if access_label=='Not assigned to your batch/section':continue
         pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=get_exam_config(s,e.id);display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
-        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_exam_display_title(s,e),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else ''})())
-    return render_template('student_dashboard.html',student=st,exams=rows)
+        subject,unit_label=student_exam_subject_unit(s,e,cfg)
+        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_exam_display_title(s,e),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label})())
+
+    grouped={}
+    for row in rows:
+        grouped.setdefault(row.subject,{}).setdefault(row.unit_label,[]).append(row)
+    exam_groups=[]
+    for subject in sorted(grouped,key=str.casefold):
+        units=[]
+        for unit_label in sorted(grouped[subject],key=student_exam_unit_sort_key):
+            units.append({'label':unit_label,'exams':grouped[subject][unit_label]})
+        exam_groups.append({'subject':subject,'units':units})
+    return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups)
 
 @app.route('/student/exam/<int:exam_id>')
 @student_required
