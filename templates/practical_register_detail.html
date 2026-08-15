@@ -30,7 +30,7 @@
   </div>
   <div class="card practical-setup-card">
     <div class="import-header"><div><h2>Experiment List</h2><span class="muted">Excel/CSV or paste one experiment per line.</span></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('practical_template',register_id=register.id,kind='experiments',fmt='xlsx') }}">Template</a></div></div>
-    <form method="post" action="{{ url_for('practical_experiments_import',register_id=register.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="file" name="experiment_file" accept=".xlsx,.csv"><label class="practical-or">or paste list</label><textarea name="experiment_text" rows="4" placeholder="1 | Installation of Android Studio&#10;2A | Display Hello World&#10;2B | Linear Layout"></textarea><button>Update Experiments</button></form>
+    <form method="post" action="{{ url_for('practical_experiments_import',register_id=register.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="file" name="experiment_file" accept=".xlsx,.csv"><label class="practical-or">or paste list</label><textarea name="experiment_text" rows="4" placeholder="1 | Installation of Android Studio&#10;2-A | Display Hello World&#10;2-B | Linear Layout"></textarea><button>Update Experiments</button></form>
   </div>
 </div>
 

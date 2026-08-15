@@ -116,17 +116,53 @@ def _collect_roster(rows: list[list[object]], start: int, roll_col: int, name_co
 
 
 def normalize_experiment_code(value: str, fallback: int) -> str:
+    """Return a stable practical number such as ``12-A``.
+
+    Common source formats such as ``12A``, ``12 A``, ``12-A`` and ``12/A``
+    are rendered consistently.  Letter-only continuation cells are handled by
+    the sequence-aware import logic below rather than being treated as a full
+    experiment number.
+    """
     raw=cell_text(value).upper().replace('EXPERIMENT','').replace('EXP.','').replace('EXP','').strip(' :-_')
     raw=re.sub(r'\s+','',raw)
-    if raw:
-        return raw[:24]
-    return str(fallback)
+    if not raw:
+        return str(fallback)
+    match=re.fullmatch(r'(\d+)[\-_/]?([A-Z])',raw)
+    if match:
+        return f"{int(match.group(1))}-{match.group(2)}"
+    if re.fullmatch(r'\d+',raw):
+        return str(int(raw))
+    return raw[:24]
+
+
+def normalize_experiment_sequence(codes: Iterable[str]) -> list[str]:
+    """Repair/display experiment codes using their ordered sequence.
+
+    Older builds could store continuation rows as ``B``, ``B-5`` or ``C-4``.
+    Once a numeric major practical is known, those legacy labels can be safely
+    interpreted as its B/C sub-parts.
+    """
+    out=[];current_major=None
+    for pos,value in enumerate(codes,start=1):
+        raw=cell_text(value).upper().strip()
+        canonical=normalize_experiment_code(raw,pos)
+        major_match=re.fullmatch(r'(\d+)(?:-([A-Z]))?',canonical)
+        if major_match:
+            current_major=str(int(major_match.group(1)))
+            out.append(canonical)
+            continue
+        continuation=re.fullmatch(r'([A-Z])(?:-\d+)?',raw)
+        if continuation and current_major:
+            out.append(f'{current_major}-{continuation.group(1)}')
+        else:
+            out.append(canonical)
+    return out
 
 
 def parse_experiment_text(text: str, default_marks: int=10) -> list[dict]:
     """Parse one experiment per line.
 
-    Accepted examples: ``2A | Linear Layout``, ``2A - Linear Layout`` or simply
+    Accepted examples: ``2-A | Linear Layout``, ``2-A - Linear Layout`` or simply
     ``Linear Layout``.  Numbered lists pasted from Word are also accepted.
     """
     rows=[]
@@ -138,7 +174,7 @@ def parse_experiment_text(text: str, default_marks: int=10) -> list[dict]:
         if '|' in line:
             code,title=[x.strip() for x in line.split('|',1)]
         else:
-            match=re.match(r'^\s*([0-9]+\s*[A-Za-z]?)\s*[.):-]?\s+(.+)$',line)
+            match=re.match(r'^\s*([0-9]+(?:\s*[-_/]?\s*[A-Za-z])?)\s*[.):-]?\s+(.+)$',line)
             if match:
                 code=match.group(1);title=match.group(2).strip()
         if not title:
@@ -172,21 +208,37 @@ def parse_experiment_bytes(filename: str, raw: bytes, default_marks: int=10) -> 
             output=_dedupe_experiments(output)
             if output:return output
 
-    # Loose list path: use the first short code-like cell and the longest text cell.
-    output=[]
+    # Loose university/list path.  Many lab sheets use one column for the
+    # major practical number and another for A/B/C sub-parts.  The major number
+    # is commonly shown only on the first row of the group (Excel merged-cell
+    # style), so carry it forward for following letter-only rows.
+    output=[];current_major=None
     for pos,row in enumerate(rows,start=1):
-        values=[cell_text(v) for v in row if cell_text(v)]
+        cells=[cell_text(v) for v in row]
+        values=[v for v in cells if v]
         if not values:
             continue
         if len(values)==1:
-            # Ignore likely headings.
             if _key(values[0]) in {'experiment','experiment_no','title','experiment_list'}:
                 continue
             code='';title=values[0]
         else:
-            code_candidates=[v for v in values[:-1] if re.fullmatch(r'(?:[0-9]+\s*[A-Za-z]?|[A-Za-z])',v.strip())]
-            code=''.join(code_candidates[:2]) if code_candidates else ''
             title=max(values,key=len)
+            # Only inspect non-title cells for numbering tokens.
+            tokens=[v.strip().upper() for v in values if v != title]
+            combined=next((v for v in tokens if re.fullmatch(r'\d+\s*[-_/]?\s*[A-Z]',v)),None)
+            major=next((v for v in tokens if re.fullmatch(r'\d+',v)),None)
+            letter=next((v for v in tokens if re.fullmatch(r'[A-Z]',v)),None)
+            if combined:
+                code=combined
+                m=re.match(r'(\d+)',combined);current_major=str(int(m.group(1))) if m else current_major
+            elif major:
+                current_major=str(int(major))
+                code=f'{current_major}-{letter}' if letter else current_major
+            elif letter and current_major:
+                code=f'{current_major}-{letter}'
+            else:
+                code=''
             if title==code:
                 continue
         if len(title)<4:

@@ -1,0 +1,21 @@
+experiment_no,title,max_marks
+1,Installation of Android Studio,10
+2-A,Develop a program to display Hello World on screen.,10
+2-B,Develop a program to implement linear layout and absolute layout.,10
+2-C,Develop a program to implement frame layout table layout and relative layout.,10
+3-A,Develop a program to implement Text View and Edit Text.,10
+3-B,Develop a program to implement Auto Complete Text View.,10
+4-A,Develop a program to implement Button Image Button and Toggle Button.,10
+4-B,Develop a program to implement a login window using the above UI controls.,10
+4-C,Develop a program to implement Checkbox.,10
+4-D,Develop a program to implement Radio Button and Radio Group.,10
+4-E,Develop a program to implement Progress Bar.,10
+5,Develop a program to implement List View Grid View Image View and Scroll View.,10
+6-A,Develop a program to implement Custom Toast Alert.,10
+6-B,Develop a program to implement Date and Time Picker.,10
+7-A,Develop a program to create an activity.,10
+7-B,Develop a program to implement a new activity using explicit intent and implicit intent.,10
+8-A,Develop a program to implement a content provider.,10
+8-B,Develop a program to implement service.,10
+8-C,Develop a program to implement a broadcast receiver.,10
+8-D,Develop a program to implement sensors.,10

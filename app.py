@@ -22,7 +22,7 @@ from enterprise_core import QUESTION_TYPE_LABELS, canonical_question_type, norma
 from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
-from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text
+from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
@@ -1873,6 +1873,33 @@ def practical_total_max(register):
     return sum(practical_marks_maxima(register).values())
 
 
+def repair_practical_experiment_numbers(s, register):
+    """Normalize legacy practical labels (e.g. B-7/C-4) to 12-B/12-C.
+
+    The repair uses experiment order only; marks stay attached to the same
+    PracticalExperiment IDs, so existing evaluation data is not moved or lost.
+    """
+    rows=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all()
+    if not rows:
+        return 0
+    targets=normalize_experiment_sequence([row.experiment_no for row in rows])
+    if len({code.casefold() for code in targets}) != len(targets):
+        return 0
+    changed=[(row,target) for row,target in zip(rows,targets) if row.experiment_no!=target]
+    if not changed:
+        return 0
+    # Two-phase rename avoids transient unique-constraint collisions.
+    for row,_ in changed:
+        row.experiment_no=f'__tmp_practical_{row.id}'
+    s.flush()
+    for row,target in changed:
+        row.experiment_no=target
+    register.updated_at=now_iso()
+    audit_event(s,'practical_experiment_numbers_normalized','practical_register',register.id,f'updated={len(changed)}')
+    s.commit()
+    return len(changed)
+
+
 def _component_mark(value, label, maximum):
     if value in {None, ''}:
         return None
@@ -1919,7 +1946,7 @@ def practical_registers():
 @app.route('/admin/practicals/<int:register_id>')
 @practical_required
 def practical_register_detail(register_id):
-    s=DB();register=practical_register_access(s,register_id)
+    s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register)
     students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all()
     experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all()
     marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();by_student={}
@@ -1987,21 +2014,27 @@ def practical_experiments_import(register_id):
         elif pasted:rows=parse_experiment_text(pasted,register.default_max_marks)
         else:raise ValueError('Upload an experiment file or paste an experiment list.')
     except ValueError as exc:flash(str(exc),'error');return redirect(url_for('practical_register_detail',register_id=register.id))
-    existing={x.experiment_no.casefold():x for x in s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()};added=updated=0;order=max([x.sort_order for x in existing.values()] or [0])
+    repair_practical_experiment_numbers(s,register)
+    existing_rows=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all()
+    by_code={x.experiment_no.casefold():x for x in existing_rows};by_title={x.title.casefold():x for x in existing_rows};added=updated=0;order=max([x.sort_order for x in existing_rows] or [0])
     for item in rows:
-        key=item['experiment_no'].casefold();current=existing.get(key)
+        key=item['experiment_no'].casefold();title_key=item['title'].casefold();current=by_code.get(key) or by_title.get(title_key)
         total_max=practical_total_max(register)
         if current:
+            # If the same experiment title was previously imported with a bad
+            # legacy label, correct only its label; its ID/marks remain intact.
+            if current.experiment_no.casefold()!=key and key not in by_code:
+                old_key=current.experiment_no.casefold();current.experiment_no=item['experiment_no'];by_code.pop(old_key,None);by_code[key]=current
             current.title=item['title'];current.max_marks=total_max;updated+=1
         else:
-            order+=1;s.add(PracticalExperiment(register_id=register.id,experiment_no=item['experiment_no'],title=item['title'],max_marks=total_max,sort_order=order,created_at=now_iso()));added+=1
+            order+=1;current=PracticalExperiment(register_id=register.id,experiment_no=item['experiment_no'],title=item['title'],max_marks=total_max,sort_order=order,created_at=now_iso());s.add(current);s.flush();by_code[key]=current;by_title[title_key]=current;added+=1
     register.updated_at=now_iso();audit_event(s,'practical_experiments_imported','practical_register',register.id,f'added={added}, updated={updated}');s.commit();flash(f'Experiment list processed: {added} added, {updated} updated.');return redirect(url_for('practical_register_detail',register_id=register.id))
 
 
 @app.route('/admin/practicals/<int:register_id>/mark-entry')
 @practical_required
 def practical_mark_entry(register_id):
-    s=DB();register=practical_register_access(s,register_id);experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all()
+    s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register);experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all()
     if not experiments:
         flash('Upload the experiment list before entering marks.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
     experiment_id=request.args.get('experiment_id',type=int) or experiments[0].id;experiment=next((x for x in experiments if x.id==experiment_id),experiments[0]);marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id,PracticalMark.practical_experiment_id==experiment.id)).all();mark_map={m.practical_student_id:m for m in marks};evaluated=sum(1 for m in marks if m.marks is not None or m.attendance=='A')
@@ -2100,7 +2133,7 @@ def practical_template(register_id,kind,fmt):
 @app.route('/admin/practicals/<int:register_id>/export/<fmt>')
 @practical_required
 def practical_export(register_id,fmt):
-    s=DB();register=practical_register_access(s,register_id);students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all();experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();mark_map={(m.practical_student_id,m.practical_experiment_id):m for m in marks};headers=['S.No','Roll No','Student Name']+[e.experiment_no for e in experiments]+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
+    s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register);students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all();experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();mark_map={(m.practical_student_id,m.practical_experiment_id):m for m in marks};headers=['S.No','Roll No','Student Name']+[e.experiment_no for e in experiments]+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
     for idx,st in enumerate(students,start=1):
         cells=[];total=0.0
         for e in experiments:
