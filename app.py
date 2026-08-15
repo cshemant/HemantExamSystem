@@ -1665,6 +1665,33 @@ def copy_bank_question_to_exam(s,bq,exam_id):
     q=Question(exam_id=exam_id,question=bq.question,option_a=bq.option_a,option_b=bq.option_b,option_c=bq.option_c,option_d=bq.option_d,correct_answer=bq.correct_answer,question_type=canonical_question_type(bq.question_type),answer_key=(bq.answer_key or bq.correct_answer),answer_tolerance=bq.answer_tolerance or '',answer_case_sensitive=bool(bq.answer_case_sensitive),marks=bq.marks)
     s.add(q); s.flush(); s.add(ExamBankMap(exam_id=exam_id,exam_question_id=q.id,bank_question_id=bq.id)); return True
 
+def sync_manual_exam_question_count(s,exam_id):
+    """For manually curated exams, make every question in the pool visible to a new attempt.
+
+    The Blueprint page can still be used afterwards to deliberately choose a smaller
+    randomized per-student count. Calling this helper again after a later manual add
+    intentionally expands the per-student count to include the newly added question.
+    """
+    pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0
+    cfg=get_exam_config(s,exam_id,create=True)
+    cfg.pool_size=pool_count
+    cfg.question_count=pool_count
+    cfg.updated_at=now_iso()
+    return pool_count
+
+def normalize_legacy_manual_subject_exam(s,exam_id,cfg=None):
+    """Upgrade V50 subject-exam configs to the new manual-pool semantics."""
+    cfg=cfg or get_exam_config(s,exam_id,create=False)
+    if not cfg or not (cfg.last_generation_summary or '').startswith('Created as a separate exam from '):
+        return cfg
+    pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0
+    if cfg.pool_size!=pool_count or cfg.question_count!=pool_count:
+        cfg.pool_size=pool_count
+        cfg.question_count=pool_count
+        cfg.updated_at=now_iso()
+        s.commit()
+    return cfg
+
 def edge_exam_payload(s,exam):
     cfg=get_exam_config(s,exam.id,create=False);security=get_exam_security_policy(s,exam.id,create=False);questions=s.scalars(select(Question).where(Question.exam_id==exam.id).order_by(Question.id)).all();inst=get_institution(s,create=True)
     return {
@@ -2351,7 +2378,8 @@ def question_bank():
             ).distinct()
         ).all() if str(value or '').strip()]
         selected_subject_units.sort(key=lambda value:(int(value) if value.isdigit() else 10**9,value.casefold()))
-    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,selected_subject_units=selected_subject_units,units=units,exams=exams_list,usage=usage,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
+    target_exam_id=request.args.get('target_exam_id',type=int)
+    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,selected_subject_units=selected_subject_units,units=units,exams=exams_list,usage=usage,target_exam_id=target_exam_id,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
 
 @app.route('/admin/question-bank/subjects',methods=['POST'])
 @staff_required
@@ -2722,11 +2750,32 @@ def bank_add_to_exam():
         try:ids.append(int(v))
         except ValueError:pass
     s=DB();exam=s.get(Exam,exam_id)
-    if not exam or not ids:flash('Select an exam and at least one bank question.','error');return redirect(url_for('question_bank'))
-    rows=s.scalars(select(BankQuestion).where(BankQuestion.id.in_(ids),BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))).all();added=0
+    if not exam or not ids:
+        flash('Select an exam and at least one bank question.','error')
+        return redirect(url_for('question_bank'))
+
+    cfg=get_exam_config(s,exam_id,create=False)
+    stmt=select(BankQuestion).where(
+        BankQuestion.id.in_(ids),
+        BankQuestion.status=='approved',
+        BankQuestion.practice_visibility.in_(['official_only','both'])
+    )
+    # If the exam belongs to an existing subject, prevent accidental
+    # cross-subject question mixing. Questions are never copied to any other exam.
+    if cfg and (cfg.subject or '').strip():
+        stmt=stmt.where(BankQuestion.subject==cfg.subject.strip())
+    rows=s.scalars(stmt).all();added=0
     for q in rows:
         if copy_bank_question_to_exam(s,q,exam_id):added+=1
-    audit_event(s,'bank_questions_added_to_exam','exam',exam_id,f'added={added}');s.commit();flash(f'Added {added} approved question(s) to {exam.title}.');return redirect(url_for('questions',exam_id=exam_id))
+
+    pool_count=sync_manual_exam_question_count(s,exam_id)
+    audit_event(s,'bank_questions_added_to_exam','exam',exam_id,f'added={added}, pool={pool_count}, per_student={pool_count}')
+    s.commit()
+    if added:
+        flash(f'Added {added} approved question(s) to {exam.title}. New attempts will receive all {pool_count} question(s) in this exam.')
+    else:
+        flash('No new questions were added. The selected questions may already be in this exam or belong to another subject.','error')
+    return redirect(url_for('questions',exam_id=exam_id))
 
 @app.route('/admin/question-bank/practice-visibility',methods=['POST'])
 @staff_required
@@ -2751,7 +2800,12 @@ def set_question_practice_visibility():
 @app.route('/admin/exams/from-subject',methods=['POST'])
 @staff_required
 def create_exam_for_existing_subject():
-    """Create a separate exam from an existing subject without changing its question bank."""
+    """Create a separate, empty exam under an existing subject.
+
+    Question Bank rows are copied only when the admin explicitly selects them and
+    uses Add Selected to Exam. This keeps multiple exams under one subject fully
+    isolated from each other.
+    """
     s=DB()
     try:
         subject_id=int(request.form.get('subject_id','0'))
@@ -2768,67 +2822,34 @@ def create_exam_for_existing_subject():
         return redirect(url_for('exams'))
 
     selected_unit=(request.form.get('unit') or '').strip()
-    bank_stmt=select(BankQuestion).where(
-        BankQuestion.subject==subject.name,
-        BankQuestion.status=='approved',
-        BankQuestion.practice_visibility.in_(['official_only','both'])
-    )
-    if selected_unit:
-        bank_stmt=bank_stmt.where(BankQuestion.unit==selected_unit)
-    bank_rows=s.scalars(bank_stmt.order_by(BankQuestion.unit,BankQuestion.id)).all()
-    if not bank_rows:
-        unit_text=f' for Unit {selected_unit}' if selected_unit else ''
-        flash(f'No approved official questions are available in {subject.name}{unit_text}.','error')
-        return redirect(url_for('exams'))
-
     try:
         duration=max(1,int(request.form.get('duration','20')))
     except ValueError:
         duration=20
-    try:
-        requested_count=max(1,int(request.form.get('question_count','10')))
-    except ValueError:
-        requested_count=10
-    per_student=min(requested_count,len(bank_rows))
 
     exam=Exam(title=exam_title,duration_minutes=duration,is_active=False,created_at=now_iso())
     s.add(exam);s.flush()
     cfg=get_exam_config(s,exam.id,create=True)
     cfg.subject=subject.name
     cfg.course_semester=subject.course_semester or ''
-    cfg.question_count=per_student
-    cfg.pool_size=len(bank_rows)
-
-    easy=sum(1 for q in bank_rows if canonical_difficulty(q.difficulty)=='Easy')
-    medium=sum(1 for q in bank_rows if canonical_difficulty(q.difficulty)=='Medium')
-    total=max(1,len(bank_rows))
-    cfg.easy_pct=round(easy*100/total)
-    cfg.medium_pct=round(medium*100/total)
-    cfg.hard_pct=max(0,100-cfg.easy_pct-cfg.medium_pct)
-    units=sorted({(q.unit or '').strip() for q in bank_rows if (q.unit or '').strip()})
-    cfg.unit_weights=json.dumps({u:1 for u in units},ensure_ascii=False)
+    cfg.question_count=0
+    cfg.pool_size=0
+    cfg.unit_weights=json.dumps({selected_unit:1},ensure_ascii=False) if selected_unit else ''
     cfg.randomize_questions=True
     cfg.shuffle_options=True
     cfg.require_fullscreen=False
     cfg.tab_switch_limit=3
-    source_label=f'{subject.name} / Unit {selected_unit}' if selected_unit else subject.name
-    cfg.last_generation_summary=f'Created as a separate exam from {source_label}: {len(bank_rows)} approved bank questions; each student receives {per_student}.'
+    cfg.last_generation_summary=f'Manual exam created for {subject.name}' + (f' / Unit {selected_unit}' if selected_unit else '') + '; no questions copied automatically.'
     cfg.updated_at=now_iso()
     get_exam_approval(s,exam.id,create=True)
-
-    for bank_question in bank_rows:
-        copy_bank_question_to_exam(s,bank_question,exam.id)
-
     audit_event(
         s,'catalog_subject_exam_created','exam',exam.id,
-        f'separate_subject_exam=1, subject={subject.name}, unit={selected_unit or "all"}, pool={len(bank_rows)}, per_student={per_student}, title={exam_title}'
+        f'manual_subject_exam=1, subject={subject.name}, unit={selected_unit or "all"}, pool=0, title={exam_title}'
     )
     s.commit()
-    if requested_count>len(bank_rows):
-        flash(f'Created “{exam_title}” under {subject.name}. Only {len(bank_rows)} approved question(s) were available, so each student will receive {per_student}.')
-    else:
-        flash(f'Created “{exam_title}” under {subject.name} with {per_student} question(s) per student.')
-    return redirect(url_for('exam_builder',exam_id=exam.id))
+
+    flash(f'Created “{exam_title}” under {subject.name}. Select only the questions you want and add them to this exam.')
+    return redirect(url_for('question_bank',subject=subject.name,unit=selected_unit,target_exam_id=exam.id)+'#bank-questions')
 
 
 @app.route('/admin/exams',methods=['GET','POST'])
@@ -3129,8 +3150,11 @@ def questions(exam_id):
         if qdef['error']:flash(qdef['error'],'error');return redirect(url_for('questions',exam_id=exam_id))
         try:marks=max(1,int(request.form.get('marks','1')))
         except ValueError:marks=1
-        opts=qdef['options'];q=Question(exam_id=exam_id,question=request.form.get('question','').strip(),option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],question_type=qdef['question_type'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks);s.add(q);s.flush();audit_event(s,'exam_question_added','exam',exam_id,f'question_id={q.id}, type={qdef["question_type"]}');s.commit();flash('Question added.')
-    qs=s.scalars(select(Question).where(Question.exam_id==exam_id).order_by(Question.id)).all();mapped=set(s.scalars(select(ExamBankMap.exam_question_id).where(ExamBankMap.exam_id==exam_id)).all());return render_template('questions.html',exam=exam,questions=qs,mapped=mapped)
+        opts=qdef['options'];q=Question(exam_id=exam_id,question=request.form.get('question','').strip(),option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],question_type=qdef['question_type'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks);s.add(q);s.flush();pool_count=sync_manual_exam_question_count(s,exam_id);audit_event(s,'exam_question_added','exam',exam_id,f'question_id={q.id}, type={qdef["question_type"]}, pool={pool_count}');s.commit();flash(f'Question added. New attempts will receive all {pool_count} question(s) in this exam.')
+    qs=s.scalars(select(Question).where(Question.exam_id==exam_id).order_by(Question.id)).all()
+    cfg=normalize_legacy_manual_subject_exam(s,exam_id,get_exam_config(s,exam_id,create=False))
+    mapped=set(s.scalars(select(ExamBankMap.exam_question_id).where(ExamBankMap.exam_id==exam_id)).all())
+    return render_template('questions.html',exam=exam,questions=qs,mapped=mapped)
 
 @app.route('/admin/exam/<int:exam_id>/import',methods=['POST'])
 @staff_required
@@ -3149,7 +3173,8 @@ def import_questions(exam_id):
         except ValueError:marks=1
         if not (r.get('question') or '').strip():continue
         s.add(Question(exam_id=exam_id,question=r['question'].strip(),option_a=(r.get('option_a') or '').strip(),option_b=(r.get('option_b') or '').strip(),option_c=(r.get('option_c') or '').strip(),option_d=(r.get('option_d') or '').strip(),correct_answer=ans,question_type='single_choice',answer_key=ans,answer_tolerance='',answer_case_sensitive=False,marks=marks));count+=1
-    audit_event(s,'exam_questions_csv_import','exam',exam_id,f'count={count}');s.commit();flash(f'Imported {count} questions.');return redirect(url_for('questions',exam_id=exam_id))
+    pool_count=sync_manual_exam_question_count(s,exam_id)
+    audit_event(s,'exam_questions_csv_import','exam',exam_id,f'count={count}, pool={pool_count}');s.commit();flash(f'Imported {count} questions. New attempts will receive all {pool_count} question(s) in this exam.');return redirect(url_for('questions',exam_id=exam_id))
 
 def result_rows(s,exam_id=None):
     stmt=select(Attempt,Student,Exam).join(Student,Student.id==Attempt.student_id).join(Exam,Exam.id==Attempt.exam_id)
@@ -3911,7 +3936,7 @@ def student_dashboard():
     for e in exams_list:
         allowed,access_label,session_row=exam_access_for_student(s,st.id,e)
         if access_label=='Not assigned to your batch/section':continue
-        pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=get_exam_config(s,e.id);display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
+        pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=normalize_legacy_manual_subject_exam(s,e.id,get_exam_config(s,e.id));display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
         subject,unit_label=student_exam_subject_unit(s,e,cfg)
         rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_grouped_exam_display_title(s,e,subject),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label})())
 
@@ -3933,7 +3958,7 @@ def take_exam(exam_id):
     if not exam:flash('Exam is not active.','error');return redirect(url_for('student_dashboard'))
     allowed,access_label,_session=exam_access_for_student(s,web_session['user_id'],exam)
     if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
-    cfg=get_exam_config(s,exam_id);attempt=get_attempt(s,web_session['user_id'],exam_id)
+    cfg=normalize_legacy_manual_subject_exam(s,exam_id,get_exam_config(s,exam_id));attempt=get_attempt(s,web_session['user_id'],exam_id)
     if attempt and attempt.status=='submitted':return redirect(url_for('submitted',exam_id=exam_id))
     if not attempt:
         qids=list(s.scalars(select(Question.id).where(Question.exam_id==exam_id).order_by(Question.id)).all())
