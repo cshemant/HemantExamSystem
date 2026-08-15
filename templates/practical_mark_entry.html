@@ -1,0 +1,40 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head practical-live-head">
+  <div>
+    <a class="back-link" href="{{ url_for('practical_register_detail',register_id=register.id) }}">← {{ register.title }}</a>
+    <h1>{{ register.subject }}</h1>
+    {% if register.section or register.lab_code %}<p class="muted">{% if register.lab_code %}{{ register.lab_code }}{% endif %}{% if register.lab_code and register.section %} · {% endif %}{% if register.section %}{{ register.section }}{% endif %}</p>{% endif %}
+  </div>
+  <div class="practical-live-progress"><strong>{{ evaluated }}/{{ students|length }}</strong><span>evaluated for this experiment</span></div>
+</div>
+
+<div class="card practical-live-toolbar">
+  <div class="practical-experiment-picker"><label>Current Experiment</label><select id="practical-experiment-select" data-register-url="{{ url_for('practical_mark_entry',register_id=register.id) }}">{% for e in experiments %}<option value="{{ e.id }}" {% if e.id==experiment.id %}selected{% endif %}>{{ e.experiment_no }} · {{ e.title }}</option>{% endfor %}</select></div>
+  <div class="practical-current-experiment"><span class="badge">Experiment {{ experiment.experiment_no }}</span><strong>{{ experiment.title }}</strong><small>Total marks: {{ total_max }}</small></div>
+  <div class="actions practical-live-actions"><input id="practical-student-search" type="search" placeholder="Search roll no / name"><form method="post" action="{{ url_for('practical_mark_all_present',register_id=register.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="experiment_id" value="{{ experiment.id }}"><button class="btn secondary" type="submit">Set All Present</button></form></div>
+</div>
+
+<form method="post" action="{{ url_for('practical_mark_bulk',register_id=register.id) }}" data-practical-entry data-save-url="{{ url_for('practical_mark_save',register_id=register.id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="experiment_id" value="{{ experiment.id }}">
+  <div class="card practical-live-table-card"><div class="table-wrap"><table class="practical-live-table practical-component-table"><thead><tr>
+    <th>#</th><th>Roll No</th><th>Student</th><th>Attendance</th>
+    <th>Attendance / {{ component_maxima.attendance }}</th>
+    <th>Record / {{ component_maxima.record }}</th>
+    <th>Performance / {{ component_maxima.performance }}</th>
+    <th>Viva / {{ component_maxima.viva }}</th>
+    <th>Total / {{ total_max }}</th><th>Save</th>
+  </tr></thead><tbody>
+  {% for st in students %}{% set m=mark_map.get(st.id) %}<tr data-practical-row data-student-search="{{ (st.roll_no ~ ' ' ~ st.name)|lower }}" data-student-id="{{ st.id }}" data-experiment-id="{{ experiment.id }}">
+    <td>{{ loop.index }}<input type="hidden" name="remarks_{{ st.id }}" data-practical-remarks value="{{ m.remarks if m else '' }}"></td><td><strong>{{ st.roll_no }}</strong></td><td class="practical-student-name">{{ st.name }}</td>
+    <td><select name="attendance_{{ st.id }}" data-practical-attendance><option value="" {% if not m or not m.attendance %}selected{% endif %}>—</option><option value="P" {% if m and m.attendance=='P' %}selected{% endif %}>Present</option><option value="A" {% if m and m.attendance=='A' %}selected{% endif %}>Absent</option></select></td>
+    <td><input class="practical-component-input" name="attendance_marks_{{ st.id }}" data-practical-component data-practical-component-key="attendance_marks" type="number" min="0" max="{{ component_maxima.attendance }}" step="0.5" value="{{ m.attendance_marks if m and m.attendance_marks is not none else '' }}" inputmode="decimal"></td>
+    <td><input class="practical-component-input" name="record_marks_{{ st.id }}" data-practical-component data-practical-component-key="record_marks" type="number" min="0" max="{{ component_maxima.record }}" step="0.5" value="{{ m.record_marks if m and m.record_marks is not none else '' }}" inputmode="decimal"></td>
+    <td><input class="practical-component-input" name="performance_marks_{{ st.id }}" data-practical-component data-practical-component-key="performance_marks" type="number" min="0" max="{{ component_maxima.performance }}" step="0.5" value="{{ m.performance_marks if m and m.performance_marks is not none else '' }}" inputmode="decimal"></td>
+    <td><input class="practical-component-input" name="viva_marks_{{ st.id }}" data-practical-component data-practical-component-key="viva_marks" type="number" min="0" max="{{ component_maxima.viva }}" step="0.5" value="{{ m.viva_marks if m and m.viva_marks is not none else '' }}" inputmode="decimal"></td>
+    <td><input class="practical-total-input" data-practical-total type="number" value="{{ m.marks if m and m.marks is not none else '' }}" readonly tabindex="-1"></td>
+    <td><span class="practical-save-state {% if m %}saved{% endif %}" data-practical-status>{% if m %}Saved{% else %}—{% endif %}</span></td>
+  </tr>{% else %}<tr><td colspan="10">No students are available in this register.</td></tr>{% endfor %}
+  </tbody></table></div></div>
+  <div class="practical-sticky-save"><span>Changes autosave while you work. Use Save All as a final checkpoint.</span><button type="submit">Save All</button></div>
+</form>
+{% endblock %}

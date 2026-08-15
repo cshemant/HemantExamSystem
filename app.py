@@ -9,7 +9,7 @@ from flask import Flask, render_template, request, redirect, url_for, session as
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
-from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, UniqueConstraint, Text, select, func, or_, delete, inspect, text, event
+from sqlalchemy import create_engine, String, Integer, Boolean, Float, ForeignKey, UniqueConstraint, Text, select, func, or_, delete, inspect, text, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, scoped_session, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from openpyxl import load_workbook, Workbook
@@ -22,13 +22,14 @@ from enterprise_core import QUESTION_TYPE_LABELS, canonical_question_type, norma
 from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
+from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.11'
+APP_VERSION='2.13'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -484,6 +485,67 @@ class EdgeResultAttempt(Base):
     payload_json:Mapped[str]=mapped_column(Text,nullable=False,default='{}')
 
 
+class PracticalRegister(Base):
+    __tablename__='practical_registers'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    owner_type:Mapped[str]=mapped_column(String,nullable=False)  # admin | faculty
+    owner_id:Mapped[int]=mapped_column(Integer,nullable=False)
+    owner_name:Mapped[str]=mapped_column(String,nullable=False,default='')
+    title:Mapped[str]=mapped_column(String,nullable=False)
+    subject:Mapped[str]=mapped_column(String,nullable=False,default='')
+    lab_code:Mapped[str]=mapped_column(String,nullable=False,default='')
+    section:Mapped[str]=mapped_column(String,nullable=False,default='')
+    academic_year:Mapped[str]=mapped_column(String,nullable=False,default='')
+    default_max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=30)
+    attendance_max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=5)
+    record_max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=5)
+    performance_max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=10)
+    viva_max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=10)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+    updated_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class PracticalStudent(Base):
+    __tablename__='practical_students'
+    __table_args__=(UniqueConstraint('register_id','roll_no'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
+    sequence:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    roll_no:Mapped[str]=mapped_column(String,nullable=False)
+    name:Mapped[str]=mapped_column(String,nullable=False)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class PracticalExperiment(Base):
+    __tablename__='practical_experiments'
+    __table_args__=(UniqueConstraint('register_id','experiment_no'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
+    experiment_no:Mapped[str]=mapped_column(String,nullable=False)
+    title:Mapped[str]=mapped_column(Text,nullable=False)
+    max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=10)
+    sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class PracticalMark(Base):
+    __tablename__='practical_marks'
+    __table_args__=(UniqueConstraint('practical_student_id','practical_experiment_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
+    practical_student_id:Mapped[int]=mapped_column(ForeignKey('practical_students.id'),nullable=False)
+    practical_experiment_id:Mapped[int]=mapped_column(ForeignKey('practical_experiments.id'),nullable=False)
+    attendance:Mapped[str]=mapped_column(String,nullable=False,default='')  # P | A | blank
+    attendance_marks:Mapped[float|None]=mapped_column(Float,nullable=True)
+    record_marks:Mapped[float|None]=mapped_column(Float,nullable=True)
+    performance_marks:Mapped[float|None]=mapped_column(Float,nullable=True)
+    viva_marks:Mapped[float|None]=mapped_column(Float,nullable=True)
+    marks:Mapped[float|None]=mapped_column(Float,nullable=True)  # calculated total / legacy total
+    remarks:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    updated_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+
 def _configure_database_reliability():
     if not DATABASE_URL.startswith('sqlite'):
         return
@@ -536,6 +598,14 @@ def run_schema_upgrades():
         ('faculty_users','mfa_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('audit_logs','prev_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('audit_logs','event_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
+        ('practical_registers','attendance_max_marks','INTEGER NOT NULL DEFAULT 5'),
+        ('practical_registers','record_max_marks','INTEGER NOT NULL DEFAULT 5'),
+        ('practical_registers','performance_max_marks','INTEGER NOT NULL DEFAULT 10'),
+        ('practical_registers','viva_max_marks','INTEGER NOT NULL DEFAULT 10'),
+        ('practical_marks','attendance_marks','FLOAT'),
+        ('practical_marks','record_marks','FLOAT'),
+        ('practical_marks','performance_marks','FLOAT'),
+        ('practical_marks','viva_marks','FLOAT'),
     )
     for table_name,column_name,ddl in upgrades:
         _ensure_column(table_name,column_name,ddl)
@@ -544,6 +614,8 @@ def run_schema_upgrades():
         conn.execute(text("UPDATE questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
         conn.execute(text("UPDATE bank_questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
         conn.execute(text("UPDATE answers SET answer_value=selected_answer WHERE (answer_value IS NULL OR answer_value='') AND selected_answer IS NOT NULL"))
+        conn.execute(text("UPDATE practical_registers SET default_max_marks=attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks"))
+        conn.execute(text("UPDATE practical_experiments SET max_marks=(SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) WHERE EXISTS (SELECT 1 FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id)"))
 
 
 def get_exam_security_policy(s,exam_id,create=False):
@@ -715,6 +787,7 @@ def audit_chain_status(s):
 
 ROLE_LABELS={'super_admin':'Super Admin','exam_controller':'Exam Controller','hod':'HOD','faculty':'Faculty'}
 APPROVER_ROLES={'super_admin','exam_controller','hod'}
+PRACTICAL_ROLES={'super_admin','hod','faculty'}
 FACULTY_DAILY_SELF_APPROVAL_LIMIT=3
 EXAM_CREATION_AUDIT_ACTIONS={
     'exam_created',
@@ -786,6 +859,36 @@ def current_staff_name(s=None):
 def can_approve_exams(s=None): return current_staff_role(s) in APPROVER_ROLES
 
 def can_approve_content(s=None): return current_staff_role(s) in APPROVER_ROLES
+
+
+def current_practical_owner(s=None):
+    """Return the account identity that owns practical registers."""
+    role=web_session.get('role')
+    uid=int(web_session.get('user_id') or 0)
+    if role=='admin':
+        return 'admin',uid,current_staff_name(s)
+    if role=='faculty':
+        return 'faculty',uid,current_staff_name(s)
+    return '',0,''
+
+
+def practical_register_access(s,register_id):
+    row=s.get(PracticalRegister,register_id)
+    if not row:abort(404)
+    if current_staff_role(s)=='super_admin':
+        return row
+    owner_type,owner_id,_=current_practical_owner(s)
+    if row.owner_type!=owner_type or row.owner_id!=owner_id:
+        abort(403)
+    return row
+
+
+def practical_register_stmt(s):
+    stmt=select(PracticalRegister).order_by(PracticalRegister.updated_at.desc(),PracticalRegister.id.desc())
+    if current_staff_role(s)!='super_admin':
+        owner_type,owner_id,_=current_practical_owner(s)
+        stmt=stmt.where(PracticalRegister.owner_type==owner_type,PracticalRegister.owner_id==owner_id)
+    return stmt
 
 def exam_owner_actor(s,exam_id):
     """Return the staff actor that originally created an exam.
@@ -1383,6 +1486,15 @@ def staff_required(fn):
         return fn(*a,**kw)
     return inner
 
+def practical_required(fn):
+    @wraps(fn)
+    def inner(*a,**kw):
+        if web_session.get('role') not in {'admin','faculty'}: return redirect(url_for('home'))
+        s=DB()
+        if current_staff_role(s) not in PRACTICAL_ROLES:abort(403)
+        return fn(*a,**kw)
+    return inner
+
 def student_required(fn):
     @wraps(fn)
     def inner(*a,**kw):
@@ -1742,7 +1854,274 @@ def admin_dashboard():
         'attempts':s.scalar(select(func.count()).select_from(Attempt)) or 0,
         'approved':s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.status=='approved')) or 0
     }
+    if current_staff_role(s) in PRACTICAL_ROLES:
+        stats['practical_registers']=len(s.scalars(practical_register_stmt(s)).all())
+    else:
+        stats['practical_registers']=0
     return render_template('admin_dashboard.html',stats=stats)
+
+def practical_marks_maxima(register):
+    return {
+        'attendance': max(0, int(getattr(register, 'attendance_max_marks', 5) or 0)),
+        'record': max(0, int(getattr(register, 'record_max_marks', 5) or 0)),
+        'performance': max(0, int(getattr(register, 'performance_max_marks', 10) or 0)),
+        'viva': max(0, int(getattr(register, 'viva_max_marks', 10) or 0)),
+    }
+
+
+def practical_total_max(register):
+    return sum(practical_marks_maxima(register).values())
+
+
+def _component_mark(value, label, maximum):
+    if value in {None, ''}:
+        return None
+    try:
+        mark=float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f'{label} marks must be numeric.')
+    if mark < 0 or mark > maximum:
+        raise ValueError(f'{label} marks must be between 0 and {maximum}.')
+    return mark
+
+
+@app.route('/admin/practicals',methods=['GET','POST'])
+@practical_required
+def practical_registers():
+    s=DB();owner_type,owner_id,owner_name=current_practical_owner(s)
+    if request.method=='POST':
+        title=(request.form.get('title') or '').strip();subject=(request.form.get('subject') or '').strip();section=(request.form.get('section') or '').strip();academic_year=(request.form.get('academic_year') or '').strip();lab_code=(request.form.get('lab_code') or '').strip()
+        attendance_max=5;record_max=5;performance_max=10;viva_max=10;default_marks=attendance_max+record_max+performance_max+viva_max
+        if not title:title=subject or 'Practical Register'
+        if not subject:
+            flash('Subject / lab name is required.','error');return redirect(url_for('practical_registers'))
+        row=PracticalRegister(owner_type=owner_type,owner_id=owner_id,owner_name=owner_name,title=title,subject=subject,lab_code=lab_code,section=section,academic_year=academic_year,default_max_marks=default_marks,attendance_max_marks=attendance_max,record_max_marks=record_max,performance_max_marks=performance_max,viva_max_marks=viva_max,created_at=now_iso(),updated_at=now_iso());s.add(row);s.flush()
+        roster=request.files.get('roster_file');added=0
+        if roster and roster.filename:
+            try:
+                imported=parse_roster_bytes(roster.filename,roster.read())
+                for seq,item in enumerate(imported,start=1):
+                    s.add(PracticalStudent(register_id=row.id,sequence=seq,roll_no=item['roll_no'],name=item['name'],created_at=now_iso()));added+=1
+            except ValueError as exc:
+                s.rollback();flash(str(exc),'error');return redirect(url_for('practical_registers'))
+        audit_event(s,'practical_register_created','practical_register',row.id,f'subject={subject}, students={added}');s.commit();flash(f'Practical register created'+(f' with {added} students.' if added else '.'))
+        return redirect(url_for('practical_register_detail',register_id=row.id))
+    rows=s.scalars(practical_register_stmt(s)).all();counts={}
+    for row in rows:
+        counts[row.id]={
+            'students':s.scalar(select(func.count()).select_from(PracticalStudent).where(PracticalStudent.register_id==row.id)) or 0,
+            'experiments':s.scalar(select(func.count()).select_from(PracticalExperiment).where(PracticalExperiment.register_id==row.id)) or 0,
+            'marks':s.scalar(select(func.count()).select_from(PracticalMark).where(PracticalMark.register_id==row.id,PracticalMark.marks.is_not(None))) or 0,
+        }
+    return render_template('practical_registers.html',registers=rows,counts=counts,viewer_role=current_staff_role(s))
+
+
+@app.route('/admin/practicals/<int:register_id>')
+@practical_required
+def practical_register_detail(register_id):
+    s=DB();register=practical_register_access(s,register_id)
+    students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all()
+    experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all()
+    marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();by_student={}
+    for mark in marks:by_student.setdefault(mark.practical_student_id,[]).append(mark)
+    possible=sum(e.max_marks for e in experiments);summary=[]
+    for st in students:
+        student_marks=by_student.get(st.id,[]);scored=sum(float(m.marks or 0) for m in student_marks if m.marks is not None);evaluated=sum(1 for m in student_marks if m.marks is not None or m.attendance=='A')
+        summary.append({'student':st,'scored':round(scored,2),'possible':possible,'evaluated':evaluated,'percent':round(scored*100/possible,1) if possible else 0})
+    return render_template('practical_register_detail.html',register=register,students=students,experiments=experiments,summary=summary,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register))
+
+
+@app.route('/admin/practicals/<int:register_id>/marks-settings',methods=['POST'])
+@practical_required
+def practical_marks_settings(register_id):
+    s=DB();register=practical_register_access(s,register_id)
+    values={}
+    labels=(('attendance','Attendance'),('record','Record'),('performance','Performance'),('viva','Viva'))
+    try:
+        for key,label in labels:
+            raw=(request.form.get(f'{key}_max_marks') or '').strip()
+            value=int(raw)
+            if value < 0 or value > 100:raise ValueError(f'{label} maximum must be between 0 and 100.')
+            values[key]=value
+    except (TypeError,ValueError) as exc:
+        flash(str(exc) if str(exc) else 'Enter valid maximum marks.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
+    total=sum(values.values())
+    if total <= 0:
+        flash('The practical total must be greater than zero.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
+    component_columns=(('attendance',PracticalMark.attendance_marks,'Attendance'),('record',PracticalMark.record_marks,'Record'),('performance',PracticalMark.performance_marks,'Performance'),('viva',PracticalMark.viva_marks,'Viva'))
+    for key,column,label in component_columns:
+        highest=s.scalar(select(func.max(column)).where(PracticalMark.register_id==register.id))
+        if highest is not None and float(highest)>values[key]:
+            flash(f'{label} maximum cannot be reduced below an existing mark of {highest:g}.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
+    register.attendance_max_marks=values['attendance'];register.record_max_marks=values['record'];register.performance_max_marks=values['performance'];register.viva_max_marks=values['viva'];register.default_max_marks=total;register.updated_at=now_iso()
+    experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()
+    for experiment in experiments:experiment.max_marks=total
+    audit_event(s,'practical_marks_settings_updated','practical_register',register.id,f"attendance={values['attendance']}, record={values['record']}, performance={values['performance']}, viva={values['viva']}, total={total}")
+    s.commit();flash(f'Practical marks distribution updated. Total: {total}.')
+    return redirect(url_for('practical_register_detail',register_id=register.id))
+
+
+@app.route('/admin/practicals/<int:register_id>/students/import',methods=['POST'])
+@practical_required
+def practical_students_import(register_id):
+    s=DB();register=practical_register_access(s,register_id);upload=request.files.get('roster_file')
+    if not upload or not upload.filename:flash('Choose a CSV or Excel student sheet.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
+    try:rows=parse_roster_bytes(upload.filename,upload.read())
+    except ValueError as exc:flash(str(exc),'error');return redirect(url_for('practical_register_detail',register_id=register.id))
+    existing={x.roll_no.casefold():x for x in s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id)).all()};added=updated=0;seq=max([x.sequence for x in existing.values()] or [0])
+    for item in rows:
+        key=item['roll_no'].casefold();current=existing.get(key)
+        if current:
+            if current.name!=item['name']:current.name=item['name'];updated+=1
+        else:
+            seq+=1;s.add(PracticalStudent(register_id=register.id,sequence=seq,roll_no=item['roll_no'],name=item['name'],created_at=now_iso()));added+=1
+    register.updated_at=now_iso();audit_event(s,'practical_students_imported','practical_register',register.id,f'added={added}, updated={updated}');s.commit();flash(f'Student sheet processed: {added} added, {updated} updated.');return redirect(url_for('practical_register_detail',register_id=register.id))
+
+
+@app.route('/admin/practicals/<int:register_id>/experiments/import',methods=['POST'])
+@practical_required
+def practical_experiments_import(register_id):
+    s=DB();register=practical_register_access(s,register_id);upload=request.files.get('experiment_file');pasted=(request.form.get('experiment_text') or '').strip()
+    try:
+        if upload and upload.filename:rows=parse_experiment_bytes(upload.filename,upload.read(),register.default_max_marks)
+        elif pasted:rows=parse_experiment_text(pasted,register.default_max_marks)
+        else:raise ValueError('Upload an experiment file or paste an experiment list.')
+    except ValueError as exc:flash(str(exc),'error');return redirect(url_for('practical_register_detail',register_id=register.id))
+    existing={x.experiment_no.casefold():x for x in s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()};added=updated=0;order=max([x.sort_order for x in existing.values()] or [0])
+    for item in rows:
+        key=item['experiment_no'].casefold();current=existing.get(key)
+        total_max=practical_total_max(register)
+        if current:
+            current.title=item['title'];current.max_marks=total_max;updated+=1
+        else:
+            order+=1;s.add(PracticalExperiment(register_id=register.id,experiment_no=item['experiment_no'],title=item['title'],max_marks=total_max,sort_order=order,created_at=now_iso()));added+=1
+    register.updated_at=now_iso();audit_event(s,'practical_experiments_imported','practical_register',register.id,f'added={added}, updated={updated}');s.commit();flash(f'Experiment list processed: {added} added, {updated} updated.');return redirect(url_for('practical_register_detail',register_id=register.id))
+
+
+@app.route('/admin/practicals/<int:register_id>/mark-entry')
+@practical_required
+def practical_mark_entry(register_id):
+    s=DB();register=practical_register_access(s,register_id);experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all()
+    if not experiments:
+        flash('Upload the experiment list before entering marks.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
+    experiment_id=request.args.get('experiment_id',type=int) or experiments[0].id;experiment=next((x for x in experiments if x.id==experiment_id),experiments[0]);marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id,PracticalMark.practical_experiment_id==experiment.id)).all();mark_map={m.practical_student_id:m for m in marks};evaluated=sum(1 for m in marks if m.marks is not None or m.attendance=='A')
+    return render_template('practical_mark_entry.html',register=register,students=students,experiments=experiments,experiment=experiment,mark_map=mark_map,evaluated=evaluated,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register))
+
+
+def _save_practical_mark(s,register,student_id,experiment_id,attendance,attendance_marks_value='',record_marks_value='',performance_marks_value='',viva_marks_value='',remarks=''):
+    student=s.get(PracticalStudent,student_id);experiment=s.get(PracticalExperiment,experiment_id)
+    if not student or not experiment or student.register_id!=register.id or experiment.register_id!=register.id:raise ValueError('Student/experiment does not belong to this practical register.')
+    attendance=(attendance or '').strip().upper()
+    if attendance not in {'','P','A'}:attendance=''
+    maxima=practical_marks_maxima(register)
+    component_values={
+        'attendance': _component_mark(attendance_marks_value,'Attendance',maxima['attendance']),
+        'record': _component_mark(record_marks_value,'Record',maxima['record']),
+        'performance': _component_mark(performance_marks_value,'Performance',maxima['performance']),
+        'viva': _component_mark(viva_marks_value,'Viva',maxima['viva']),
+    }
+    has_component=any(value is not None for value in component_values.values())
+    if has_component and not attendance:attendance='P'
+    if attendance=='A':
+        component_values={key:None for key in component_values}
+    row=s.scalar(select(PracticalMark).where(PracticalMark.practical_student_id==student.id,PracticalMark.practical_experiment_id==experiment.id))
+    legacy_total=(row.marks if row and row.marks is not None and all(getattr(row,name,None) is None for name in ('attendance_marks','record_marks','performance_marks','viva_marks')) else None)
+    total=(sum(value or 0 for value in component_values.values()) if has_component else legacy_total)
+    if attendance=='A':total=None
+    if not row:
+        row=PracticalMark(register_id=register.id,practical_student_id=student.id,practical_experiment_id=experiment.id,attendance=attendance,attendance_marks=component_values['attendance'],record_marks=component_values['record'],performance_marks=component_values['performance'],viva_marks=component_values['viva'],marks=total,remarks=(remarks or '').strip()[:500],updated_by=actor_label(s),updated_at=now_iso());s.add(row)
+    else:
+        row.attendance=attendance;row.attendance_marks=component_values['attendance'];row.record_marks=component_values['record'];row.performance_marks=component_values['performance'];row.viva_marks=component_values['viva'];row.marks=total;row.remarks=(remarks or '').strip()[:500];row.updated_by=actor_label(s);row.updated_at=now_iso()
+    experiment.max_marks=practical_total_max(register)
+    return row
+
+
+@app.route('/admin/practicals/<int:register_id>/marks/save',methods=['POST'])
+@practical_required
+def practical_mark_save(register_id):
+    s=DB();register=practical_register_access(s,register_id);payload=request.get_json(silent=True) or request.form
+    try:
+        student_id=int(payload.get('student_id') or 0);experiment_id=int(payload.get('experiment_id') or 0)
+        row=_save_practical_mark(s,register,student_id,experiment_id,payload.get('attendance',''),payload.get('attendance_marks',''),payload.get('record_marks',''),payload.get('performance_marks',''),payload.get('viva_marks',''),payload.get('remarks',''));register.updated_at=now_iso();s.commit()
+        return jsonify(ok=True,attendance=row.attendance,attendance_marks=row.attendance_marks,record_marks=row.record_marks,performance_marks=row.performance_marks,viva_marks=row.viva_marks,total=row.marks,updated_at=row.updated_at)
+    except ValueError as exc:s.rollback();return jsonify(ok=False,error=str(exc)),400
+
+
+@app.route('/admin/practicals/<int:register_id>/marks/bulk',methods=['POST'])
+@practical_required
+def practical_mark_bulk(register_id):
+    s=DB();register=practical_register_access(s,register_id)
+    try:experiment_id=int(request.form.get('experiment_id') or 0)
+    except ValueError:experiment_id=0
+    students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id)).all();errors=[];saved=0
+    for st in students:
+        attendance=request.form.get(f'attendance_{st.id}','');attendance_marks=request.form.get(f'attendance_marks_{st.id}','');record_marks=request.form.get(f'record_marks_{st.id}','');performance_marks=request.form.get(f'performance_marks_{st.id}','');viva_marks=request.form.get(f'viva_marks_{st.id}','');remarks=request.form.get(f'remarks_{st.id}','')
+        if attendance or attendance_marks or record_marks or performance_marks or viva_marks or remarks:
+            try:_save_practical_mark(s,register,st.id,experiment_id,attendance,attendance_marks,record_marks,performance_marks,viva_marks,remarks);saved+=1
+            except ValueError as exc:errors.append(f'{st.roll_no}: {exc}')
+    if errors:s.rollback();flash(' '.join(errors[:5]),'error')
+    else:register.updated_at=now_iso();audit_event(s,'practical_marks_bulk_saved','practical_register',register.id,f'experiment={experiment_id}, rows={saved}');s.commit();flash(f'Saved {saved} practical mark row(s).')
+    return redirect(url_for('practical_mark_entry',register_id=register.id,experiment_id=experiment_id))
+
+
+@app.route('/admin/practicals/<int:register_id>/marks/all-present',methods=['POST'])
+@practical_required
+def practical_mark_all_present(register_id):
+    s=DB();register=practical_register_access(s,register_id)
+    try:experiment_id=int(request.form.get('experiment_id') or 0)
+    except ValueError:experiment_id=0
+    experiment=s.get(PracticalExperiment,experiment_id)
+    if not experiment or experiment.register_id!=register.id:abort(404)
+    students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id)).all()
+    for st in students:
+        existing=s.scalar(select(PracticalMark).where(PracticalMark.practical_student_id==st.id,PracticalMark.practical_experiment_id==experiment.id))
+        if not existing:s.add(PracticalMark(register_id=register.id,practical_student_id=st.id,practical_experiment_id=experiment.id,attendance='P',marks=None,remarks='',updated_by=actor_label(s),updated_at=now_iso()))
+        elif existing.attendance!='A':existing.attendance='P';existing.updated_by=actor_label(s);existing.updated_at=now_iso()
+    register.updated_at=now_iso();s.commit();flash('All unmarked students set to Present.');return redirect(url_for('practical_mark_entry',register_id=register.id,experiment_id=experiment.id))
+
+
+@app.route('/admin/practicals/<int:register_id>/template/<kind>/<fmt>')
+@practical_required
+def practical_template(register_id,kind,fmt):
+    s=DB();register=practical_register_access(s,register_id)
+    if kind=='students':headers=['roll_no','name'];example=['2024/17008','Student Name'];base='practical_student_roster'
+    elif kind=='experiments':headers=['experiment_no','title'];example=['1','Installation of Android Studio'];base='practical_experiment_list'
+    else:abort(404)
+    if fmt=='csv':
+        out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerow(example);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{base}.csv')
+    if fmt=='xlsx':
+        wb=Workbook();ws=wb.active;ws.title='Students' if kind=='students' else 'Experiments';ws.append(headers);ws.append(example)
+        for cell in ws[1]:cell.font=Font(bold=True)
+        ws.column_dimensions['A'].width=20;ws.column_dimensions['B'].width=70 if kind=='experiments' else 34
+        data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{base}.xlsx')
+    abort(404)
+
+
+@app.route('/admin/practicals/<int:register_id>/export/<fmt>')
+@practical_required
+def practical_export(register_id,fmt):
+    s=DB();register=practical_register_access(s,register_id);students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all();experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();mark_map={(m.practical_student_id,m.practical_experiment_id):m for m in marks};headers=['S.No','Roll No','Student Name']+[e.experiment_no for e in experiments]+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
+    for idx,st in enumerate(students,start=1):
+        cells=[];total=0.0
+        for e in experiments:
+            m=mark_map.get((st.id,e.id))
+            if not m:cells.append('')
+            elif m.attendance=='A':cells.append('A')
+            elif m.marks is None:cells.append('P')
+            else:cells.append(m.marks);total+=float(m.marks)
+        matrix.append([idx,st.roll_no,st.name]+cells+[round(total,2),possible,round(total*100/possible,1) if possible else 0])
+    safe=''.join(ch if ch.isalnum() else '_' for ch in register.title).strip('_')[:60] or 'practical_marks'
+    if fmt=='csv':
+        out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{safe}.csv')
+    if fmt=='xlsx':
+        wb=Workbook();ws=wb.active;ws.title='Practical Marks';ws.append([register.title]);ws.append([f'Subject: {register.subject}',f'Section: {register.section}',f'Academic Year: {register.academic_year}']);ws.append(headers)
+        for row in matrix:ws.append(row)
+        for cell in ws[3]:cell.font=Font(bold=True)
+        ws.freeze_panes='D4';ws.column_dimensions['A'].width=8;ws.column_dimensions['B'].width=18;ws.column_dimensions['C'].width=30
+        for col in range(4,4+len(experiments)):ws.column_dimensions[ws.cell(3,col).column_letter].width=11
+        data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{safe}.xlsx')
+    abort(404)
+
 
 @app.route('/admin/students',methods=['GET','POST'])
 @staff_required

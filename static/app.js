@@ -359,3 +359,67 @@ function initPracticeTimer(){
   form.addEventListener('submit',()=>{submitted=true;});tick();
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initPracticeTimer); else initPracticeTimer();
+
+function initPracticalMarks(){
+  const form=document.querySelector('[data-practical-entry]');
+  const experimentSelect=document.getElementById('practical-experiment-select');
+  if(experimentSelect){
+    experimentSelect.addEventListener('change',()=>{
+      const base=experimentSelect.getAttribute('data-register-url');
+      window.location=`${base}?experiment_id=${encodeURIComponent(experimentSelect.value)}`;
+    });
+  }
+  const search=document.getElementById('practical-student-search');
+  if(search){search.addEventListener('input',()=>{const q=(search.value||'').trim().toLowerCase();document.querySelectorAll('[data-practical-row]').forEach(row=>{row.hidden=Boolean(q)&&!(row.getAttribute('data-student-search')||'').includes(q);});});}
+  if(!form)return;
+  const endpoint=form.getAttribute('data-save-url');
+  const rows=[...form.querySelectorAll('[data-practical-row]')];
+  const components=row=>[...row.querySelectorAll('[data-practical-component]')];
+  const updateTotal=row=>{
+    const total=row.querySelector('[data-practical-total]');if(!total)return;
+    const inputs=components(row);const hasValue=inputs.some(input=>input.value!=='');
+    if(!hasValue){return;}
+    const sum=inputs.reduce((acc,input)=>acc+(Number.parseFloat(input.value)||0),0);
+    total.value=Number.isInteger(sum)?String(sum):sum.toFixed(1).replace(/\.0$/,'');
+  };
+  const saveRow=async(row)=>{
+    const attendance=row.querySelector('[data-practical-attendance]');const remarks=row.querySelector('[data-practical-remarks]');const state=row.querySelector('[data-practical-status]');const inputs=components(row);
+    if(!attendance||!state)return;
+    const payload={student_id:Number(row.getAttribute('data-student-id')),experiment_id:Number(row.getAttribute('data-experiment-id')),attendance:attendance.value,remarks:remarks?remarks.value:''};
+    inputs.forEach(input=>{payload[input.getAttribute('data-practical-component-key')]=input.value;});
+    state.textContent='Saving…';state.className='practical-save-state saving';
+    try{
+      const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify(payload)});
+      const data=await res.json();if(!res.ok||!data.ok)throw new Error(data.error||'Save failed');
+      const total=row.querySelector('[data-practical-total]');if(total)total.value=(data.total===null||data.total===undefined)?'':data.total;
+      state.textContent='Saved';state.className='practical-save-state saved';
+    }catch(err){state.textContent='Retry';state.title=err.message||'Save failed';state.className='practical-save-state error';}
+  };
+  rows.forEach((row,index)=>{
+    const attendance=row.querySelector('[data-practical-attendance]');const inputs=components(row);
+    const syncAttendance=()=>{
+      if(attendance.value==='A'){
+        inputs.forEach(input=>{input.value='';input.disabled=true;});const total=row.querySelector('[data-practical-total]');if(total)total.value='';
+      }else{
+        inputs.forEach(input=>{input.disabled=false;});
+      }
+      if(inputs.some(input=>input.value!=='')&&!attendance.value)attendance.value='P';
+      updateTotal(row);
+    };
+    syncAttendance();
+    attendance.addEventListener('change',()=>{syncAttendance();saveRow(row);});
+    inputs.forEach(input=>{
+      input.addEventListener('input',()=>{syncAttendance();updateTotal(row);});
+      input.addEventListener('change',()=>{syncAttendance();saveRow(row);});
+      input.addEventListener('keydown',event=>{
+        if(event.key==='Enter'){
+          event.preventDefault();saveRow(row);
+          const key=input.getAttribute('data-practical-component-key');
+          const next=rows.slice(index+1).find(r=>!r.hidden);const nextInput=next&&next.querySelector(`[data-practical-component-key="${key}"]`);
+          if(nextInput&&!nextInput.disabled){nextInput.focus();nextInput.select();}
+        }
+      });
+    });
+  });
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initPracticalMarks); else initPracticalMarks();

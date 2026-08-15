@@ -1,4 +1,4 @@
-"""One-click Windows launcher for Learn with Hemant Offline Exam V2.02.
+"""One-click Windows launcher for Learn with Hemant Offline Exam V2.10.
 
 This file is compiled into a single executable for distribution. The executable
 stores mutable data outside the application bundle so upgrades do not overwrite
@@ -15,7 +15,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-APP_VERSION = "2.02"
+APP_VERSION = "2.10"
 DEFAULT_PORT = 8080
 
 

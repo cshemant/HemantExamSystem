@@ -22,6 +22,7 @@
           <span class="nav-dropdown-label">Academic</span>
           <a href="{{ url_for('students') }}">Students</a>
           <a href="{{ url_for('academic_groups') }}">Batches &amp; Sections</a>
+          <a href="{{ url_for('practical_registers') }}">Practical Marks</a>
           <a href="{{ url_for('question_bank') }}">Question Bank</a>
         </div>
         <div class="nav-dropdown-section">
@@ -43,6 +44,7 @@
     {% else %}
     <a href="{{ url_for('students') }}">Students</a>
     <a href="{{ url_for('academic_groups') }}">Batches</a>
+    {% if staff_role in ['faculty','hod'] %}<a href="{{ url_for('practical_registers') }}">Practical Marks</a>{% endif %}
     <a href="{{ url_for('question_bank') }}">Question Bank</a>
     <a href="{{ url_for('exams') }}">Exams</a>
     <a href="{{ url_for('results') }}">Results</a>
@@ -78,13 +80,13 @@
         <a href="{{ url_for('admin_dashboard') }}">Dashboard</a>
         {% if staff_role == 'super_admin' %}
           <span class="mobile-menu-section-label">Academic</span>
-          <a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches &amp; Sections</a><a href="{{ url_for('question_bank') }}">Question Bank</a>
+          <a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches &amp; Sections</a><a href="{{ url_for('practical_registers') }}">Practical Marks</a><a href="{{ url_for('question_bank') }}">Question Bank</a>
           <span class="mobile-menu-section-label">Examinations</span>
           <a href="{{ url_for('exams') }}">Exams</a><a href="{{ url_for('results') }}">Results</a><a href="{{ url_for('analytics') }}">Analytics</a><a href="{{ url_for('exam_centre') }}">Exam Centre</a><a href="{{ url_for('edge_results_reconciliation') }}">Edge Results</a>
           <span class="mobile-menu-section-label">Administration</span>
           <a href="{{ url_for('staff_mfa_settings') }}">Security</a><a href="{{ url_for('faculty_users') }}">Staff</a><a href="{{ url_for('system_tools') }}">System</a>
         {% else %}
-          <a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches &amp; Sections</a><a href="{{ url_for('question_bank') }}">Question Bank</a><a href="{{ url_for('exams') }}">Exams</a><a href="{{ url_for('results') }}">Results</a><a href="{{ url_for('analytics') }}">Analytics</a><a href="{{ url_for('exam_centre') }}">Exam Centre</a><a href="{{ url_for('edge_results_reconciliation') }}">Edge Results</a><a href="{{ url_for('staff_mfa_settings') }}">Security</a>{% if staff_role == 'hod' %}<a href="{{ url_for('faculty_users') }}">Staff</a>{% endif %}
+          <a href="{{ url_for('students') }}">Students</a><a href="{{ url_for('academic_groups') }}">Batches &amp; Sections</a>{% if staff_role in ['faculty','hod'] %}<a href="{{ url_for('practical_registers') }}">Practical Marks</a>{% endif %}<a href="{{ url_for('question_bank') }}">Question Bank</a><a href="{{ url_for('exams') }}">Exams</a><a href="{{ url_for('results') }}">Results</a><a href="{{ url_for('analytics') }}">Analytics</a><a href="{{ url_for('exam_centre') }}">Exam Centre</a><a href="{{ url_for('edge_results_reconciliation') }}">Edge Results</a><a href="{{ url_for('staff_mfa_settings') }}">Security</a>{% if staff_role == 'hod' %}<a href="{{ url_for('faculty_users') }}">Staff</a>{% endif %}
         {% endif %}
       {% elif web_session.get('role') == 'student' %}<a href="{{ url_for('student_dashboard') }}">My Exams</a><a href="{{ url_for('practice_centre') }}">Practice Centre</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}{% endif %}
       <a class="mobile-logout" href="{{ url_for('logout') }}">Logout</a>

@@ -1,0 +1,34 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head practical-page-head"><div><h1>Practical Marks</h1><p class="muted">Your live lab registers and practical evaluation records.</p></div></div>
+
+<div class="card practical-create-card">
+  <h2>Create Practical Register</h2>
+  <form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="grid practical-register-form">
+      <div><label>Register Title</label><input name="title" placeholder="MAD Lab · Section A"></div>
+      <div><label>Subject / Lab Name</label><input name="subject" placeholder="Mobile Application Development Lab" required></div>
+      <div><label>Lab Code</label><input name="lab_code" placeholder="Optional"></div>
+      <div><label>Section / Batch</label><input name="section" placeholder="5th Sem · Section A"></div>
+      <div><label>Academic Year</label><input name="academic_year" placeholder="2026-27"></div>
+    </div>
+    <div class="practical-roster-upload">
+      <div><label>Student Excel / CSV <span class="muted">(optional now; can be uploaded later)</span></label><input type="file" name="roster_file" accept=".xlsx,.csv"></div>
+      <button type="submit">Create Register</button>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>My Practical Registers</h2>
+  <div class="table-wrap"><table>
+    <tr><th>Register</th>{% if viewer_role=='super_admin' %}<th>Owner</th>{% endif %}<th>Students</th><th>Experiments</th><th>Marks Entered</th><th>Updated</th><th>Action</th></tr>
+    {% for r in registers %}{% set c=counts.get(r.id,{}) %}<tr>
+      <td><strong>{{ r.title }}</strong><div class="muted small-text">{{ r.subject }}{% if r.section %} · {{ r.section }}{% endif %}{% if r.academic_year %} · {{ r.academic_year }}{% endif %}</div></td>
+      {% if viewer_role=='super_admin' %}<td>{{ r.owner_name or '-' }}</td>{% endif %}
+      <td>{{ c.get('students',0) }}</td><td>{{ c.get('experiments',0) }}</td><td>{{ c.get('marks',0) }}</td><td>{{ r.updated_at|dt }}</td>
+      <td><a class="btn small" href="{{ url_for('practical_register_detail',register_id=r.id) }}">Open Register</a></td>
+    </tr>{% else %}<tr><td colspan="{{ 7 if viewer_role=='super_admin' else 6 }}">No practical register has been created yet.</td></tr>{% endfor %}
+  </table></div>
+</div>
+{% endblock %}
