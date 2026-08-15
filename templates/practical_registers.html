@@ -27,7 +27,7 @@
       <td><strong>{{ r.title }}</strong><div class="muted small-text">{{ r.subject }}{% if r.section %} · {{ r.section }}{% endif %}{% if r.academic_year %} · {{ r.academic_year }}{% endif %}</div></td>
       {% if viewer_role=='super_admin' %}<td>{{ r.owner_name or '-' }}</td>{% endif %}
       <td>{{ c.get('students',0) }}</td><td>{{ c.get('experiments',0) }}</td><td>{{ c.get('marks',0) }}</td><td>{{ r.updated_at|dt }}</td>
-      <td><a class="btn small" href="{{ url_for('practical_register_detail',register_id=r.id) }}">Open Register</a></td>
+      <td><div class="actions"><a class="btn small" href="{{ url_for('practical_register_detail',register_id=r.id) }}">Open Register</a><form method="post" action="{{ url_for('delete_practical_register',register_id=r.id) }}" onsubmit="return confirm('Delete this entire practical section? This will permanently delete its students, experiments, marks and related practical data. This action cannot be undone.');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="btn small danger">Delete</button></form></div></td>
     </tr>{% else %}<tr><td colspan="{{ 7 if viewer_role=='super_admin' else 6 }}">No practical register has been created yet.</td></tr>{% endfor %}
   </table></div>
 </div>

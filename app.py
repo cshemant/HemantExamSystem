@@ -1943,6 +1943,28 @@ def practical_registers():
     return render_template('practical_registers.html',registers=rows,counts=counts,viewer_role=current_staff_role(s))
 
 
+@app.route('/admin/practicals/<int:register_id>/delete',methods=['POST'])
+@practical_required
+def delete_practical_register(register_id):
+    s=DB();register=practical_register_access(s,register_id)
+    label=register.title or register.section or register.subject or f'Practical Register {register.id}'
+    student_count=s.scalar(select(func.count()).select_from(PracticalStudent).where(PracticalStudent.register_id==register.id)) or 0
+    experiment_count=s.scalar(select(func.count()).select_from(PracticalExperiment).where(PracticalExperiment.register_id==register.id)) or 0
+    mark_count=s.scalar(select(func.count()).select_from(PracticalMark).where(PracticalMark.register_id==register.id)) or 0
+    audit_event(
+        s,'practical_register_deleted','practical_register',register.id,
+        f'title={label}, students={student_count}, experiments={experiment_count}, mark_rows={mark_count}'
+    )
+    # Delete dependent practical data explicitly so this works consistently on
+    # both PostgreSQL production databases and SQLite/LAN deployments.
+    s.execute(delete(PracticalMark).where(PracticalMark.register_id==register.id))
+    s.execute(delete(PracticalStudent).where(PracticalStudent.register_id==register.id))
+    s.execute(delete(PracticalExperiment).where(PracticalExperiment.register_id==register.id))
+    s.delete(register);s.commit()
+    flash(f'{label} and all of its practical data were deleted.')
+    return redirect(url_for('practical_registers'))
+
+
 @app.route('/admin/practicals/<int:register_id>')
 @practical_required
 def practical_register_detail(register_id):
