@@ -1513,19 +1513,23 @@ def approver_required(fn):
 def get_attempt(s,student_id,exam_id): return s.scalar(select(Attempt).where(Attempt.student_id==student_id,Attempt.exam_id==exam_id))
 
 def student_exam_display_title(s, exam):
-    """Return a clean student-facing title and distinguish duplicate Ready Exams as Part 1, Part 2, etc."""
+    """Return the exam title without collapsing it into the subject heading.
+
+    Ready Exams keep their explicit title so a subject heading such as
+    ``Artificial Intelligence`` is visually distinct from the exam row
+    ``Artificial Intelligence - Ready Exam``. Duplicate titles are still
+    distinguished with a Part number.
+    """
     raw=(exam.title or '').strip()
-    suffix=' - Ready Exam'
-    if not raw.endswith(suffix):
-        return raw
-    base=raw[:-len(suffix)].strip()
+    if not raw:
+        return 'Exam'
     siblings=s.scalars(select(Exam).where(Exam.title==raw).order_by(Exam.id.asc())).all()
     if len(siblings)<=1:
-        return base
+        return raw
     for idx,row in enumerate(siblings,1):
         if row.id==exam.id:
-            return f"{base} - Part {idx}"
-    return base
+            return f"{raw} - Part {idx}"
+    return raw
 
 def result_performance(score,total_marks):
     total=total_marks or 0
@@ -2392,7 +2396,7 @@ def create_exam_from_catalog_subject(subject_id):
         per_student=10
     per_student=min(per_student,len(bank_rows))
 
-    exam=Exam(title=subject.name,duration_minutes=duration,is_active=False,created_at=now_iso())
+    exam=Exam(title=f"{subject.name} - Ready Exam",duration_minutes=duration,is_active=False,created_at=now_iso())
     s.add(exam); s.flush()
     cfg=get_exam_config(s,exam.id,create=True)
     cfg.subject=subject.name
@@ -3702,10 +3706,10 @@ def toggle_practice_bookmark(bank_question_id):
 def student_exam_subject_unit(s, exam, cfg):
     """Return stable subject/unit labels for the student exam dashboard.
 
-    Prefer ExamConfig metadata, then fall back to the mapped Question Bank rows.
+    Prefer the mapped Question Bank subject, then fall back to ExamConfig metadata.
     No schema change is required, so older production exams remain compatible.
     """
-    subject=((cfg.subject if cfg else '') or '').strip()
+    configured_subject=((cfg.subject if cfg else '') or '').strip()
     mapped=s.execute(
         select(BankQuestion.subject,BankQuestion.unit)
         .join(ExamBankMap,ExamBankMap.bank_question_id==BankQuestion.id)
@@ -3713,8 +3717,18 @@ def student_exam_subject_unit(s, exam, cfg):
     ).all()
     mapped_subjects=sorted({(row[0] or '').strip() for row in mapped if (row[0] or '').strip()},key=str.casefold)
     mapped_units=sorted({(row[1] or '').strip() for row in mapped if (row[1] or '').strip()},key=lambda value:(int(value) if str(value).isdigit() else 10**9,str(value).casefold()))
-    if not subject and mapped_subjects:
-        subject=mapped_subjects[0] if len(mapped_subjects)==1 else 'General'
+
+    # The mapped Question Bank is the strongest source of truth for a Ready
+    # Exam. This prevents an exam from being placed under a title-like or stale
+    # ExamConfig subject when all of its questions belong to one real subject.
+    if len(mapped_subjects)==1:
+        subject=mapped_subjects[0]
+    elif configured_subject:
+        subject=configured_subject
+    elif len(mapped_subjects)>1:
+        subject='Mixed Subjects'
+    else:
+        subject=''
 
     units=list(mapped_units)
     if not units and cfg and cfg.unit_weights:
@@ -3735,7 +3749,7 @@ def student_exam_subject_unit(s, exam, cfg):
         unit_label='General'
 
     if not subject:
-        subject=student_exam_display_title(s,exam) or 'General'
+        subject='General'
     return subject,unit_label
 
 def student_exam_unit_sort_key(label):
