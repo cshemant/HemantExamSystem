@@ -398,13 +398,21 @@ function initPracticalMarks(){
   rows.forEach((row,index)=>{
     const attendance=row.querySelector('[data-practical-attendance]');const inputs=components(row);
     const syncAttendance=()=>{
+      const attendanceInput=row.querySelector('[data-practical-component-key="attendance_marks"]');
+      const gradedInputs=inputs.filter(input=>input!==attendanceInput);
+      const attendanceMax=attendanceInput?Number.parseFloat(attendanceInput.max||'0')||0:0;
       if(attendance.value==='A'){
-        inputs.forEach(input=>{input.value='';input.disabled=true;});const total=row.querySelector('[data-practical-total]');if(total)total.value='';
+        if(attendanceInput){attendanceInput.disabled=false;attendanceInput.value='0';}
+        gradedInputs.forEach(input=>{input.value='';input.disabled=true;});
+        const total=row.querySelector('[data-practical-total]');if(total)total.value='0';
       }else{
-        inputs.forEach(input=>{input.disabled=false;});
+        gradedInputs.forEach(input=>{input.disabled=false;});
+        if(attendanceInput)attendanceInput.disabled=false;
+        if(!attendance.value&&gradedInputs.some(input=>input.value!==''))attendance.value='P';
+        if(attendance.value==='P'&&attendanceInput)attendanceInput.value=String(attendanceMax);
+        else if(!attendance.value&&attendanceInput)attendanceInput.value='';
+        updateTotal(row);
       }
-      if(inputs.some(input=>input.value!=='')&&!attendance.value)attendance.value='P';
-      updateTotal(row);
     };
     syncAttendance();
     attendance.addEventListener('change',()=>{syncAttendance();saveRow(row);});

@@ -2075,14 +2075,21 @@ def _save_practical_mark(s,register,student_id,experiment_id,attendance,attendan
         'performance': _component_mark(performance_marks_value,'Performance',maxima['performance']),
         'viva': _component_mark(viva_marks_value,'Viva',maxima['viva']),
     }
+    # Attendance marks follow the attendance status automatically. The configured
+    # Attendance Max is awarded for Present; Absent receives zero for the practical.
+    # Untouched rows (no attendance and no component marks) remain blank.
+    non_attendance_component=any(component_values[key] is not None for key in ('record','performance','viva'))
+    if not attendance and non_attendance_component:
+        attendance='P'
+    if attendance=='P':
+        component_values['attendance']=float(maxima['attendance'])
+    elif attendance=='A':
+        component_values={'attendance':0.0,'record':None,'performance':None,'viva':None}
     has_component=any(value is not None for value in component_values.values())
-    if has_component and not attendance:attendance='P'
-    if attendance=='A':
-        component_values={key:None for key in component_values}
     row=s.scalar(select(PracticalMark).where(PracticalMark.practical_student_id==student.id,PracticalMark.practical_experiment_id==experiment.id))
     legacy_total=(row.marks if row and row.marks is not None and all(getattr(row,name,None) is None for name in ('attendance_marks','record_marks','performance_marks','viva_marks')) else None)
     total=(sum(value or 0 for value in component_values.values()) if has_component else legacy_total)
-    if attendance=='A':total=None
+    if attendance=='A':total=0.0
     if not row:
         row=PracticalMark(register_id=register.id,practical_student_id=student.id,practical_experiment_id=experiment.id,attendance=attendance,attendance_marks=component_values['attendance'],record_marks=component_values['record'],performance_marks=component_values['performance'],viva_marks=component_values['viva'],marks=total,remarks=(remarks or '').strip()[:500],updated_by=actor_label(s),updated_at=now_iso());s.add(row)
     else:
@@ -2127,11 +2134,18 @@ def practical_mark_all_present(register_id):
     except ValueError:experiment_id=0
     experiment=s.get(PracticalExperiment,experiment_id)
     if not experiment or experiment.register_id!=register.id:abort(404)
-    students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id)).all()
+    students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id)).all();attendance_max=float(practical_marks_maxima(register)['attendance'])
     for st in students:
         existing=s.scalar(select(PracticalMark).where(PracticalMark.practical_student_id==st.id,PracticalMark.practical_experiment_id==experiment.id))
-        if not existing:s.add(PracticalMark(register_id=register.id,practical_student_id=st.id,practical_experiment_id=experiment.id,attendance='P',marks=None,remarks='',updated_by=actor_label(s),updated_at=now_iso()))
-        elif existing.attendance!='A':existing.attendance='P';existing.updated_by=actor_label(s);existing.updated_at=now_iso()
+        if not existing:
+            s.add(PracticalMark(register_id=register.id,practical_student_id=st.id,practical_experiment_id=experiment.id,attendance='P',attendance_marks=attendance_max,marks=attendance_max,remarks='',updated_by=actor_label(s),updated_at=now_iso()))
+        elif existing.attendance!='A':
+            existing.attendance='P';existing.attendance_marks=attendance_max
+            if any(getattr(existing,name,None) is not None for name in ('record_marks','performance_marks','viva_marks')):
+                existing.marks=sum((getattr(existing,name,None) or 0) for name in ('attendance_marks','record_marks','performance_marks','viva_marks'))
+            elif existing.marks is None:
+                existing.marks=attendance_max
+            existing.updated_by=actor_label(s);existing.updated_at=now_iso()
     register.updated_at=now_iso();s.commit();flash('All unmarked students set to Present.');return redirect(url_for('practical_mark_entry',register_id=register.id,experiment_id=experiment.id))
 
 

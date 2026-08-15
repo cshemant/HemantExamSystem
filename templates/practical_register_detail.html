@@ -11,7 +11,7 @@
 </div>
 
 <div class="card practical-marks-settings">
-  <div class="import-header"><div><h2>Marks Distribution</h2><span class="muted">One global setting for every experiment in this register.</span></div><div class="practical-total-badge">Total <strong>{{ total_max }}</strong></div></div>
+  <div class="import-header"><div><h2>Marks Distribution</h2></div><div class="practical-total-badge">Total <strong>{{ total_max }}</strong></div></div>
   <form method="post" action="{{ url_for('practical_marks_settings',register_id=register.id) }}" class="grid practical-marks-settings-grid">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div><label>Attendance Max</label><input type="number" name="attendance_max_marks" min="0" max="100" value="{{ component_maxima.attendance }}" required></div>
@@ -24,7 +24,7 @@
 
 <div class="grid practical-setup-grid">
   <div class="card practical-setup-card">
-    <div class="import-header"><div><h2>Student List</h2><span class="muted">Upload your university Excel sheet directly.</span></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('practical_template',register_id=register.id,kind='students',fmt='xlsx') }}">Template</a></div></div>
+    <div class="import-header"><div><h2>Student List</h2></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('practical_template',register_id=register.id,kind='students',fmt='xlsx') }}">Template</a></div></div>
     <form method="post" action="{{ url_for('practical_students_import',register_id=register.id) }}" enctype="multipart/form-data" class="import-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="file" name="roster_file" accept=".xlsx,.csv" required><button>Upload Students</button></form>
     <p class="import-hint">The importer detects common fields such as Reg. No, Registration No, Roll No and Name of Student—even when the headings are on different rows.</p>
   </div>
