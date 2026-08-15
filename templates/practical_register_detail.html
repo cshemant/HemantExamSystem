@@ -1,6 +1,6 @@
 {% extends 'base.html' %}{% block content %}
 <div class="page-head practical-register-head">
-  <div><a class="back-link" href="{{ url_for('practical_registers') }}">← Practical Marks</a><h1>{{ register.title }}</h1><p class="muted">{{ register.subject }}{% if register.lab_code %} · {{ register.lab_code }}{% endif %}{% if register.section %} · {{ register.section }}{% endif %}{% if register.academic_year %} · {{ register.academic_year }}{% endif %}</p></div>
+  <div><a class="back-link" href="{{ url_for('practical_registers') }}">← Practical Marks</a><h1>{{ register.subject }}</h1>{% if register.lab_code or register.section %}<p class="muted">{% if register.lab_code %}{{ register.lab_code }}{% endif %}{% if register.lab_code and register.section %} · {% endif %}{% if register.section %}{{ register.section }}{% endif %}</p>{% endif %}</div>
   <div class="actions"><a class="btn secondary" href="{{ url_for('practical_export',register_id=register.id,fmt='xlsx') }}">Export Excel</a>{% if experiments and students %}<a class="btn" href="{{ url_for('practical_mark_entry',register_id=register.id) }}">Live Mark Entry</a>{% endif %}</div>
 </div>
 
@@ -48,4 +48,3 @@
   </table></div>
 </div>
 {% endblock %}
-
