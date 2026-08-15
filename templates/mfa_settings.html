@@ -1,5 +1,5 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div class="eyebrow">Account security</div><h1>Multi-Factor Authentication</h1><p class="muted">Protect this staff account with a time-based authenticator code in addition to the password.</p></div>
+<div class="page-head"><h1>Multi-Factor Authentication</h1></div>
 {% if enabled %}
 <div class="card"><span class="badge success">MFA enabled</span><h2>Authenticator protection is active</h2><p class="muted">A valid 6-digit authenticator code is required after the password at every new sign-in.</p>
 <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="disable"><div class="grid"><div><label>Current password</label><input type="password" name="password" autocomplete="current-password" required></div><div><label>Current authenticator code</label><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></div></div><button class="secondary" onclick="return confirm('Disable MFA for this account?')">Disable MFA</button></form></div>
@@ -8,5 +8,5 @@
 <div class="mfa-enrol-grid"><div><img class="mfa-qr" src="{{ qr_uri }}" alt="Authenticator setup QR code"></div><div><label>Manual setup key</label><code class="secret-code">{{ secret_value }}</code><p class="mini-note">Do not share this key. It can generate valid sign-in codes.</p></div></div>
 <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="enable"><div class="grid"><div><label>Current password</label><input type="password" name="password" autocomplete="current-password" required></div><div><label>6-digit authenticator code</label><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></div></div><button>Enable MFA</button></form></div>
 {% endif %}
-<div class="card"><h2>Institutional recommendation</h2><p class="muted">Enable MFA for Super Admin, HOD and Exam Controller accounts before a production examination. For emergency recovery, keep a controlled offline database backup and a documented privileged-account recovery procedure.</p></div>
+
 {% endblock %}
