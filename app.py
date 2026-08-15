@@ -2335,13 +2335,23 @@ def question_bank():
     catalog_categories=sorted({row.category for row in catalog_rows})
     selected_catalog_subject=catalog_map.get(subject) if subject else None
     selected_subject_stats=None
+    selected_subject_units=[]
     if selected_catalog_subject:
         approved_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved')) or 0
         official_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))) or 0
         practice_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))) or 0
         draft_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='draft')) or 0
         selected_subject_stats={'total':approved_count+draft_count,'approved':approved_count,'official':official_count,'practice':practice_count,'draft':draft_count}
-    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,units=units,exams=exams_list,usage=usage,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
+        selected_subject_units=[str(value).strip() for value in s.scalars(
+            select(BankQuestion.unit).where(
+                BankQuestion.subject==selected_catalog_subject.name,
+                BankQuestion.status=='approved',
+                BankQuestion.practice_visibility.in_(['official_only','both']),
+                BankQuestion.unit!=''
+            ).distinct()
+        ).all() if str(value or '').strip()]
+        selected_subject_units.sort(key=lambda value:(int(value) if value.isdigit() else 10**9,value.casefold()))
+    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,selected_subject_units=selected_subject_units,units=units,exams=exams_list,usage=usage,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
 
 @app.route('/admin/question-bank/subjects',methods=['POST'])
 @staff_required
@@ -2385,13 +2395,18 @@ def create_exam_from_catalog_subject(subject_id):
         flash('This subject is not active in the Subject Catalog.','error')
         return redirect(url_for('question_bank'))
 
-    bank_rows=s.scalars(select(BankQuestion).where(
+    selected_unit=(request.form.get('unit') or '').strip()
+    bank_stmt=select(BankQuestion).where(
         BankQuestion.subject==subject.name,
         BankQuestion.status=='approved',
         BankQuestion.practice_visibility.in_(['official_only','both'])
-    ).order_by(BankQuestion.unit,BankQuestion.id)).all()
+    )
+    if selected_unit:
+        bank_stmt=bank_stmt.where(BankQuestion.unit==selected_unit)
+    bank_rows=s.scalars(bank_stmt.order_by(BankQuestion.unit,BankQuestion.id)).all()
     if not bank_rows:
-        flash(f'Add and approve at least one question for {subject.name} before creating an exam.','error')
+        scope=f' Unit {selected_unit}' if selected_unit else ''
+        flash(f'Add and approve at least one question for {subject.name}{scope} before creating an exam.','error')
         return redirect(url_for('question_bank',subject=subject.name)+'#subject-workspace')
 
     try:
@@ -2404,7 +2419,15 @@ def create_exam_from_catalog_subject(subject_id):
         per_student=10
     per_student=min(per_student,len(bank_rows))
 
-    exam=Exam(title=f"{subject.name} - Ready Exam",duration_minutes=duration,is_active=False,created_at=now_iso())
+    requested_title=(request.form.get('exam_title') or '').strip()
+    if requested_title:
+        subject_prefix=re.compile(r'^'+re.escape(subject.name)+r'\s*(?:[-–—:|]\s*)+',re.IGNORECASE)
+        short_title=subject_prefix.sub('',requested_title,count=1).strip() or requested_title
+    elif selected_unit:
+        short_title=f'Unit {selected_unit} - Ready Exam'
+    else:
+        short_title='Ready Exam'
+    exam=Exam(title=f"{subject.name} - {short_title}",duration_minutes=duration,is_active=False,created_at=now_iso())
     s.add(exam); s.flush()
     cfg=get_exam_config(s,exam.id,create=True)
     cfg.subject=subject.name
@@ -2424,16 +2447,17 @@ def create_exam_from_catalog_subject(subject_id):
     cfg.shuffle_options=True
     cfg.require_fullscreen=False
     cfg.tab_switch_limit=3
-    cfg.last_generation_summary=f'Created from {subject.name}: {len(bank_rows)} approved bank questions; each student receives {per_student}.'
+    source_label=f'{subject.name} / Unit {selected_unit}' if selected_unit else subject.name
+    cfg.last_generation_summary=f'Created from {source_label}: {len(bank_rows)} approved bank questions; each student receives {per_student}.'
     cfg.updated_at=now_iso()
     get_exam_approval(s,exam.id,create=True)
 
     for bq in bank_rows:
         copy_bank_question_to_exam(s,bq,exam.id)
 
-    audit_event(s,'catalog_subject_exam_created','exam',exam.id,f'subject={subject.name}, pool={len(bank_rows)}, per_student={per_student}')
+    audit_event(s,'catalog_subject_exam_created','exam',exam.id,f'subject={subject.name}, unit={selected_unit or "all"}, pool={len(bank_rows)}, per_student={per_student}, title={short_title}')
     s.commit()
-    flash(f'Created ready exam “{subject.name}” with {len(bank_rows)} approved questions. Review the blueprint, approve it, then activate it for students.')
+    flash(f'Created “{short_title}” with {len(bank_rows)} approved question(s) in the pool and {per_student} question(s) per student.')
     return redirect(url_for('exam_builder', exam_id=exam.id))
 
 

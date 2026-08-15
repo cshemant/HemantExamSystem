@@ -4,7 +4,6 @@
 <div class="card preloaded-bank-card">
   <div class="import-header">
     <div>
-      <h2>Preloaded Unit-wise Subject Banks</h2>
       <div class="actions template-actions preloaded-downloads">
         <a class="btn secondary small" href="{{ url_for('export_preloaded_question_banks',fmt='csv') }}">Download Master CSV</a>
         <a class="btn secondary small" href="{{ url_for('export_preloaded_question_banks',fmt='xlsx') }}">Download Master Excel</a>
@@ -124,7 +123,6 @@
 <div class="card subject-workspace-card" id="subject-workspace">
   <div class="import-header">
     <div>
-      <div class="eyebrow">Selected subject workspace</div>
       <h2>{{ selected_catalog_subject.name }}</h2>
       <p class="muted"><span class="badge gray">{{ selected_catalog_subject.category }}</span>{% if selected_catalog_subject.course_semester %} · {{ selected_catalog_subject.course_semester }}{% endif %}</p>
     </div>
@@ -149,13 +147,16 @@
     {% if selected_subject_stats.total %}<a class="btn secondary" href="#bank-questions">View {{ selected_subject_stats.total }} Question{{ '' if selected_subject_stats.total == 1 else 's' }}</a>{% endif %}
   </div>
   <div class="subject-exam-bridge">
-    <div>
-      <strong>Ready to conduct this subject?</strong>
-      <p class="muted">Only approved questions are copied into the exam. <strong>Create Ready Exam</strong> prepares the paper as Draft / Inactive, then opens its Blueprint &amp; Sessions page so an authorized user can approve and activate it.</p>
-    </div>
     {% if selected_subject_stats.official %}
     <form method="post" action="{{ url_for('create_exam_from_catalog_subject',subject_id=selected_catalog_subject.id) }}" class="subject-exam-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Unit
+        <select name="unit">
+          <option value="">All Units</option>
+          {% for unit_value in selected_subject_units %}<option value="{{ unit_value }}">Unit {{ unit_value }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Exam Title <input name="exam_title" placeholder="Unit 2 - Activity Control"></label>
       <label>Duration <input name="duration" type="number" min="1" value="20"></label>
       <label>Questions per student <input name="question_count" type="number" min="1" max="{{ selected_subject_stats.official }}" value="{{ 10 if selected_subject_stats.official >= 10 else selected_subject_stats.official }}"></label>
       <button>Create Ready Exam</button>
