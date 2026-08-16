@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.16.1'
+APP_VERSION='2.16.2'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -44,6 +44,7 @@ LOGIN_WINDOW_MINUTES=max(1,int(os.getenv('LOGIN_WINDOW_MINUTES','10')))
 LOGIN_LOCK_MINUTES=max(1,int(os.getenv('LOGIN_LOCK_MINUTES','10')))
 HEARTBEAT_STALE_SECONDS=max(20,int(os.getenv('HEARTBEAT_STALE_SECONDS','45')))
 MAX_ANSWER_LENGTH=max(100,int(os.getenv('MAX_ANSWER_LENGTH','4000')))
+PRACTICAL_SYNC_BATCH_SIZE=max(5,min(50,int(os.getenv('PRACTICAL_SYNC_BATCH_SIZE','20'))))
 INTEGRATION_API_KEY=os.getenv('INTEGRATION_API_KEY','').strip()
 EXAM_PACKAGE_SIGNING_KEY=os.getenv('EXAM_PACKAGE_SIGNING_KEY','').strip()
 
@@ -2490,46 +2491,82 @@ def students():
 def sync_students_from_practical():
     """Create/update exam logins from an existing practical-register roster.
 
-    The sync is deliberately row-isolated.  A single legacy/duplicate student
-    record must never abort the whole section (this previously surfaced as a
-    generic HTTP 500 for some larger rosters such as Section K).
+    Browser requests are processed in small, committed chunks (20 rows by
+    default).  This keeps production requests short and makes the sync
+    resumable/idempotent.  Inside every chunk each student is protected by a
+    SAVEPOINT, so one legacy/duplicate row cannot abort the remaining rows.
     """
     s=DB()
+    wants_json=(
+        request.form.get('ajax')=='1'
+        or request.headers.get('X-Requested-With')=='XMLHttpRequest'
+        or request.accept_mimetypes.best=='application/json'
+    )
+
+    def respond_error(message,status=400):
+        if wants_json:
+            return jsonify({'ok':False,'error':message}),status
+        flash(message,'error')
+        return redirect(url_for('students'))
+
     try:
-        register_id=int(request.form.get('register_id','0') or 0);group_id=int(request.form.get('group_id','0') or 0)
+        register_id=int(request.form.get('register_id','0') or 0)
+        group_id=int(request.form.get('group_id','0') or 0)
     except ValueError:
         register_id=group_id=0
     if not register_id or not group_id:
-        flash('Choose a practical list and a batch / section.','error');return redirect(url_for('students'))
-    register=practical_register_access(s,register_id);group=s.get(AcademicGroup,group_id)
+        return respond_error('Choose a practical list and a batch / section.')
+
+    register=practical_register_access(s,register_id)
+    group=s.get(AcademicGroup,group_id)
     if not group or not group.is_active:
-        flash('Choose a valid active batch / section.','error');return redirect(url_for('students'))
+        return respond_error('Choose a valid active batch / section.')
+
     register_section=_practical_register_section_code(register)
     group_section=_section_code(group.section)
     if register_section and group_section and register_section!=group_section:
-        flash(f'This practical list belongs to Section {register_section}; it cannot be synced to Section {group_section}.','error')
-        return redirect(url_for('students'))
+        return respond_error(f'This practical list belongs to Section {register_section}; it cannot be synced to Section {group_section}.')
     register_year=(register.academic_year or '').strip()
     group_year=(group.academic_year or '').strip()
     if register_year and group_year and register_year.casefold()!=group_year.casefold():
-        flash(f'This practical list is for {register_year}; choose a batch / section from the same academic year.','error')
-        return redirect(url_for('students'))
-    practical_students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.id)).all()
-    if not practical_students:
-        flash('The selected practical list has no students.','error');return redirect(url_for('students'))
+        return respond_error(f'This practical list is for {register_year}; choose a batch / section from the same academic year.')
 
-    # Build deterministic lookup maps once.  Registration numbers are not a
-    # database unique key in older installations, so explicitly mark any
-    # legacy duplicate registration as ambiguous instead of choosing one row.
+    practical_students=s.scalars(
+        select(PracticalStudent)
+        .where(PracticalStudent.register_id==register.id)
+        .order_by(PracticalStudent.sequence,PracticalStudent.id)
+    ).all()
+    if not practical_students:
+        return respond_error('The selected practical list has no students.')
+
+    total=len(practical_students)
+    if wants_json:
+        try:offset=max(0,int(request.form.get('offset','0') or 0))
+        except ValueError:offset=0
+        try:batch_size=int(request.form.get('batch_size',str(PRACTICAL_SYNC_BATCH_SIZE)) or PRACTICAL_SYNC_BATCH_SIZE)
+        except ValueError:batch_size=PRACTICAL_SYNC_BATCH_SIZE
+        batch_size=max(1,min(PRACTICAL_SYNC_BATCH_SIZE,batch_size))
+        if offset>=total:
+            return jsonify({'ok':True,'done':True,'offset':offset,'next_offset':total,'total':total,'processed':0,'created':0,'updated':0,'assigned':0,'collisions':0,'invalid':0,'failed':0,'issues':[]})
+        selected_students=practical_students[offset:offset+batch_size]
+    else:
+        # Compatibility fallback when JavaScript is disabled.  Keep the route
+        # functional, but the normal UI uses sequential 20-row requests.
+        offset=0
+        selected_students=practical_students
+        batch_size=len(selected_students)
+
+    # Build deterministic lookup maps for this chunk. Registration numbers are
+    # not a database unique key in older installations, so ambiguous legacy
+    # registrations are skipped instead of attaching the wrong account.
     master_students=s.scalars(select(Student)).all()
     by_login={row.roll_no.strip().casefold():row for row in master_students if row.roll_no}
-    by_registration={};ambiguous_registrations=set()
+    by_registration={}
+    ambiguous_registrations=set()
     for row in master_students:
         keys=[]
         key=_canonical_registration_no(getattr(row,'registration_no',''))
         if key:keys.append(key)
-        # Backwards compatibility: older accounts may have stored the full
-        # university registration number directly in roll_no.
         legacy_key=_canonical_registration_no(row.roll_no)
         if len(legacy_key)>5 and legacy_key not in keys:keys.append(legacy_key)
         for item_key in keys:
@@ -2540,21 +2577,34 @@ def sync_students_from_practical():
                 by_registration[item_key]=row
 
     created=updated=assigned=collisions=invalid=failed=0
-    seen_registration=set();seen_login={};failure_types={}
-    for practical_student in practical_students:
-        registration=(practical_student.roll_no or '').strip();name=(practical_student.name or '').strip()
-        reg_key=_canonical_registration_no(registration);login_id=_student_login_from_registration(registration)
+    seen_registration=set()
+    seen_login={}
+    failure_types={}
+    issues=[]
+
+    for local_index,practical_student in enumerate(selected_students,start=offset+1):
+        registration=(practical_student.roll_no or '').strip()
+        name=(practical_student.name or '').strip()
+        reg_key=_canonical_registration_no(registration)
+        login_id=_student_login_from_registration(registration)
+
+        def add_issue(kind,detail=''):
+            if len(issues)>=12:return
+            label=registration or f'row {local_index}'
+            issues.append({'row':local_index,'registration':label,'type':kind,'detail':detail[:160]})
+
         if not reg_key or not login_id or not name:
-            invalid+=1;continue
+            invalid+=1;add_issue('invalid','Missing name or a registration number with at least five digits.');continue
         if reg_key in seen_registration:
-            continue
+            # Duplicate inside the same practical chunk. The first row wins.
+            invalid+=1;add_issue('duplicate','Duplicate registration number in this practical list chunk.');continue
         seen_registration.add(reg_key)
         previous_reg=seen_login.get(login_id)
         if previous_reg and previous_reg!=reg_key:
-            collisions+=1;continue
+            collisions+=1;add_issue('login_collision',f'Last five digits {login_id} are shared by another registration.');continue
         seen_login[login_id]=reg_key
         if reg_key in ambiguous_registrations:
-            collisions+=1;continue
+            collisions+=1;add_issue('registration_collision','Multiple existing exam accounts use this registration number.');continue
 
         student=by_registration.get(reg_key)
         login_owner=by_login.get(login_id.casefold())
@@ -2562,22 +2612,26 @@ def sync_students_from_practical():
             owner_reg=_canonical_registration_no(getattr(login_owner,'registration_no',''))
             owner_name=(login_owner.name or '').strip().casefold()
             if owner_reg and owner_reg!=reg_key:
-                collisions+=1;continue
+                collisions+=1;add_issue('login_collision',f'Login {login_id} already belongs to another registration.');continue
             if not owner_reg and owner_name and owner_name!=name.casefold():
-                collisions+=1;continue
+                collisions+=1;add_issue('legacy_login_collision',f'Login {login_id} belongs to an older account with a different name.');continue
             student=login_owner
         if student is not None and login_owner is not None and login_owner.id!=student.id:
-            collisions+=1;continue
+            collisions+=1;add_issue('login_collision',f'Login {login_id} is already owned by another account.');continue
 
-        # SAVEPOINT per student: malformed/legacy data in one record can no
-        # longer roll back every other student in the section.
         row_created=row_updated=row_assigned=False
         old_login=(student.roll_no or '').strip().casefold() if student is not None else ''
         had_registration=bool(_canonical_registration_no(getattr(student,'registration_no',''))) if student is not None else False
         try:
             with s.begin_nested():
                 if student is None:
-                    student=Student(roll_no=login_id,registration_no=registration,name=name,password_hash=generate_password_hash(login_id),created_at=now_iso())
+                    student=Student(
+                        roll_no=login_id,
+                        registration_no=registration,
+                        name=name,
+                        password_hash=generate_password_hash(login_id),
+                        created_at=now_iso(),
+                    )
                     s.add(student);s.flush();row_created=True
                 else:
                     changed=False;login_changed=False
@@ -2590,9 +2644,8 @@ def sync_students_from_practical():
                         student.registration_no=registration;changed=True
                     if student.name!=name:
                         student.name=name;changed=True
-                    # Do not re-hash/reset every existing student's password on
-                    # each sync. Reset only when converting a legacy login ID or
-                    # when adopting an older account that had no registration no.
+                    # Preserve a student's password on ordinary re-sync. Reset
+                    # only while converting/adopting a legacy account.
                     if login_changed or not had_registration:
                         student.password_hash=generate_password_hash(login_id)
                     row_updated=changed
@@ -2601,34 +2654,65 @@ def sync_students_from_practical():
                 if not membership or membership.group_id!=group.id:
                     assign_student_group(s,student.id,group.id);row_assigned=True
                 s.flush()
-        except IntegrityError:
-            collisions+=1
-            # The SAVEPOINT has already been rolled back; continue with the
-            # remaining roster rather than returning HTTP 500.
-            continue
+        except IntegrityError as exc:
+            collisions+=1;add_issue('database_collision',str(getattr(exc,'orig',None) or 'Duplicate login/assignment constraint.'));continue
         except Exception as exc:
-            failed+=1;failure_types[type(exc).__name__]=failure_types.get(type(exc).__name__,0)+1
+            failed+=1
+            failure_types[type(exc).__name__]=failure_types.get(type(exc).__name__,0)+1
+            add_issue(type(exc).__name__,str(exc))
             continue
 
         if row_created:created+=1
         if row_updated:updated+=1
         if row_assigned:assigned+=1
         if old_login and old_login!=login_id.casefold():by_login.pop(old_login,None)
-        by_login[login_id.casefold()]=student;by_registration[reg_key]=student
+        by_login[login_id.casefold()]=student
+        by_registration[reg_key]=student
 
-    detail=f'register={register.id}, group={group.id}, created={created}, updated={updated}, assigned={assigned}, collisions={collisions}, invalid={invalid}, failed={failed}'
+    processed=len(selected_students)
+    next_offset=min(total,offset+processed)
+    detail=(
+        f'register={register.id}, group={group.id}, offset={offset}, processed={processed}, '
+        f'created={created}, updated={updated}, assigned={assigned}, collisions={collisions}, '
+        f'invalid={invalid}, failed={failed}'
+    )
     if failure_types:detail+=', failure_types='+json.dumps(failure_types,sort_keys=True)
-    audit_event(s,'students_practical_sync','student','',detail)
+    audit_event(s,'students_practical_sync_batch','student','',detail)
     try:
         s.commit()
-    except IntegrityError:
-        s.rollback();flash('Student sync stopped because two records would create the same login ID. Check the registration numbers.','error');return redirect(url_for('students'))
+    except IntegrityError as exc:
+        s.rollback()
+        return respond_error('This batch could not be saved because two student records would create the same login ID. The completed earlier batches are safe.',409)
     except Exception as exc:
-        s.rollback();flash(f'Student sync could not be saved ({type(exc).__name__}). No practical data was changed.','error');return redirect(url_for('students'))
-    parts=[f'{created} login'+('' if created==1 else 's')+' created',f'{updated} updated',f'{assigned} batch assignment'+('' if assigned==1 else 's')+' updated']
+        s.rollback()
+        return respond_error(f'This batch could not be saved ({type(exc).__name__}). The completed earlier batches are safe and you can retry.',500)
+
+    result={
+        'ok':True,
+        'done':next_offset>=total,
+        'offset':offset,
+        'next_offset':next_offset,
+        'total':total,
+        'processed':processed,
+        'created':created,
+        'updated':updated,
+        'assigned':assigned,
+        'collisions':collisions,
+        'invalid':invalid,
+        'failed':failed,
+        'issues':issues,
+    }
+    if wants_json:
+        return jsonify(result)
+
+    parts=[
+        f'{created} login'+('' if created==1 else 's')+' created',
+        f'{updated} updated',
+        f'{assigned} batch assignment'+('' if assigned==1 else 's')+' updated',
+    ]
     if collisions:parts.append(f'{collisions} login/data collision'+('' if collisions==1 else 's')+' skipped')
-    if invalid:parts.append(f'{invalid} invalid row'+('' if invalid==1 else 's')+' skipped')
-    if failed:parts.append(f'{failed} legacy/problem row'+('' if failed==1 else 's')+' skipped')
+    if invalid:parts.append(f'{invalid} invalid/duplicate row'+('' if invalid==1 else 's')+' skipped')
+    if failed:parts.append(f'{failed} problem row'+('' if failed==1 else 's')+' skipped')
     flash('Practical list synced: '+', '.join(parts)+'.')
     return redirect(url_for('students'))
 

@@ -1,7 +1,102 @@
 {% extends 'base.html' %}{% block content %}
 <div class="page-head"><h1>Students</h1></div>
 <div class="card"><h2>Add Student</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Login ID</label><input name="roll_no" required></div><div><label>Name</label><input name="name" required></div><div><label>Password</label><input name="password" type="password" required></div><div><label>Batch / Section</label><select name="group_id"><option value="">Unassigned</option>{% for g in groups %}<option value="{{ g.id }}">{{ group_label(g) }}</option>{% endfor %}</select></div></div><button>Add Student</button></form></div>
-{% if practical_registers %}<div class="card"><h2>Create Logins from Practical List</h2><form method="post" action="{{ url_for('sync_students_from_practical') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Practical List</label><select name="register_id" id="practical-sync-register" required><option value="">Choose practical list...</option>{% for r in practical_registers %}<option value="{{ r.id }}" data-section="{{ practical_section_code(r) }}" data-year="{{ r.academic_year }}">{{ r.title }}{% if r.subject %} · {{ r.subject }}{% endif %}{% if r.section %} · {{ r.section }}{% endif %}</option>{% endfor %}</select></div><div><label>Batch / Section</label><select name="group_id" id="practical-sync-group" required><option value="">Choose batch / section...</option>{% for g in groups %}<option value="{{ g.id }}" data-section="{{ section_code(g.section) }}" data-year="{{ g.academic_year }}">{{ group_label(g) }}</option>{% endfor %}</select></div></div><button type="submit">Create / Sync Logins</button></form></div><script>(function(){const r=document.getElementById('practical-sync-register'),g=document.getElementById('practical-sync-group');if(!r||!g)return;const all=[...g.options].map(o=>({value:o.value,text:o.textContent,section:o.dataset.section||'',year:o.dataset.year||''}));function refresh(){const opt=r.options[r.selectedIndex],section=(opt?.dataset.section||'').toUpperCase(),year=(opt?.dataset.year||'').toLowerCase(),current=g.value;g.innerHTML='';all.forEach((x,i)=>{if(i===0||((!section||x.section.toUpperCase()===section)&&(!year||!x.year||x.year.toLowerCase()===year))){const o=document.createElement('option');o.value=x.value;o.textContent=x.text;o.dataset.section=x.section;o.dataset.year=x.year;g.appendChild(o);}});if([...g.options].some(o=>o.value===current))g.value=current;else g.value='';}r.addEventListener('change',refresh);refresh();})();</script>{% endif %}
+{% if practical_registers %}
+<div class="card">
+  <h2>Create Logins from Practical List</h2>
+  <form method="post" action="{{ url_for('sync_students_from_practical') }}" id="practical-sync-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="grid">
+      <div>
+        <label>Practical List</label>
+        <select name="register_id" id="practical-sync-register" required>
+          <option value="">Choose practical list...</option>
+          {% for r in practical_registers %}<option value="{{ r.id }}" data-section="{{ practical_section_code(r) }}" data-year="{{ r.academic_year }}">{{ r.title }}{% if r.subject %} · {{ r.subject }}{% endif %}{% if r.section %} · {{ r.section }}{% endif %}</option>{% endfor %}
+        </select>
+      </div>
+      <div>
+        <label>Batch / Section</label>
+        <select name="group_id" id="practical-sync-group" required>
+          <option value="">Choose batch / section...</option>
+          {% for g in groups %}<option value="{{ g.id }}" data-section="{{ section_code(g.section) }}" data-year="{{ g.academic_year }}">{{ group_label(g) }}</option>{% endfor %}
+        </select>
+      </div>
+    </div>
+    <button type="submit" id="practical-sync-button">Create / Sync Logins</button>
+    <span id="practical-sync-status" class="muted" aria-live="polite" style="margin-left:12px"></span>
+  </form>
+</div>
+<script>
+(function(){
+  const form=document.getElementById('practical-sync-form');
+  const r=document.getElementById('practical-sync-register');
+  const g=document.getElementById('practical-sync-group');
+  const button=document.getElementById('practical-sync-button');
+  const status=document.getElementById('practical-sync-status');
+  if(!form||!r||!g||!button)return;
+
+  const all=[...g.options].map(o=>({value:o.value,text:o.textContent,section:o.dataset.section||'',year:o.dataset.year||''}));
+  function refreshGroups(){
+    const opt=r.options[r.selectedIndex];
+    const section=(opt?.dataset.section||'').toUpperCase();
+    const year=(opt?.dataset.year||'').toLowerCase();
+    const current=g.value;
+    g.innerHTML='';
+    all.forEach((x,i)=>{
+      if(i===0||((!section||x.section.toUpperCase()===section)&&(!year||!x.year||x.year.toLowerCase()===year))){
+        const o=document.createElement('option');o.value=x.value;o.textContent=x.text;o.dataset.section=x.section;o.dataset.year=x.year;g.appendChild(o);
+      }
+    });
+    if([...g.options].some(o=>o.value===current))g.value=current;else g.value='';
+  }
+  r.addEventListener('change',refreshGroups);refreshGroups();
+
+  form.addEventListener('submit',async function(event){
+    event.preventDefault();
+    if(!form.reportValidity())return;
+    button.disabled=true;r.disabled=true;g.disabled=true;
+    const originalLabel=button.textContent;
+    const totals={processed:0,created:0,updated:0,assigned:0,collisions:0,invalid:0,failed:0};
+    const issues=[];
+    let offset=0,total=null;
+    try{
+      while(true){
+        const data=new FormData(form);
+        // Disabled selects are omitted by FormData, so append their selected values explicitly.
+        data.set('register_id',r.value);data.set('group_id',g.value);
+        data.set('ajax','1');data.set('offset',String(offset));data.set('batch_size','20');
+        if(total!==null){button.textContent=`Syncing ${Math.min(offset+1,total)}-${Math.min(offset+20,total)} of ${total}…`;}
+        else{button.textContent='Starting sync…';}
+        const response=await fetch(form.action,{method:'POST',body:data,headers:{'X-Requested-With':'XMLHttpRequest','Accept':'application/json'}});
+        let result;
+        try{result=await response.json();}catch(_){throw new Error(`Server returned HTTP ${response.status}.`);}
+        if(!response.ok||!result.ok)throw new Error(result.error||`Sync failed (HTTP ${response.status}).`);
+        total=result.total;
+        for(const key of Object.keys(totals))totals[key]+=Number(result[key]||0);
+        if(Array.isArray(result.issues))issues.push(...result.issues);
+        offset=Number(result.next_offset||0);
+        status.textContent=`${Math.min(offset,total)} / ${total} processed`;
+        if(result.done)break;
+      }
+      const skipped=totals.collisions+totals.invalid+totals.failed;
+      button.textContent='Sync complete';
+      status.textContent=`${totals.processed} processed · ${totals.created} created · ${totals.assigned} assigned${skipped?` · ${skipped} skipped`:''}`;
+      if(issues.length){
+        const brief=issues.slice(0,5).map(x=>`${x.registration}: ${x.type}`).join('\n');
+        window.alert(`Sync completed, but ${skipped} row(s) were skipped.\n\n${brief}${issues.length>5?'\n…':''}`);
+      }
+      window.setTimeout(()=>window.location.reload(),900);
+    }catch(error){
+      button.textContent='Retry Sync';
+      status.textContent=error.message||'Sync failed. Earlier completed batches are safe.';
+      button.disabled=false;r.disabled=false;g.disabled=false;
+      return;
+    }
+    window.setTimeout(()=>{button.textContent=originalLabel;},1200);
+  });
+})();
+</script>
+{% endif %}
 <div class="card"><div class="import-header"><div><h2>Bulk Import Students</h2></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('student_import_template', fmt='csv') }}">CSV Template</a><a class="btn secondary small" href="{{ url_for('student_import_template', fmt='xlsx') }}">Excel Template</a></div></div><form method="post" action="{{ url_for('import_students') }}" enctype="multipart/form-data" class="import-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div><label>Student Login File</label><input type="file" name="student_file" accept=".csv,.xlsx" required></div><button type="submit">Import Students</button></form></div>
 <div class="card"><div class="import-header"><div><h2>Registered Students</h2></div><a class="btn secondary small" href="{{ url_for('academic_groups') }}">Manage Batches</a></div><div class="table-wrap"><table><tr><th>Registration No</th><th>Login ID</th><th>Name</th><th>Batch / Section</th><th>Created</th></tr>{% for s in students %}{% set gid=membership.get(s.id) %}<tr><td>{{ s.registration_no or '-' }}</td><td><strong>{{ s.roll_no }}</strong></td><td>{{ s.name }}</td><td>{{ group_label(group_map.get(gid)) if gid else 'Unassigned' }}</td><td>{{ s.created_at|dt }}</td></tr>{% else %}<tr><td colspan="5">No students added yet.</td></tr>{% endfor %}</table></div></div>
 {% endblock %}
