@@ -1,24 +1,36 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><h1>{{ display_title }}</h1></div>
-<div class="card exam-pin-card" style="max-width:720px">
-  <h2>Verify Exam PIN</h2>
-  <div class="rotating-pin-box">
-    <div id="rotating-exam-pin" class="rotating-pin-value">{{ rotating_pin }}</div>
-    <div class="rotating-pin-timer"><span id="pin-countdown">{{ pin_seconds_remaining }}</span>s</div>
+<div id="pin-verification-view">
+  <div class="page-head"><h1>{{ display_title }}</h1></div>
+  <div class="card exam-pin-card" style="max-width:720px">
+    <h2>Verify Exam PIN</h2>
+    <div class="rotating-pin-box">
+      <div id="rotating-exam-pin" class="rotating-pin-value">{{ rotating_pin }}</div>
+      <div class="rotating-pin-timer"><span id="pin-countdown">{{ pin_seconds_remaining }}</span>s</div>
+    </div>
+    <form id="exam-pin-form" method="post">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Roll Number</label><input value="{{ student.roll_no }}" disabled>
+      <label>6-digit Exam PIN</label><input name="exam_pin" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" required autofocus>
+      <button id="exam-pin-submit">Continue to Exam</button>
+    </form>
   </div>
-  <form id="exam-pin-form" method="post">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label>Roll Number</label><input value="{{ student.roll_no }}" disabled>
-    <label>6-digit Exam PIN</label><input name="exam_pin" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" required autofocus>
-    <button id="exam-pin-submit">Continue to Exam</button>
-  </form>
 </div>
+<div id="secure-exam-shell" class="secure-exam-shell" hidden aria-hidden="true"></div>
 <script>
 (function(){
   const pinEl=document.getElementById('rotating-exam-pin');
   const countdownEl=document.getElementById('pin-countdown');
   const form=document.getElementById('exam-pin-form');
+  const input=form.querySelector('input[name="exam_pin"]');
+  const button=document.getElementById('exam-pin-submit');
+  const verification=document.getElementById('pin-verification-view');
+  const shell=document.getElementById('secure-exam-shell');
   let remaining={{ pin_seconds_remaining|int }};
+  let examFinished=false;
+  let shellActive=false;
+  let fullscreenEstablished=false;
+  let guard=null;
+
   async function refreshPin(){
     try{
       const res=await fetch('{{ url_for("current_student_exam_pin",exam_id=exam.id) }}',{cache:'no-store'});
@@ -27,21 +39,125 @@
       pinEl.textContent=data.pin;remaining=data.seconds_remaining;countdownEl.textContent=remaining;
     }catch(_err){}
   }
-  setInterval(()=>{remaining=Math.max(0,remaining-1);countdownEl.textContent=remaining;if(remaining<=0)refreshPin();},1000);
-  form.addEventListener('submit',async event=>{
-    if(form.dataset.submitting==='1')return;
-    event.preventDefault();
-    const input=form.querySelector('input[name="exam_pin"]');
-    const button=document.getElementById('exam-pin-submit');
-    if(input && input.value.trim()!==pinEl.textContent.trim()){
-      await refreshPin();
-      if(input.value.trim()!==pinEl.textContent.trim()){
-        input.setCustomValidity('Enter the PIN currently shown above.');input.reportValidity();input.setCustomValidity('');return;
+
+  function ensureGuard(){
+    if(guard)return guard;
+    guard=document.createElement('div');
+    guard.id='silent-fullscreen-guard';
+    guard.className='silent-fullscreen-guard';
+    guard.hidden=true;
+    document.body.appendChild(guard);
+    return guard;
+  }
+
+  async function requestFullscreenFromGesture(){
+    try{
+      if(document.documentElement.requestFullscreen && !document.fullscreenElement){
+        await document.documentElement.requestFullscreen({navigationUI:'hide'});
       }
+    }catch(_err){}
+    if(document.fullscreenElement)fullscreenEstablished=true;
+    try{if(navigator.keyboard && navigator.keyboard.lock && document.fullscreenElement)await navigator.keyboard.lock(['Escape']);}catch(_err){}
+  }
+
+  async function tryRestoreFullscreen(){
+    if(examFinished || !shellActive || !fullscreenEstablished)return;
+    try{
+      if(document.documentElement.requestFullscreen && !document.fullscreenElement){
+        await document.documentElement.requestFullscreen({navigationUI:'hide'});
+      }
+    }catch(_err){}
+    try{if(navigator.keyboard && navigator.keyboard.lock && document.fullscreenElement)await navigator.keyboard.lock(['Escape']);}catch(_err){}
+    if(guard)guard.hidden=!!document.fullscreenElement;
+  }
+
+  document.addEventListener('fullscreenchange',()=>{
+    if(examFinished || !shellActive)return;
+    if(document.fullscreenElement){
+      fullscreenEstablished=true;
+      if(guard)guard.hidden=true;
+      return;
     }
-    if(button)button.disabled=true;
-    try{if(document.documentElement.requestFullscreen && !document.fullscreenElement)await document.documentElement.requestFullscreen();}catch(_err){}
-    form.dataset.submitting='1';form.submit();
+    if(!fullscreenEstablished)return;
+    ensureGuard().hidden=false;
+    fetch('/student/integrity-event',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':'{{ csrf_token }}'},body:JSON.stringify({exam_id:{{ exam.id }},event_type:'fullscreen_exit',details:'Secure exam shell left full-screen'})}).catch(()=>{});
+    tryRestoreFullscreen();
+  });
+
+  function finishShell(url){
+    if(examFinished)return;
+    examFinished=true;
+    shellActive=false;
+    document.body.classList.remove('secure-exam-running');
+    if(guard)guard.hidden=true;
+    try{if(navigator.keyboard && navigator.keyboard.unlock)navigator.keyboard.unlock();}catch(_err){}
+    const done=()=>{window.location.href=url;};
+    if(document.fullscreenElement && document.exitFullscreen){document.exitFullscreen().catch(()=>{}).finally(done);}else done();
+  }
+
+  function launchExam(url){
+    shellActive=true;
+    // Add a same-document history entry so the browser Back button cannot
+    // escape an active exam to the dashboard. Submission removes the shell.
+    try{history.pushState({secureExam:true},'',window.location.href);}catch(_err){}
+    document.body.classList.add('secure-exam-running');
+    verification.hidden=true;
+    shell.hidden=false;
+    shell.setAttribute('aria-hidden','false');
+    const frame=document.createElement('iframe');
+    frame.className='secure-exam-frame';
+    frame.setAttribute('title','Exam');
+    frame.setAttribute('allow','fullscreen');
+    frame.src=url;
+    shell.replaceChildren(frame);
+    frame.addEventListener('load',()=>{
+      try{
+        const loc=frame.contentWindow.location;
+        const path=loc.pathname || '';
+        if(path.startsWith('/student/submitted/') || path==='/student'){finishShell(loc.href);return;}
+        // A new exam must always begin with Q1 fully visible. This also avoids
+        // the sticky exam header covering the first question in the iframe.
+        frame.contentWindow.scrollTo(0,0);
+      }catch(_err){}
+    });
+  }
+
+  window.addEventListener('popstate',()=>{
+    if(!shellActive || examFinished)return;
+    try{history.pushState({secureExam:true},'',window.location.href);}catch(_err){}
+    if(fullscreenEstablished && !document.fullscreenElement){ensureGuard().hidden=false;tryRestoreFullscreen();}
+  });
+
+  document.addEventListener('pointerdown',()=>{if(shellActive && fullscreenEstablished && !document.fullscreenElement)tryRestoreFullscreen();},true);
+  document.addEventListener('touchstart',()=>{if(shellActive && fullscreenEstablished && !document.fullscreenElement)tryRestoreFullscreen();},{passive:true,capture:true});
+  document.addEventListener('keydown',event=>{
+    if(shellActive && fullscreenEstablished && !document.fullscreenElement){event.preventDefault();tryRestoreFullscreen();}
+  },true);
+
+  setInterval(()=>{remaining=Math.max(0,remaining-1);countdownEl.textContent=remaining;if(remaining<=0)refreshPin();},1000);
+
+  form.addEventListener('submit',async event=>{
+    event.preventDefault();
+    if(form.dataset.submitting==='1')return;
+    if(input.value.trim()!==pinEl.textContent.trim()){
+      await refreshPin();input.value='';input.focus();return;
+    }
+    form.dataset.submitting='1';if(button)button.disabled=true;
+
+    // Full-screen must be requested directly from this user click.  Do not hide
+    // the PIN page unless the server has also accepted the PIN.
+    await requestFullscreenFromGesture();
+
+    try{
+      const data=new FormData(form);
+      const res=await fetch(window.location.href,{method:'POST',body:data,headers:{'X-Requested-With':'XMLHttpRequest','Accept':'application/json'},cache:'no-store'});
+      const payload=await res.json().catch(()=>({ok:false}));
+      if(res.ok && payload.ok && payload.exam_url){launchExam(payload.exam_url);return;}
+      if(payload.pin){pinEl.textContent=payload.pin;remaining=payload.seconds_remaining||60;countdownEl.textContent=remaining;}
+    }catch(_err){}
+
+    // Keep the verification screen usable after an invalid/expired PIN.
+    form.dataset.submitting='0';if(button)button.disabled=false;input.value='';input.focus();
   });
 })();
 </script>

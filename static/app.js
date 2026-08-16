@@ -13,7 +13,13 @@ async function saveAnswer(examId, questionId, answer, retryCount=0){
     });
     const data=await res.json();
     if(!res.ok) throw new Error(data.error || 'Save failed');
-    if(data.submitted){window.location='/student/submitted/'+examId;return;}
+    if(data.submitted){
+      const resultUrl='/student/submitted/'+examId;
+      const form=document.getElementById('exam-form');
+      if(form && form.getAttribute('data-secure-shell')==='1' && window.top!==window.self){window.top.location.href=resultUrl;}
+      else window.location.href=resultUrl;
+      return;
+    }
     if(status){status.textContent='Saved';setTimeout(()=>{if(status.textContent==='Saved')status.textContent='';},1000);}
   }catch(err){
     if(status) status.textContent='Save failed — retrying…';

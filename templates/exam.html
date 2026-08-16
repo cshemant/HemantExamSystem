@@ -1,9 +1,9 @@
 {% extends 'base.html' %}{% block content %}
-{% set secure_fullscreen = (cfg and cfg.require_fullscreen) or (security and security.require_exam_pin) %}
-<div class="exam-head"><span class="exam-title">{{ display_title }}</span><span id="save-status" class="save-status" aria-live="polite"></span>{% if secure_fullscreen %}<button type="button" id="fullscreen-btn" class="btn small secondary">Enter Full Screen</button>{% endif %}<span class="timer">Time left: <span id="timer"></span></span></div>
-{% if secure_fullscreen %}<div id="integrity-warning" class="integrity-banner">Integrity monitoring is enabled. Leaving the exam tab or full-screen mode is recorded for faculty review. This remains browser-level monitoring; use the supplied kiosk launcher when the institution requires a more restricted device session.</div>{% endif %}
-{% if security and security.require_exam_pin %}<div id="secure-fullscreen-lock" class="secure-fullscreen-lock"><div class="secure-fullscreen-card"><h2>Screen Locked</h2><button type="button" id="secure-fullscreen-enter">Resume Exam</button></div></div>{% endif %}
-<form id="exam-form" method="post" action="{{ url_for('submit_exam',exam_id=exam.id) }}" data-exam-integrity="{{ exam.id }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{% set pin_secure = security and security.require_exam_pin %}
+{% set manual_fullscreen = cfg and cfg.require_fullscreen and not pin_secure %}
+<div class="exam-head"><span class="exam-title">{{ display_title }}</span><span id="save-status" class="save-status" aria-live="polite"></span>{% if manual_fullscreen %}<button type="button" id="fullscreen-btn" class="btn small secondary">Enter Full Screen</button>{% endif %}<span class="timer">Time left: <span id="timer"></span></span></div>
+{% if manual_fullscreen %}<div id="integrity-warning" class="integrity-banner">Integrity monitoring is enabled. Leaving the exam tab or full-screen mode is recorded for faculty review.</div>{% endif %}
+<form id="exam-form" method="post" action="{{ url_for('submit_exam',exam_id=exam.id) }}" data-exam-integrity="{{ exam.id }}" data-secure-shell="{{ '1' if secure_shell else '0' }}"{% if secure_shell %} target="_top"{% endif %}><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 {% for q in questions %}<div class="question exam-question" data-question-type="{{ q.question_type }}"><div class="question-title">Q{{ loop.index }}. {{ q.question }}</div><div class="mini-meta">{{ q.question_type_label }} · {{ q.marks }} mark(s)</div>
   {% if q.question_type=='single_choice' %}
     {% for label,key,value in q.display_options %}<label class="option"><input type="radio" name="q_{{ q.id }}" value="{{ key }}" {% if answers.get(q.id)==key %}checked{% endif %} onchange="saveAnswer({{ exam.id }},{{ q.id }},'{{ key }}')"><span><strong>{{ label }}.</strong> {{ value }}</span></label>{% endfor %}
@@ -21,5 +21,5 @@
   {% endif %}
 </div>{% endfor %}
 <button onclick="return confirm('Submit exam now?')">Submit Exam</button></form>
-<script>startTimer({{ end_epoch }});startIntegrity({{ exam.id }},{{ 'true' if secure_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});{% if security and security.require_exam_pin %}startSecureExamFullscreenLock();{% endif %}</script>
+<script>startTimer({{ end_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});</script>
 {% endblock %}

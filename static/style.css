@@ -516,3 +516,25 @@ body{overflow-x:hidden}
 .secure-fullscreen-lock{position:fixed;inset:0;z-index:10000;background:rgba(8,18,38,.94);display:flex;align-items:center;justify-content:center;padding:24px}
 .secure-fullscreen-card{background:#fff;border-radius:18px;padding:28px;min-width:280px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.35)}
 .secure-fullscreen-card h2{margin:0 0 18px}
+
+/* V57 silent secure-exam shell */
+.secure-exam-shell{position:fixed;inset:0;z-index:20000;background:#fff}
+.secure-exam-frame{display:block;width:100%;height:100%;border:0;background:#fff}
+body.secure-exam-running{overflow:hidden}
+body.secure-exam-running>.site-header,
+body.secure-exam-running>.mobile-menu,
+body.secure-exam-running>main,
+body.secure-exam-running>.site-footer,
+body.secure-exam-running>.skip-link{visibility:hidden}
+body.secure-exam-running>.secure-exam-shell{visibility:visible}
+.silent-fullscreen-guard[hidden]{display:none!important}
+.silent-fullscreen-guard{position:fixed;inset:0;z-index:30000;background:#fff;cursor:default}
+body.secure-exam-shell-page>.site-header,
+body.secure-exam-shell-page>.mobile-menu,
+body.secure-exam-shell-page>.site-footer,
+body.secure-exam-shell-page>.skip-link{display:none!important}
+body.secure-exam-shell-page main.page{padding-top:0;padding-bottom:0;min-height:100vh}
+body.secure-exam-shell-page main.page>.container{max-width:1240px;padding-top:20px;padding-bottom:30px}
+body.secure-exam-shell-page .exam-head{top:0}
+body.secure-exam-shell-page .exam-question:first-of-type{scroll-margin-top:88px}
+body.secure-exam-running .secure-exam-shell{visibility:visible!important}

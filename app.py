@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.15'
+APP_VERSION='2.16'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -754,6 +754,34 @@ def mark_exam_pin_verified(exam_id):
 def exam_pin_is_verified(exam_id):
     value=_exam_pin_verified_map();ts=int(value.get(str(int(exam_id))) or 0)
     return ts>0 and int(time.time())-ts<=SESSION_TIMEOUT_MINUTES*60
+
+
+def create_secure_exam_launch_token(exam_id):
+    token=secrets.token_urlsafe(32)
+    launches=web_session.get('_secure_exam_launches') or {}
+    if not isinstance(launches,dict):launches={}
+    launches[str(int(exam_id))]={'token':token,'issued_at':int(time.time())}
+    web_session['_secure_exam_launches']=launches
+    return token
+
+
+def secure_exam_launch_token_valid(exam_id,token):
+    if not token:return False
+    launches=web_session.get('_secure_exam_launches') or {}
+    if not isinstance(launches,dict):return False
+    row=launches.get(str(int(exam_id))) or {}
+    if not isinstance(row,dict):return False
+    issued_at=int(row.get('issued_at') or 0)
+    expected=str(row.get('token') or '')
+    # The token is never exposed on the dashboard. It only authorizes the
+    # silent same-session exam shell after a successful PIN verification.
+    return bool(expected and issued_at and int(time.time())-issued_at<=SESSION_TIMEOUT_MINUTES*60 and secrets.compare_digest(expected,str(token)))
+
+
+def clear_secure_exam_launch_token(exam_id):
+    launches=web_session.get('_secure_exam_launches') or {}
+    if isinstance(launches,dict) and str(int(exam_id)) in launches:
+        launches.pop(str(int(exam_id)),None);web_session['_secure_exam_launches']=launches
 
 
 def _ensure_student_device_token():
@@ -1582,10 +1610,17 @@ def offline_first_run_guard():
 @app.after_request
 def security_headers(response):
     response.headers.setdefault('X-Content-Type-Options','nosniff')
-    response.headers.setdefault('X-Frame-Options','DENY')
+    # Every page remains non-frameable except the authenticated secure exam
+    # document loaded by our own PIN-verification shell.  That single route is
+    # same-origin only, so external sites still cannot embed the application.
+    secure_exam_frame=bool(request.endpoint=='take_exam' and request.args.get('secure_shell')=='1')
+    response.headers['X-Frame-Options']='SAMEORIGIN' if secure_exam_frame else 'DENY'
     response.headers.setdefault('Referrer-Policy','same-origin')
     response.headers.setdefault('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=(), usb=()')
-    response.headers.setdefault('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    if secure_exam_frame:
+        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
+    else:
+        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     response.headers.setdefault('Cross-Origin-Opener-Policy','same-origin')
     response.headers.setdefault('Cross-Origin-Resource-Policy','same-origin')
     if APP_MODE=='online' and request.is_secure: response.headers.setdefault('Strict-Transport-Security','max-age=31536000; includeSubDomains')
@@ -4295,8 +4330,8 @@ def student_dashboard():
         allowed,access_label,session_row=exam_access_for_student(s,st.id,e)
         if access_label=='Not assigned to your batch/section':continue
         pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=normalize_legacy_manual_subject_exam(s,e.id,get_exam_config(s,e.id));display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
-        subject,unit_label=student_exam_subject_unit(s,e,cfg)
-        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_grouped_exam_display_title(s,e,subject),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label})())
+        subject,unit_label=student_exam_subject_unit(s,e,cfg);security=get_exam_security_policy(s,e.id,create=False)
+        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_grouped_exam_display_title(s,e,subject),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label,'pin_required':bool(security and security.require_exam_pin)})())
 
     grouped={}
     for row in rows:
@@ -4332,14 +4367,22 @@ def verify_student_exam_pin(exam_id):
     if not security or not security.require_exam_pin:return redirect(url_for('take_exam',exam_id=exam_id))
     allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
     if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
+    ajax=request.headers.get('X-Requested-With')=='XMLHttpRequest' or request.accept_mimetypes.best=='application/json'
     if request.method=='POST':
         pin=(request.form.get('exam_pin') or '').strip()
         if rotating_exam_pin_matches(exam_id,student.id,pin):
             device_ok,_lock=ensure_exam_device_lock(s,exam_id,student.id)
             if not device_ok:
-                s.commit();flash('This exam is already locked to another browser/device. Ask the invigilator to reset your device lock.','error');return redirect(url_for('student_dashboard'))
-            mark_exam_pin_verified(exam_id);audit_event(s,'student_rotating_exam_pin_verified','exam',exam_id,f'student_id={student.id}');s.commit();return redirect(url_for('take_exam',exam_id=exam_id))
-        audit_event(s,'student_rotating_exam_pin_failed','exam',exam_id,f'student_id={student.id}, ip={request.remote_addr or ""}');s.commit();flash('The PIN changed or was entered incorrectly. Use the PIN currently shown on screen.','error')
+                s.commit()
+                if ajax:return jsonify(ok=False,error='device_locked'),409
+                flash('This exam is already locked to another browser/device. Ask the invigilator to reset your device lock.','error');return redirect(url_for('student_dashboard'))
+            mark_exam_pin_verified(exam_id);launch_token=create_secure_exam_launch_token(exam_id);audit_event(s,'student_rotating_exam_pin_verified','exam',exam_id,f'student_id={student.id}');s.commit()
+            exam_url=url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=launch_token)
+            if ajax:return jsonify(ok=True,exam_url=exam_url)
+            return redirect(url_for('take_exam',exam_id=exam_id))
+        audit_event(s,'student_rotating_exam_pin_failed','exam',exam_id,f'student_id={student.id}, ip={request.remote_addr or ""}');s.commit()
+        if ajax:return jsonify(ok=False,error='invalid_pin',pin=rotating_exam_pin(exam_id,student.id),seconds_remaining=rotating_exam_pin_seconds_remaining()),400
+        flash('The PIN changed or was entered incorrectly. Use the PIN currently shown on screen.','error')
     return render_template('exam_pin_verify.html',exam=exam,student=student,display_title=student_exam_display_title(s,exam),rotating_pin=rotating_exam_pin(exam_id,student.id),pin_seconds_remaining=rotating_exam_pin_seconds_remaining())
 
 
@@ -4352,7 +4395,12 @@ def take_exam(exam_id):
     if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
     security=get_exam_security_policy(s,exam_id,create=False)
     if security and security.require_exam_pin:
-        if not exam_pin_is_verified(exam_id):return redirect(url_for('verify_student_exam_pin',exam_id=exam_id))
+        # PIN-secured exams must never be resumed directly from the dashboard.
+        # Only the same-session URL issued after a successful PIN check may
+        # render inside the silent secure shell.
+        launch_token=(request.args.get('launch') or '').strip()
+        if request.args.get('secure_shell')!='1' or not exam_pin_is_verified(exam_id) or not secure_exam_launch_token_valid(exam_id,launch_token):
+            return redirect(url_for('verify_student_exam_pin',exam_id=exam_id))
         device_ok,_lock=ensure_exam_device_lock(s,exam_id,web_session['user_id'])
         if not device_ok:
             s.commit();flash('This exam is already locked to another browser/device. Ask the invigilator to reset your device lock.','error');return redirect(url_for('student_dashboard'))
@@ -4390,7 +4438,8 @@ def take_exam(exam_id):
         views.append(type('QuestionView',(),{'id':q.id,'question':q.question,'question_type':qtype,'question_type_label':QUESTION_TYPE_LABELS.get(qtype,qtype),'display_options':display,'marks':q.marks})())
     saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();answers={a.question_id:answer_record_value(a) for a in saved}
     security=get_exam_security_policy(s,exam_id,create=False)
-    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),cfg=cfg,security=security)
+    secure_shell=bool(request.args.get('secure_shell')=='1' and security and security.require_exam_pin)
+    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),cfg=cfg,security=security,secure_shell=secure_shell)
 
 @app.route('/student/save-answer',methods=['POST'])
 @student_required
@@ -4456,6 +4505,9 @@ def submit_exam(exam_id):
             try:save_answer_record(s,attempt.id,qid,value[:MAX_ANSWER_LENGTH],question)
             except ValueError:continue
         s.commit();finalize_attempt(s,attempt)
+    # The secure iframe launch token is single-session exam state. Once the
+    # paper is submitted, discard it before showing the result page.
+    clear_secure_exam_launch_token(exam_id)
     return redirect(url_for('submitted',exam_id=exam_id))
 
 @app.route('/student/submitted/<int:exam_id>')

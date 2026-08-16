@@ -26,7 +26,7 @@
                       {% if e.attempt_status=='submitted' %}
                         <a class="btn small secondary" href="{{ url_for('submitted',exam_id=e.id) }}">View Result</a>
                       {% elif e.can_start %}
-                        <a class="btn small" href="{{ url_for('take_exam',exam_id=e.id) }}">{% if e.attempt_status=='in_progress' %}Resume{% else %}Start{% endif %}</a>
+                        <a class="btn small" href="{{ url_for('verify_student_exam_pin',exam_id=e.id) if e.pin_required else url_for('take_exam',exam_id=e.id) }}">{% if e.attempt_status=='in_progress' %}Resume{% else %}Start{% endif %}</a>
                       {% else %}
                         <span class="badge gray">{{ e.access_label }}</span>
                       {% endif %}
