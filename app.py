@@ -2892,8 +2892,14 @@ def exams():
         cfg=get_exam_config(s,e.id);target=(cfg.question_count if cfg and cfg.question_count else count)
         approval=get_exam_approval(s,e.id,create=True);session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.exam_id==e.id)) or 0
         policy=exam_approval_policy(s,e)
-        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count']})())
-    return render_template('exams.html',exams=rows,subject_exam_options=subject_exam_options)
+        subject,unit_label=student_exam_subject_unit(s,e,cfg)
+        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label})())
+
+    grouped={}
+    for row in rows:
+        grouped.setdefault(row.subject,[]).append(row)
+    exam_groups=[{'subject':subject,'exams':grouped[subject]} for subject in sorted(grouped,key=lambda name:(name in {'General','Mixed Subjects'},name.casefold()))]
+    return render_template('exams.html',exams=rows,exam_groups=exam_groups,subject_exam_options=subject_exam_options)
 
 @app.route('/admin/exam/<int:exam_id>/delete',methods=['POST'])
 @admin_required

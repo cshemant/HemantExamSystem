@@ -490,3 +490,10 @@ body{overflow-x:hidden}
 }
 .practical-delete-icon:hover{background:#fff4f3;color:#912018;transform:none;box-shadow:none}
 .practical-delete-icon svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+
+/* V53 Admin exam organization: Subject > Exams */
+.admin-exam-subject-group{margin-top:18px;padding-top:18px;border-top:1px solid var(--border)}
+.admin-exam-subject-group:first-of-type{margin-top:8px;padding-top:0;border-top:0}
+.admin-exam-subject-group>h3{margin:0 0 10px;font-size:19px;line-height:1.35}
+.admin-exam-subject-group table{margin:0}
