@@ -59,5 +59,49 @@
 </script>
 
 <div class="card"><h2>Create Exam</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Exam Title</label><input name="title" required></div><div><label>Duration (minutes)</label><input name="duration" type="number" min="1" value="30" required></div></div><button>Create Draft Exam</button></form></div>
-<div class="card"><h2>Exam List</h2><div class="table-wrap"><table><tr><th>Title</th><th>Duration</th><th>Pool</th><th>Per Student</th><th>Batch Sessions</th><th>Approval</th><th>Status</th><th>Actions</th></tr>{% for e in exams %}<tr><td><strong>{{ e.title }}</strong>{% if staff_role=='faculty' and e.approval_policy_message %}<div class="mini-meta">{{ e.approval_policy_message }}</div>{% endif %}</td><td>{{ e.duration_minutes }} min</td><td>{{ e.question_count }}</td><td>{{ e.student_question_count }}</td><td>{{ e.session_count }}</td><td>{% if e.approval_status=='approved' %}<span class="badge success">Approved</span>{% elif staff_role=='faculty' and e.self_approval_allowed %}<span class="badge success">Self-approval allowed</span>{% elif staff_role=='faculty' and e.external_approval_required %}<span class="badge warning">Approval required</span>{% elif e.approval_status=='pending' %}<span class="badge warning">Pending</span>{% elif e.approval_status=='rejected' %}<span class="badge danger-badge">Changes requested</span>{% else %}<span class="badge gray">Draft</span>{% endif %}</td><td>{% if e.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge gray">Inactive</span>{% endif %}</td><td><div class="actions"><a class="btn small" href="{{ url_for('exam_builder',exam_id=e.id) }}">Blueprint & Sessions</a><a class="btn small secondary" href="{{ url_for('questions',exam_id=e.id) }}">Questions</a>{% if e.approval_status!='approved' and (staff_role!='faculty' or e.external_approval_required) %}<form method="post" action="{{ url_for('request_exam_approval',exam_id=e.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">Request Approval</button></form>{% endif %}{% if staff_role in ['super_admin','exam_controller','hod'] and e.approval_status!='approved' %}<form method="post" action="{{ url_for('review_exam_approval',exam_id=e.id,decision='approve') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small">Approve</button></form>{% endif %}{% if e.approval_status=='approved' or staff_role!='faculty' or e.self_approval_allowed %}<form method="post" action="{{ url_for('toggle_exam',exam_id=e.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small {% if e.is_active %}secondary{% endif %}">{% if e.is_active %}Deactivate{% elif staff_role=='faculty' and e.approval_status!='approved' and e.self_approval_allowed %}Approve & Activate{% else %}Activate{% endif %}</button></form>{% endif %}</div></td></tr>{% else %}<tr><td colspan="8">No exams created yet.</td></tr>{% endfor %}</table></div></div>
+<div class="card"><h2>Exam List</h2><div class="table-wrap"><table><tr><th>Title</th><th>Duration</th><th>Pool</th><th>Per Student</th><th>Batch Sessions</th><th>Approval</th><th>Status</th><th>Actions</th></tr>{% for e in exams %}<tr><td>
+  <div class="practical-register-leading">
+    {% if staff_role=='super_admin' %}
+    <button type="button" class="practical-delete-icon exam-delete-trigger"
+            data-delete-url="{{ url_for('delete_exam',exam_id=e.id) }}"
+            data-exam-title="{{ e.title|e }}"
+            aria-label="Delete {{ e.title }}" title="Delete {{ e.title }}">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 10v6M14 10v6"/></svg>
+    </button>
+    {% endif %}
+    <div><strong>{{ e.title }}</strong>{% if staff_role=='faculty' and e.approval_policy_message %}<div class="mini-meta">{{ e.approval_policy_message }}</div>{% endif %}</div>
+  </div>
+</td><td>{{ e.duration_minutes }} min</td><td>{{ e.question_count }}</td><td>{{ e.student_question_count }}</td><td>{{ e.session_count }}</td><td>{% if e.approval_status=='approved' %}<span class="badge success">Approved</span>{% elif staff_role=='faculty' and e.self_approval_allowed %}<span class="badge success">Self-approval allowed</span>{% elif staff_role=='faculty' and e.external_approval_required %}<span class="badge warning">Approval required</span>{% elif e.approval_status=='pending' %}<span class="badge warning">Pending</span>{% elif e.approval_status=='rejected' %}<span class="badge danger-badge">Changes requested</span>{% else %}<span class="badge gray">Draft</span>{% endif %}</td><td>{% if e.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge gray">Inactive</span>{% endif %}</td><td><div class="actions"><a class="btn small" href="{{ url_for('exam_builder',exam_id=e.id) }}">Blueprint & Sessions</a><a class="btn small secondary" href="{{ url_for('questions',exam_id=e.id) }}">Questions</a>{% if e.approval_status!='approved' and (staff_role!='faculty' or e.external_approval_required) %}<form method="post" action="{{ url_for('request_exam_approval',exam_id=e.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">Request Approval</button></form>{% endif %}{% if staff_role in ['super_admin','exam_controller','hod'] and e.approval_status!='approved' %}<form method="post" action="{{ url_for('review_exam_approval',exam_id=e.id,decision='approve') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small">Approve</button></form>{% endif %}{% if e.approval_status=='approved' or staff_role!='faculty' or e.self_approval_allowed %}<form method="post" action="{{ url_for('toggle_exam',exam_id=e.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small {% if e.is_active %}secondary{% endif %}">{% if e.is_active %}Deactivate{% elif staff_role=='faculty' and e.approval_status!='approved' and e.self_approval_allowed %}Approve & Activate{% else %}Activate{% endif %}</button></form>{% endif %}</div></td></tr>{% else %}<tr><td colspan="8">No exams created yet.</td></tr>{% endfor %}</table></div></div>
+
+{% if staff_role=='super_admin' %}
+<dialog id="exam-delete-dialog" style="max-width:520px;width:calc(100% - 32px);border:0;border-radius:16px;padding:0;box-shadow:0 18px 60px rgba(15,23,42,.22)">
+  <form id="exam-delete-form" method="post" style="padding:24px;margin:0">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <h2 style="margin-top:0">Delete Exam?</h2>
+    <p id="exam-delete-warning" style="margin-bottom:22px">This will permanently delete this exam and its related marks/results.</p>
+    <div class="actions">
+      <button type="button" class="btn secondary" id="exam-delete-cancel">Cancel</button>
+      <button type="submit" class="btn danger">Yes, Delete</button>
+    </div>
+  </form>
+</dialog>
+<script>
+(function(){
+  const dialog=document.getElementById('exam-delete-dialog');
+  const form=document.getElementById('exam-delete-form');
+  const warning=document.getElementById('exam-delete-warning');
+  const cancel=document.getElementById('exam-delete-cancel');
+  if(!dialog||!form||!warning||!cancel)return;
+  document.querySelectorAll('.exam-delete-trigger').forEach(function(button){
+    button.addEventListener('click',function(){
+      form.action=button.dataset.deleteUrl || '';
+      const title=button.dataset.examTitle || 'this exam';
+      warning.textContent='Delete “'+title+'”? This permanently deletes only this exam and its related questions, student attempts, answers, scores and exam-specific records. The Question Bank and other exams will not be deleted.';
+      dialog.showModal();
+    });
+  });
+  cancel.addEventListener('click',function(){dialog.close();});
+})();
+</script>
+{% endif %}
 {% endblock %}

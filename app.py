@@ -2895,6 +2895,65 @@ def exams():
         rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count']})())
     return render_template('exams.html',exams=rows,subject_exam_options=subject_exam_options)
 
+@app.route('/admin/exam/<int:exam_id>/delete',methods=['POST'])
+@admin_required
+def delete_exam(exam_id):
+    # Permanently delete one exam and only data owned by that exam.
+    # The reusable BankQuestion library is intentionally not touched.
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:
+        abort(404)
+
+    title=exam.title or f'Exam {exam.id}'
+    question_ids=list(s.scalars(select(Question.id).where(Question.exam_id==exam.id)).all())
+    attempt_ids=list(s.scalars(select(Attempt.id).where(Attempt.exam_id==exam.id)).all())
+    edge_result_receipt_ids=list(s.scalars(
+        select(EdgeResultReceipt.id).where(EdgeResultReceipt.target_exam_id==exam.id)
+    ).all())
+
+    answer_count=0
+    if attempt_ids:
+        answer_count=s.scalar(
+            select(func.count()).select_from(Answer).where(Answer.attempt_id.in_(attempt_ids))
+        ) or 0
+
+        s.execute(delete(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id.in_(attempt_ids)))
+        s.execute(delete(IntegrityEvent).where(IntegrityEvent.attempt_id.in_(attempt_ids)))
+        s.execute(delete(Answer).where(Answer.attempt_id.in_(attempt_ids)))
+        s.execute(delete(AttemptQuestion).where(AttemptQuestion.attempt_id.in_(attempt_ids)))
+        s.execute(delete(Attempt).where(Attempt.id.in_(attempt_ids)))
+
+    if edge_result_receipt_ids:
+        s.execute(delete(EdgeResultAttempt).where(
+            EdgeResultAttempt.receipt_id.in_(edge_result_receipt_ids)
+        ))
+        s.execute(delete(EdgeResultReceipt).where(
+            EdgeResultReceipt.id.in_(edge_result_receipt_ids)
+        ))
+
+    s.execute(delete(ExamBankMap).where(ExamBankMap.exam_id==exam.id))
+    if question_ids:
+        s.execute(delete(Question).where(Question.id.in_(question_ids)))
+
+    s.execute(delete(PracticeAttempt).where(PracticeAttempt.exam_id==exam.id))
+    s.execute(delete(ExamSession).where(ExamSession.exam_id==exam.id))
+    s.execute(delete(ExamApproval).where(ExamApproval.exam_id==exam.id))
+    s.execute(delete(ExamPracticeRelease).where(ExamPracticeRelease.exam_id==exam.id))
+    s.execute(delete(ExamSecurityPolicy).where(ExamSecurityPolicy.exam_id==exam.id))
+    s.execute(delete(ExamCandidateCheckin).where(ExamCandidateCheckin.exam_id==exam.id))
+    s.execute(delete(EdgePackageReceipt).where(EdgePackageReceipt.exam_id==exam.id))
+    s.execute(delete(ExamConfig).where(ExamConfig.exam_id==exam.id))
+
+    audit_event(
+        s,'exam_deleted','exam',exam.id,
+        f'title={title}, questions={len(question_ids)}, attempts={len(attempt_ids)}, answers={answer_count}'
+    )
+    s.delete(exam)
+    s.commit()
+    flash(f'Exam “{title}” and its related results/marks were deleted.')
+    return redirect(url_for('exams'))
+
+
 @app.route('/admin/exam/<int:exam_id>/toggle',methods=['POST'])
 @staff_required
 def toggle_exam(exam_id):
