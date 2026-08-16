@@ -132,7 +132,10 @@ class Faculty(Base):
 class Student(Base):
     __tablename__='students'
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    # roll_no is the student's login ID.  Practical-register sync uses the
+    # last five digits of the university registration number here.
     roll_no:Mapped[str]=mapped_column(String,unique=True,nullable=False)
+    registration_no:Mapped[str]=mapped_column(String,nullable=False,default='')
     name:Mapped[str]=mapped_column(String,nullable=False)
     password_hash:Mapped[str]=mapped_column(String,nullable=False)
     created_at:Mapped[str]=mapped_column(String,nullable=False)
@@ -629,6 +632,7 @@ def run_schema_upgrades():
         ('practical_marks','record_marks','FLOAT'),
         ('practical_marks','performance_marks','FLOAT'),
         ('practical_marks','viva_marks','FLOAT'),
+        ('students','registration_no',"VARCHAR NOT NULL DEFAULT ''"),
     )
     for table_name,column_name,ddl in upgrades:
         _ensure_column(table_name,column_name,ddl)
@@ -1300,6 +1304,17 @@ def assign_student_group(s,student_id,group_id):
     elif row:s.delete(row)
 
 
+def _canonical_registration_no(value):
+    """Normalize a university registration number only for duplicate matching."""
+    return ''.join(ch for ch in (value or '').strip().upper() if ch.isalnum())
+
+
+def _student_login_from_registration(value):
+    """Return the last five digits used as both student login ID and default password."""
+    digits=''.join(ch for ch in (value or '') if ch.isdigit())
+    return digits[-5:] if len(digits)>=5 else ''
+
+
 def parse_local_schedule(value):
     value=(value or '').strip()
     if not value:return ''
@@ -1931,7 +1946,7 @@ def _canonical_header(value):
     key=_cell_text(value).lower().replace('-','_').replace(' ','_')
     while '__' in key:key=key.replace('__','_')
     aliases={
-        'roll':'roll_no','rollno':'roll_no','roll_number':'roll_no','student_id':'roll_no','registration_no':'roll_no','registration_number':'roll_no','enrollment_no':'roll_no','enrollment_number':'roll_no',
+        'roll':'roll_no','rollno':'roll_no','roll_number':'roll_no','student_id':'roll_no','registration_no':'registration_no','registration_number':'registration_no','enrollment_no':'registration_no','enrollment_number':'registration_no',
         'student_name':'name','full_name':'name','candidate_name':'name','pass':'password','login_password':'password','student_password':'password',
         'semester':'course_semester','course':'course_semester','co':'co_mapping','bloom':'bloom_level','answer':'correct_answer','correct':'correct_answer','type':'question_type'
     }
@@ -2445,13 +2460,104 @@ def students():
         if not roll or not name or not pw: flash('All student fields are required.','error')
         else:
             try:
-                st=Student(roll_no=roll,name=name,password_hash=generate_password_hash(pw),created_at=now_iso()); s.add(st); s.flush();
+                st=Student(roll_no=roll,registration_no='',name=name,password_hash=generate_password_hash(pw),created_at=now_iso()); s.add(st); s.flush();
                 try:group_id=int(request.form.get('group_id','0') or 0)
                 except ValueError:group_id=0
                 if group_id and s.get(AcademicGroup,group_id):assign_student_group(s,st.id,group_id)
                 audit_event(s,'student_created','student',st.id,roll); s.commit(); flash('Student added.')
             except IntegrityError:s.rollback();flash('Roll number already exists.','error')
-    rows=s.scalars(select(Student).order_by(Student.roll_no)).all();groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();membership=dict(s.execute(select(StudentGroup.student_id,StudentGroup.group_id)).all());group_map={g.id:g for g in groups};return render_template('students.html',students=rows,groups=groups,membership=membership,group_map=group_map,group_label=group_label)
+    rows=s.scalars(select(Student).order_by(Student.roll_no)).all();groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();membership=dict(s.execute(select(StudentGroup.student_id,StudentGroup.group_id)).all());group_map={g.id:g for g in groups};practical_registers=s.scalars(practical_register_stmt(s)).all();return render_template('students.html',students=rows,groups=groups,membership=membership,group_map=group_map,group_label=group_label,practical_registers=practical_registers)
+
+@app.route('/admin/students/sync-practical',methods=['POST'])
+@staff_required
+def sync_students_from_practical():
+    s=DB()
+    try:
+        register_id=int(request.form.get('register_id','0') or 0);group_id=int(request.form.get('group_id','0') or 0)
+    except ValueError:
+        register_id=group_id=0
+    if not register_id or not group_id:
+        flash('Choose a practical list and a batch / section.','error');return redirect(url_for('students'))
+    register=practical_register_access(s,register_id);group=s.get(AcademicGroup,group_id)
+    if not group or not group.is_active:
+        flash('Choose a valid active batch / section.','error');return redirect(url_for('students'))
+    practical_students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.id)).all()
+    if not practical_students:
+        flash('The selected practical list has no students.','error');return redirect(url_for('students'))
+
+    master_students=s.scalars(select(Student)).all()
+    by_login={row.roll_no.strip().casefold():row for row in master_students if row.roll_no}
+    by_registration={}
+    for row in master_students:
+        key=_canonical_registration_no(getattr(row,'registration_no',''))
+        if key:by_registration[key]=row
+        # Backwards compatibility: older accounts may have stored the full
+        # university registration number directly in roll_no.
+        legacy_key=_canonical_registration_no(row.roll_no)
+        if len(legacy_key)>5:by_registration.setdefault(legacy_key,row)
+
+    created=updated=assigned=collisions=invalid=0
+    seen_registration=set();seen_login={}
+    for practical_student in practical_students:
+        registration=(practical_student.roll_no or '').strip();name=(practical_student.name or '').strip()
+        reg_key=_canonical_registration_no(registration);login_id=_student_login_from_registration(registration)
+        if not reg_key or not login_id or not name:
+            invalid+=1;continue
+        if reg_key in seen_registration:
+            continue
+        seen_registration.add(reg_key)
+        previous_reg=seen_login.get(login_id)
+        if previous_reg and previous_reg!=reg_key:
+            collisions+=1;continue
+        seen_login[login_id]=reg_key
+
+        student=by_registration.get(reg_key)
+        login_owner=by_login.get(login_id.casefold())
+        if student is None and login_owner is not None:
+            owner_reg=_canonical_registration_no(getattr(login_owner,'registration_no',''))
+            owner_name=(login_owner.name or '').strip().casefold()
+            if owner_reg and owner_reg!=reg_key:
+                collisions+=1;continue
+            if not owner_reg and owner_name and owner_name!=name.casefold():
+                collisions+=1;continue
+            student=login_owner
+        if student is not None and login_owner is not None and login_owner.id!=student.id:
+            collisions+=1;continue
+
+        if student is None:
+            student=Student(roll_no=login_id,registration_no=registration,name=name,password_hash=generate_password_hash(login_id),created_at=now_iso())
+            s.add(student);s.flush();created+=1
+            by_login[login_id.casefold()]=student;by_registration[reg_key]=student
+        else:
+            changed=False
+            if student.roll_no!=login_id:
+                existing_login=by_login.get(login_id.casefold())
+                if existing_login is not None and existing_login.id!=student.id:
+                    collisions+=1;continue
+                by_login.pop((student.roll_no or '').strip().casefold(),None)
+                student.roll_no=login_id;by_login[login_id.casefold()]=student;changed=True
+            if getattr(student,'registration_no','')!=registration:
+                student.registration_no=registration;changed=True
+            if student.name!=name:
+                student.name=name;changed=True
+            # The requested login rule is deterministic: last five registration
+            # digits are both the login ID and the initial/default password.
+            student.password_hash=generate_password_hash(login_id);changed=True
+            if changed:updated+=1
+
+        membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student.id))
+        if not membership or membership.group_id!=group.id:
+            assign_student_group(s,student.id,group.id);assigned+=1
+
+    audit_event(s,'students_practical_sync','student','',f'register={register.id}, group={group.id}, created={created}, updated={updated}, assigned={assigned}, collisions={collisions}, invalid={invalid}')
+    try:s.commit()
+    except IntegrityError:
+        s.rollback();flash('Student sync stopped because two records would create the same login ID. Check the registration numbers.','error');return redirect(url_for('students'))
+    parts=[f'{created} login'+('' if created==1 else 's')+' created',f'{updated} updated',f'{assigned} batch assignment'+('' if assigned==1 else 's')+' updated']
+    if collisions:parts.append(f'{collisions} login collision'+('' if collisions==1 else 's')+' skipped')
+    if invalid:parts.append(f'{invalid} invalid row'+('' if invalid==1 else 's')+' skipped')
+    flash('Practical list synced: '+', '.join(parts)+'.')
+    return redirect(url_for('students'))
 
 @app.route('/admin/students/import',methods=['POST'])
 @staff_required
@@ -2460,29 +2566,47 @@ def import_students():
     if not upload or not upload.filename: flash('Choose a CSV or Excel (.xlsx) file.','error'); return redirect(url_for('students'))
     try: headers,rows=_rows_from_upload(upload)
     except ValueError as exc: flash(str(exc),'error'); return redirect(url_for('students'))
-    required={'roll_no','name','password'}
-    if not required.issubset(set(headers)): flash('Required columns are: roll_no, name, password.','error'); return redirect(url_for('students'))
-    s=DB(); existing=set(s.scalars(select(Student.roll_no)).all()); seen=set(); added=duplicates=invalid=0
+    if 'name' not in set(headers) or not ({'roll_no','registration_no'} & set(headers)):
+        flash('Required columns are name and either roll_no or registration_no.','error'); return redirect(url_for('students'))
+    s=DB(); master=s.scalars(select(Student)).all()
+    existing_logins={(x.roll_no or '').strip().casefold():x for x in master}
+    existing_regs={_canonical_registration_no(getattr(x,'registration_no','')):x for x in master if _canonical_registration_no(getattr(x,'registration_no',''))}
+    seen_logins=set();seen_regs=set();added=duplicates=invalid=collisions=0
     for row in rows:
-        roll=row.get('roll_no','').strip(); name=row.get('name','').strip(); password=row.get('password','')
-        if not roll or not name or not password: invalid+=1; continue
-        if roll in existing or roll in seen: duplicates+=1; continue
-        st=Student(roll_no=roll,name=name,password_hash=generate_password_hash(password),created_at=now_iso());s.add(st);s.flush()
+        registration=(row.get('registration_no','') or '').strip(); raw_roll=(row.get('roll_no','') or '').strip(); name=(row.get('name','') or '').strip(); password=row.get('password','') or ''
+        login=raw_roll or (_student_login_from_registration(registration) if registration else '')
+        if not name or not login:
+            invalid+=1;continue
+        if registration and not password:password=_student_login_from_registration(registration) or login
+        elif not password:password=login
+        reg_key=_canonical_registration_no(registration) if registration else ''
+        login_key=login.casefold()
+        if login_key in seen_logins or (reg_key and reg_key in seen_regs):duplicates+=1;continue
+        existing=existing_regs.get(reg_key) if reg_key else None
+        login_owner=existing_logins.get(login_key)
+        if existing and login_owner and existing.id!=login_owner.id:
+            collisions+=1;continue
+        if existing or login_owner:
+            duplicates+=1;continue
+        st=Student(roll_no=login,registration_no=registration,name=name,password_hash=generate_password_hash(password),created_at=now_iso());s.add(st);s.flush()
         group=find_or_create_group(s,row.get('department',''),row.get('program',''),row.get('semester',''),row.get('section',''),row.get('academic_year',''))
         if group:assign_student_group(s,st.id,group.id)
-        seen.add(roll); added+=1
+        seen_logins.add(login_key);existing_logins[login_key]=st
+        if reg_key:seen_regs.add(reg_key);existing_regs[reg_key]=st
+        added+=1
     try:
-        audit_event(s,'students_bulk_import','student','',f'added={added}, duplicates={duplicates}, invalid={invalid}'); s.commit()
-    except IntegrityError:s.rollback();flash('Import could not be completed because one or more roll numbers conflict with existing students.','error');return redirect(url_for('students'))
+        audit_event(s,'students_bulk_import','student','',f'added={added}, duplicates={duplicates}, collisions={collisions}, invalid={invalid}'); s.commit()
+    except IntegrityError:s.rollback();flash('Import could not be completed because one or more student login IDs conflict.','error');return redirect(url_for('students'))
     parts=[f'Imported {added} student login'+('' if added==1 else 's')+'.']
-    if duplicates:parts.append(f'Skipped {duplicates} duplicate roll number'+('' if duplicates==1 else 's')+'.')
+    if duplicates:parts.append(f'Skipped {duplicates} existing/duplicate student'+('' if duplicates==1 else 's')+'.')
+    if collisions:parts.append(f'Skipped {collisions} login collision'+('' if collisions==1 else 's')+'.')
     if invalid:parts.append(f'Skipped {invalid} incomplete row'+('' if invalid==1 else 's')+'.')
     flash(' '.join(parts)); return redirect(url_for('students'))
 
 @app.route('/admin/students/template/<fmt>')
 @staff_required
 def student_import_template(fmt):
-    headers=['roll_no','name','password','department','program','semester','section','academic_year']
+    headers=['roll_no','registration_no','name','password','department','program','semester','section','academic_year']
     if fmt=='csv':
         out=io.StringIO(newline=''); writer=csv.writer(out); writer.writerow(headers); data=io.BytesIO(out.getvalue().encode('utf-8-sig')); return send_file(data,mimetype='text/csv',as_attachment=True,download_name='student_import_template.csv')
     if fmt=='xlsx':
