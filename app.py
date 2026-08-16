@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.16'
+APP_VERSION='2.16.1'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -2488,6 +2488,12 @@ def students():
 @app.route('/admin/students/sync-practical',methods=['POST'])
 @staff_required
 def sync_students_from_practical():
+    """Create/update exam logins from an existing practical-register roster.
+
+    The sync is deliberately row-isolated.  A single legacy/duplicate student
+    record must never abort the whole section (this previously surfaced as a
+    generic HTTP 500 for some larger rosters such as Section K).
+    """
     s=DB()
     try:
         register_id=int(request.form.get('register_id','0') or 0);group_id=int(request.form.get('group_id','0') or 0)
@@ -2512,19 +2518,29 @@ def sync_students_from_practical():
     if not practical_students:
         flash('The selected practical list has no students.','error');return redirect(url_for('students'))
 
+    # Build deterministic lookup maps once.  Registration numbers are not a
+    # database unique key in older installations, so explicitly mark any
+    # legacy duplicate registration as ambiguous instead of choosing one row.
     master_students=s.scalars(select(Student)).all()
     by_login={row.roll_no.strip().casefold():row for row in master_students if row.roll_no}
-    by_registration={}
+    by_registration={};ambiguous_registrations=set()
     for row in master_students:
+        keys=[]
         key=_canonical_registration_no(getattr(row,'registration_no',''))
-        if key:by_registration[key]=row
+        if key:keys.append(key)
         # Backwards compatibility: older accounts may have stored the full
         # university registration number directly in roll_no.
         legacy_key=_canonical_registration_no(row.roll_no)
-        if len(legacy_key)>5:by_registration.setdefault(legacy_key,row)
+        if len(legacy_key)>5 and legacy_key not in keys:keys.append(legacy_key)
+        for item_key in keys:
+            previous=by_registration.get(item_key)
+            if previous is not None and previous.id!=row.id:
+                ambiguous_registrations.add(item_key)
+            else:
+                by_registration[item_key]=row
 
-    created=updated=assigned=collisions=invalid=0
-    seen_registration=set();seen_login={}
+    created=updated=assigned=collisions=invalid=failed=0
+    seen_registration=set();seen_login={};failure_types={}
     for practical_student in practical_students:
         registration=(practical_student.roll_no or '').strip();name=(practical_student.name or '').strip()
         reg_key=_canonical_registration_no(registration);login_id=_student_login_from_registration(registration)
@@ -2537,6 +2553,8 @@ def sync_students_from_practical():
         if previous_reg and previous_reg!=reg_key:
             collisions+=1;continue
         seen_login[login_id]=reg_key
+        if reg_key in ambiguous_registrations:
+            collisions+=1;continue
 
         student=by_registration.get(reg_key)
         login_owner=by_login.get(login_id.casefold())
@@ -2551,38 +2569,66 @@ def sync_students_from_practical():
         if student is not None and login_owner is not None and login_owner.id!=student.id:
             collisions+=1;continue
 
-        if student is None:
-            student=Student(roll_no=login_id,registration_no=registration,name=name,password_hash=generate_password_hash(login_id),created_at=now_iso())
-            s.add(student);s.flush();created+=1
-            by_login[login_id.casefold()]=student;by_registration[reg_key]=student
-        else:
-            changed=False
-            if student.roll_no!=login_id:
-                existing_login=by_login.get(login_id.casefold())
-                if existing_login is not None and existing_login.id!=student.id:
-                    collisions+=1;continue
-                by_login.pop((student.roll_no or '').strip().casefold(),None)
-                student.roll_no=login_id;by_login[login_id.casefold()]=student;changed=True
-            if getattr(student,'registration_no','')!=registration:
-                student.registration_no=registration;changed=True
-            if student.name!=name:
-                student.name=name;changed=True
-            # The requested login rule is deterministic: last five registration
-            # digits are both the login ID and the initial/default password.
-            student.password_hash=generate_password_hash(login_id);changed=True
-            if changed:updated+=1
+        # SAVEPOINT per student: malformed/legacy data in one record can no
+        # longer roll back every other student in the section.
+        row_created=row_updated=row_assigned=False
+        old_login=(student.roll_no or '').strip().casefold() if student is not None else ''
+        had_registration=bool(_canonical_registration_no(getattr(student,'registration_no',''))) if student is not None else False
+        try:
+            with s.begin_nested():
+                if student is None:
+                    student=Student(roll_no=login_id,registration_no=registration,name=name,password_hash=generate_password_hash(login_id),created_at=now_iso())
+                    s.add(student);s.flush();row_created=True
+                else:
+                    changed=False;login_changed=False
+                    if student.roll_no!=login_id:
+                        existing_login=by_login.get(login_id.casefold())
+                        if existing_login is not None and existing_login.id!=student.id:
+                            raise IntegrityError('login collision',None,None)
+                        student.roll_no=login_id;changed=True;login_changed=True
+                    if getattr(student,'registration_no','')!=registration:
+                        student.registration_no=registration;changed=True
+                    if student.name!=name:
+                        student.name=name;changed=True
+                    # Do not re-hash/reset every existing student's password on
+                    # each sync. Reset only when converting a legacy login ID or
+                    # when adopting an older account that had no registration no.
+                    if login_changed or not had_registration:
+                        student.password_hash=generate_password_hash(login_id)
+                    row_updated=changed
 
-        membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student.id))
-        if not membership or membership.group_id!=group.id:
-            assign_student_group(s,student.id,group.id);assigned+=1
+                membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student.id))
+                if not membership or membership.group_id!=group.id:
+                    assign_student_group(s,student.id,group.id);row_assigned=True
+                s.flush()
+        except IntegrityError:
+            collisions+=1
+            # The SAVEPOINT has already been rolled back; continue with the
+            # remaining roster rather than returning HTTP 500.
+            continue
+        except Exception as exc:
+            failed+=1;failure_types[type(exc).__name__]=failure_types.get(type(exc).__name__,0)+1
+            continue
 
-    audit_event(s,'students_practical_sync','student','',f'register={register.id}, group={group.id}, created={created}, updated={updated}, assigned={assigned}, collisions={collisions}, invalid={invalid}')
-    try:s.commit()
+        if row_created:created+=1
+        if row_updated:updated+=1
+        if row_assigned:assigned+=1
+        if old_login and old_login!=login_id.casefold():by_login.pop(old_login,None)
+        by_login[login_id.casefold()]=student;by_registration[reg_key]=student
+
+    detail=f'register={register.id}, group={group.id}, created={created}, updated={updated}, assigned={assigned}, collisions={collisions}, invalid={invalid}, failed={failed}'
+    if failure_types:detail+=', failure_types='+json.dumps(failure_types,sort_keys=True)
+    audit_event(s,'students_practical_sync','student','',detail)
+    try:
+        s.commit()
     except IntegrityError:
         s.rollback();flash('Student sync stopped because two records would create the same login ID. Check the registration numbers.','error');return redirect(url_for('students'))
+    except Exception as exc:
+        s.rollback();flash(f'Student sync could not be saved ({type(exc).__name__}). No practical data was changed.','error');return redirect(url_for('students'))
     parts=[f'{created} login'+('' if created==1 else 's')+' created',f'{updated} updated',f'{assigned} batch assignment'+('' if assigned==1 else 's')+' updated']
-    if collisions:parts.append(f'{collisions} login collision'+('' if collisions==1 else 's')+' skipped')
+    if collisions:parts.append(f'{collisions} login/data collision'+('' if collisions==1 else 's')+' skipped')
     if invalid:parts.append(f'{invalid} invalid row'+('' if invalid==1 else 's')+' skipped')
+    if failed:parts.append(f'{failed} legacy/problem row'+('' if failed==1 else 's')+' skipped')
     flash('Practical list synced: '+', '.join(parts)+'.')
     return redirect(url_for('students'))
 
