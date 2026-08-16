@@ -1315,6 +1315,23 @@ def _student_login_from_registration(value):
     return digits[-5:] if len(digits)>=5 else ''
 
 
+def _section_code(value):
+    """Extract a compact section code such as E/K from a label when possible."""
+    raw=(value or '').strip()
+    if not raw:return ''
+    match=re.search(r'\bsection\s*[-:/]?\s*([A-Za-z0-9]+)\b',raw,re.I)
+    if match:return match.group(1).strip().upper()
+    # A practical register often stores only the section letter in this field.
+    if re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,7}',raw) and not re.search(r'\bsem(?:ester)?\b',raw,re.I):
+        return raw.upper()
+    return ''
+
+
+def _practical_register_section_code(register):
+    """Prefer the register's Section/Batch field, then its title."""
+    return _section_code(getattr(register,'section','')) or _section_code(getattr(register,'title',''))
+
+
 def parse_local_schedule(value):
     value=(value or '').strip()
     if not value:return ''
@@ -2466,7 +2483,7 @@ def students():
                 if group_id and s.get(AcademicGroup,group_id):assign_student_group(s,st.id,group_id)
                 audit_event(s,'student_created','student',st.id,roll); s.commit(); flash('Student added.')
             except IntegrityError:s.rollback();flash('Roll number already exists.','error')
-    rows=s.scalars(select(Student).order_by(Student.roll_no)).all();groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();membership=dict(s.execute(select(StudentGroup.student_id,StudentGroup.group_id)).all());group_map={g.id:g for g in groups};practical_registers=s.scalars(practical_register_stmt(s)).all();return render_template('students.html',students=rows,groups=groups,membership=membership,group_map=group_map,group_label=group_label,practical_registers=practical_registers)
+    rows=s.scalars(select(Student).order_by(Student.roll_no)).all();groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();membership=dict(s.execute(select(StudentGroup.student_id,StudentGroup.group_id)).all());group_map={g.id:g for g in groups};practical_registers=s.scalars(practical_register_stmt(s)).all();return render_template('students.html',students=rows,groups=groups,membership=membership,group_map=group_map,group_label=group_label,practical_registers=practical_registers,section_code=_section_code,practical_section_code=_practical_register_section_code)
 
 @app.route('/admin/students/sync-practical',methods=['POST'])
 @staff_required
@@ -2481,6 +2498,16 @@ def sync_students_from_practical():
     register=practical_register_access(s,register_id);group=s.get(AcademicGroup,group_id)
     if not group or not group.is_active:
         flash('Choose a valid active batch / section.','error');return redirect(url_for('students'))
+    register_section=_practical_register_section_code(register)
+    group_section=_section_code(group.section)
+    if register_section and group_section and register_section!=group_section:
+        flash(f'This practical list belongs to Section {register_section}; it cannot be synced to Section {group_section}.','error')
+        return redirect(url_for('students'))
+    register_year=(register.academic_year or '').strip()
+    group_year=(group.academic_year or '').strip()
+    if register_year and group_year and register_year.casefold()!=group_year.casefold():
+        flash(f'This practical list is for {register_year}; choose a batch / section from the same academic year.','error')
+        return redirect(url_for('students'))
     practical_students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.id)).all()
     if not practical_students:
         flash('The selected practical list has no students.','error');return redirect(url_for('students'))
@@ -2635,13 +2662,33 @@ def academic_groups():
     groups=s.scalars(select(AcademicGroup).order_by(AcademicGroup.academic_year.desc(),AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all()
     counts=dict(s.execute(select(StudentGroup.group_id,func.count()).group_by(StudentGroup.group_id)).all())
     students_list=s.scalars(select(Student).order_by(Student.roll_no)).all();memberships=dict(s.execute(select(StudentGroup.student_id,StudentGroup.group_id)).all())
-    return render_template('groups.html',groups=groups,counts=counts,students=students_list,memberships=memberships,group_label=group_label)
+    return render_template('groups.html',groups=groups,counts=counts,students=students_list,memberships=memberships,group_label=group_label,staff_role=current_staff_role(s))
 
 @app.route('/admin/groups/<int:group_id>/toggle',methods=['POST'])
 @staff_required
 def toggle_group(group_id):
     s=DB();row=s.get(AcademicGroup,group_id)
     if row:row.is_active=not row.is_active;audit_event(s,'academic_group_enabled' if row.is_active else 'academic_group_disabled','group',row.id,group_label(row));s.commit()
+    return redirect(url_for('academic_groups'))
+
+@app.route('/admin/groups/<int:group_id>/delete',methods=['POST'])
+@admin_required
+def delete_group(group_id):
+    """Delete only the exam-system batch/section mapping, never practical-register data."""
+    s=DB();row=s.get(AcademicGroup,group_id)
+    if not row:abort(404)
+    label=group_label(row)
+    member_count=s.scalar(select(func.count()).select_from(StudentGroup).where(StudentGroup.group_id==row.id)) or 0
+    session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.group_id==row.id)) or 0
+    # Student accounts remain intact and become Unassigned. Exam records remain
+    # intact; only sessions that explicitly target this deleted group are removed.
+    # PracticalRegister / PracticalStudent / PracticalMark are intentionally not
+    # referenced here, so lab lists and marks are preserved unchanged.
+    s.execute(delete(StudentGroup).where(StudentGroup.group_id==row.id))
+    s.execute(delete(ExamSession).where(ExamSession.group_id==row.id))
+    audit_event(s,'academic_group_deleted','group',row.id,f'{label}; students_unassigned={member_count}; exam_sessions_removed={session_count}; practical_data_preserved=1')
+    s.delete(row);s.commit()
+    flash(f'{label} deleted. {member_count} student account'+(' was' if member_count==1 else 's were')+' left unassigned; practical lists and practical marks were not changed.')
     return redirect(url_for('academic_groups'))
 
 @app.route('/admin/question-bank',methods=['GET','POST'])
