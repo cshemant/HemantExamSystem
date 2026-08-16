@@ -507,3 +507,12 @@ body{overflow-x:hidden}
 }
 .exam-edit-icon:hover{background:#f2f6ff;color:#0b4cc4;transform:none;box-shadow:none}
 .exam-edit-icon svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+
+.rotating-pin-box{display:flex;align-items:center;gap:14px;margin:14px 0 20px;padding:14px 18px;border:1px solid #cfe0ff;border-radius:14px;background:#f5f8ff;width:max-content;max-width:100%}
+.rotating-pin-value{font-size:32px;font-weight:800;letter-spacing:.18em;color:#0b5cff;font-variant-numeric:tabular-nums}
+.rotating-pin-timer{min-width:46px;font-weight:800;color:#5d6b82;font-variant-numeric:tabular-nums}
+.secure-fullscreen-lock[hidden]{display:none!important}
+.secure-fullscreen-lock{position:fixed;inset:0;z-index:10000;background:rgba(8,18,38,.94);display:flex;align-items:center;justify-content:center;padding:24px}
+.secure-fullscreen-card{background:#fff;border-radius:18px;padding:28px;min-width:280px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+.secure-fullscreen-card h2{margin:0 0 18px}

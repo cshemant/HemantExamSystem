@@ -1,0 +1,17 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><a class="back-link" href="{{ url_for('exam_builder',exam_id=exam.id) }}">← Blueprint &amp; Sessions</a><h1>{{ exam.title }}</h1></div>
+<div class="card">
+  <div class="import-header"><div><h2>Student Access Security</h2></div><span class="badge {{ 'success' if security and security.require_exam_pin else 'gray' }}">{{ 'Enabled' if security and security.require_exam_pin else 'Disabled' }}</span></div>
+  <form method="post" action="{{ url_for('update_exam_student_access_security',exam_id=exam.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="checkline"><input type="checkbox" name="require_exam_pin" {% if security and security.require_exam_pin %}checked{% endif %}> Require rotating 6-digit Exam PIN + single-device lock</label>
+    <button>Save Security</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Device Locks</h2>
+  <div class="table-wrap"><table><thead><tr><th>Roll No</th><th>Name</th><th>Device</th><th>Action</th></tr></thead><tbody>
+    {% for row in rows %}<tr><td><strong>{{ row.student.roll_no }}</strong></td><td>{{ row.student.name }}</td><td>{{ 'Locked' if row.locked else 'Not locked' }}</td><td>{% if row.locked %}<form method="post" action="{{ url_for('reset_exam_student_device',exam_id=exam.id,student_id=row.student.id) }}" onsubmit="return confirm('Reset the device lock for {{ row.student.roll_no }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn secondary small">Reset Device</button></form>{% else %}—{% endif %}</td></tr>{% else %}<tr><td colspan="4">No eligible students are available for this exam.</td></tr>{% endfor %}
+  </tbody></table></div>
+</div>
+{% endblock %}

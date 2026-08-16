@@ -1,0 +1,48 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><h1>{{ display_title }}</h1></div>
+<div class="card exam-pin-card" style="max-width:720px">
+  <h2>Verify Exam PIN</h2>
+  <div class="rotating-pin-box">
+    <div id="rotating-exam-pin" class="rotating-pin-value">{{ rotating_pin }}</div>
+    <div class="rotating-pin-timer"><span id="pin-countdown">{{ pin_seconds_remaining }}</span>s</div>
+  </div>
+  <form id="exam-pin-form" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Roll Number</label><input value="{{ student.roll_no }}" disabled>
+    <label>6-digit Exam PIN</label><input name="exam_pin" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" required autofocus>
+    <button id="exam-pin-submit">Continue to Exam</button>
+  </form>
+</div>
+<script>
+(function(){
+  const pinEl=document.getElementById('rotating-exam-pin');
+  const countdownEl=document.getElementById('pin-countdown');
+  const form=document.getElementById('exam-pin-form');
+  let remaining={{ pin_seconds_remaining|int }};
+  async function refreshPin(){
+    try{
+      const res=await fetch('{{ url_for("current_student_exam_pin",exam_id=exam.id) }}',{cache:'no-store'});
+      if(!res.ok)return;
+      const data=await res.json();
+      pinEl.textContent=data.pin;remaining=data.seconds_remaining;countdownEl.textContent=remaining;
+    }catch(_err){}
+  }
+  setInterval(()=>{remaining=Math.max(0,remaining-1);countdownEl.textContent=remaining;if(remaining<=0)refreshPin();},1000);
+  form.addEventListener('submit',async event=>{
+    if(form.dataset.submitting==='1')return;
+    event.preventDefault();
+    const input=form.querySelector('input[name="exam_pin"]');
+    const button=document.getElementById('exam-pin-submit');
+    if(input && input.value.trim()!==pinEl.textContent.trim()){
+      await refreshPin();
+      if(input.value.trim()!==pinEl.textContent.trim()){
+        input.setCustomValidity('Enter the PIN currently shown above.');input.reportValidity();input.setCustomValidity('');return;
+      }
+    }
+    if(button)button.disabled=true;
+    try{if(document.documentElement.requestFullscreen && !document.fullscreenElement)await document.documentElement.requestFullscreen();}catch(_err){}
+    form.dataset.submitting='1';form.submit();
+  });
+})();
+</script>
+{% endblock %}

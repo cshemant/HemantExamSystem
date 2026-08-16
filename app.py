@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.13'
+APP_VERSION='2.15'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -411,8 +411,30 @@ class ExamSecurityPolicy(Base):
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
     exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
     require_candidate_checkin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    require_exam_pin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     heartbeat_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=15)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class ExamStudentAccess(Base):
+    __tablename__='exam_student_access'
+    __table_args__=(UniqueConstraint('exam_id','student_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    pin_hash:Mapped[str]=mapped_column(String,nullable=False)
+    pin_ciphertext:Mapped[str]=mapped_column(Text,nullable=False)
+    issued_at:Mapped[str]=mapped_column(String,nullable=False)
+    issued_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class ExamDeviceLock(Base):
+    __tablename__='exam_device_locks'
+    __table_args__=(UniqueConstraint('exam_id','student_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    device_hash:Mapped[str]=mapped_column(String(64),nullable=False)
+    locked_at:Mapped[str]=mapped_column(String,nullable=False)
+    last_seen_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class ExamCandidateCheckin(Base):
     __tablename__='exam_candidate_checkins'
@@ -596,6 +618,7 @@ def run_schema_upgrades():
         ('admins','mfa_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('faculty_users','mfa_secret',"VARCHAR NOT NULL DEFAULT ''"),
         ('faculty_users','mfa_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_policies','require_exam_pin',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('audit_logs','prev_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('audit_logs','event_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('practical_registers','attendance_max_marks','INTEGER NOT NULL DEFAULT 5'),
@@ -621,7 +644,7 @@ def run_schema_upgrades():
 def get_exam_security_policy(s,exam_id,create=False):
     row=s.scalar(select(ExamSecurityPolicy).where(ExamSecurityPolicy.exam_id==exam_id))
     if not row and create:
-        row=ExamSecurityPolicy(exam_id=exam_id,require_candidate_checkin=False,heartbeat_seconds=15,updated_at=now_iso())
+        row=ExamSecurityPolicy(exam_id=exam_id,require_candidate_checkin=False,require_exam_pin=False,heartbeat_seconds=15,updated_at=now_iso())
         s.add(row);s.flush()
     return row
 
@@ -629,6 +652,147 @@ def get_exam_security_policy(s,exam_id,create=False):
 def candidate_is_checked_in(s,exam_id,student_id):
     row=s.scalar(select(ExamCandidateCheckin).where(ExamCandidateCheckin.exam_id==exam_id,ExamCandidateCheckin.student_id==student_id))
     return bool(row and row.status=='verified')
+
+
+def _exam_pin_fernet():
+    key=base64.urlsafe_b64encode(hashlib.sha256((str(app.secret_key)+'|exam-pin-v1').encode('utf-8')).digest())
+    return Fernet(key)
+
+
+def encrypt_exam_pin(pin):
+    return _exam_pin_fernet().encrypt(str(pin).encode('utf-8')).decode('ascii')
+
+
+def decrypt_exam_pin(value):
+    try:return _exam_pin_fernet().decrypt((value or '').encode('ascii')).decode('utf-8')
+    except Exception:return ''
+
+
+def exam_pin_record(s,exam_id,student_id):
+    return s.scalar(select(ExamStudentAccess).where(ExamStudentAccess.exam_id==exam_id,ExamStudentAccess.student_id==student_id))
+
+
+def exam_pin_matches(s,exam_id,student_id,pin):
+    row=exam_pin_record(s,exam_id,student_id)
+    return bool(row and pin and check_password_hash(row.pin_hash,str(pin).strip()))
+
+
+ROTATING_EXAM_PIN_SECONDS=60
+ROTATING_EXAM_PIN_GRACE_SECONDS=3
+
+
+def rotating_exam_pin(exam_id,student_id,at_time=None):
+    now=int(time.time() if at_time is None else at_time)
+    slot=now//ROTATING_EXAM_PIN_SECONDS
+    payload=f'exam-rotating-pin-v1|{int(exam_id)}|{int(student_id)}|{slot}'.encode('utf-8')
+    digest=hmac.new(str(app.secret_key).encode('utf-8'),payload,hashlib.sha256).digest()
+    return f'{int.from_bytes(digest[:8],"big")%1000000:06d}'
+
+
+def rotating_exam_pin_seconds_remaining(at_time=None):
+    now=int(time.time() if at_time is None else at_time)
+    return ROTATING_EXAM_PIN_SECONDS-(now%ROTATING_EXAM_PIN_SECONDS)
+
+
+def rotating_exam_pin_matches(exam_id,student_id,pin,at_time=None):
+    value=str(pin or '').strip()
+    if not re.fullmatch(r'\d{6}',value):return False
+    now=int(time.time() if at_time is None else at_time)
+    if secrets.compare_digest(value,rotating_exam_pin(exam_id,student_id,now)):return True
+    # Tiny rollover grace avoids rejecting a code typed just as the 60-second window changes.
+    if now%ROTATING_EXAM_PIN_SECONDS<=ROTATING_EXAM_PIN_GRACE_SECONDS:
+        return secrets.compare_digest(value,rotating_exam_pin(exam_id,student_id,now-ROTATING_EXAM_PIN_SECONDS))
+    return False
+
+
+def eligible_students_for_exam(s,exam_id):
+    sessions=s.scalars(select(ExamSession).where(ExamSession.exam_id==exam_id)).all()
+    if not sessions:
+        return s.scalars(select(Student).order_by(Student.roll_no)).all()
+    group_ids={row.group_id for row in sessions}
+    if not group_ids:return []
+    return s.scalars(select(Student).join(StudentGroup,StudentGroup.student_id==Student.id).where(StudentGroup.group_id.in_(group_ids)).order_by(Student.roll_no)).all()
+
+
+def generate_exam_pins(s,exam_id,regenerate=False,issued_by=''):
+    students=eligible_students_for_exam(s,exam_id);created=0;kept=0;used=set()
+    existing=s.scalars(select(ExamStudentAccess)).all()
+    for row in existing:
+        pin=decrypt_exam_pin(row.pin_ciphertext)
+        if pin:used.add(pin)
+    for student in students:
+        row=exam_pin_record(s,exam_id,student.id)
+        if row and not regenerate:
+            kept+=1;continue
+        if row and regenerate:
+            old=decrypt_exam_pin(row.pin_ciphertext)
+            if old:used.discard(old)
+        pin=''
+        for _ in range(50):
+            candidate=f'{secrets.randbelow(900000)+100000:06d}'
+            if candidate not in used:
+                pin=candidate;break
+        if not pin:raise RuntimeError('Could not generate a unique Exam PIN.')
+        used.add(pin)
+        if not row:
+            row=ExamStudentAccess(exam_id=exam_id,student_id=student.id,pin_hash='',pin_ciphertext='',issued_at=now_iso(),issued_by=issued_by or '')
+            s.add(row)
+        row.pin_hash=generate_password_hash(pin);row.pin_ciphertext=encrypt_exam_pin(pin);row.issued_at=now_iso();row.issued_by=issued_by or ''
+        created+=1
+    return created,kept,len(students)
+
+
+def _exam_pin_verified_map():
+    value=web_session.get('_exam_pin_verified') or {}
+    return value if isinstance(value,dict) else {}
+
+
+def mark_exam_pin_verified(exam_id):
+    value=_exam_pin_verified_map();value[str(int(exam_id))]=int(time.time());web_session['_exam_pin_verified']=value
+
+
+def exam_pin_is_verified(exam_id):
+    value=_exam_pin_verified_map();ts=int(value.get(str(int(exam_id))) or 0)
+    return ts>0 and int(time.time())-ts<=SESSION_TIMEOUT_MINUTES*60
+
+
+def _ensure_student_device_token():
+    token=(web_session.get('_student_device_token') or '').strip()
+    if not token:
+        token=secrets.token_urlsafe(24);web_session['_student_device_token']=token
+    return token
+
+
+def current_student_device_hash():
+    token=_ensure_student_device_token();ua=(request.headers.get('User-Agent') or '')[:500]
+    return hmac.new(str(app.secret_key).encode('utf-8'),f'{token}|{ua}'.encode('utf-8'),hashlib.sha256).hexdigest()
+
+
+def ensure_exam_device_lock(s,exam_id,student_id):
+    device_hash=current_student_device_hash();row=s.scalar(select(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam_id,ExamDeviceLock.student_id==student_id))
+    if not row:
+        row=ExamDeviceLock(exam_id=exam_id,student_id=student_id,device_hash=device_hash,locked_at=now_iso(),last_seen_at=now_iso());s.add(row);s.flush()
+        audit_event(s,'exam_device_locked','exam',exam_id,f'student_id={student_id}')
+        return True,row
+    if not secrets.compare_digest(row.device_hash,device_hash):
+        audit_event(s,'exam_device_lock_blocked','exam',exam_id,f'student_id={student_id}, ip={request.remote_addr or ""}')
+        return False,row
+    row.last_seen_at=now_iso();return True,row
+
+
+def secure_exam_device_allowed(s,attempt):
+    security=get_exam_security_policy(s,attempt.exam_id,create=False)
+    if not security or not security.require_exam_pin:return True
+    row=s.scalar(select(ExamDeviceLock).where(ExamDeviceLock.exam_id==attempt.exam_id,ExamDeviceLock.student_id==attempt.student_id))
+    return bool(row and secrets.compare_digest(row.device_hash,current_student_device_hash()))
+
+
+def find_active_exam_for_pin(s,student_id,pin):
+    if not pin:return None
+    rows=s.execute(select(ExamStudentAccess,Exam).join(Exam,Exam.id==ExamStudentAccess.exam_id).join(ExamSecurityPolicy,ExamSecurityPolicy.exam_id==Exam.id).where(ExamStudentAccess.student_id==student_id,Exam.is_active==True,ExamSecurityPolicy.require_exam_pin==True).order_by(Exam.id.desc())).all()
+    for access,exam in rows:
+        if check_password_hash(access.pin_hash,str(pin).strip()):return exam
+    return None
 
 
 PRACTICE_VISIBILITY_LABELS={
@@ -1389,7 +1553,9 @@ def csrf_and_session_setup():
     if web_session.get('role'):
         last=int(web_session.get('_last_activity',now_ts))
         if now_ts-last>SESSION_TIMEOUT_MINUTES*60:
-            web_session.clear();web_session['_csrf_token']=secrets.token_urlsafe(32);flash('Your session expired after inactivity. Please sign in again.','error')
+            device_token=web_session.get('_student_device_token');web_session.clear();web_session['_csrf_token']=secrets.token_urlsafe(32)
+            if device_token:web_session['_student_device_token']=device_token
+            flash('Your session expired after inactivity. Please sign in again.','error')
             if request.endpoint not in {'home','static','health'}:return redirect(url_for('home'))
         else:web_session['_last_activity']=now_ts
     if '_csrf_token' not in web_session: web_session['_csrf_token']=secrets.token_urlsafe(32)
@@ -1703,7 +1869,7 @@ def edge_exam_payload(s,exam):
             'easy_pct':cfg.easy_pct,'medium_pct':cfg.medium_pct,'hard_pct':cfg.hard_pct,'unit_weights':cfg.unit_weights,
             'randomize_questions':bool(cfg.randomize_questions),'shuffle_options':bool(cfg.shuffle_options),'require_fullscreen':bool(cfg.require_fullscreen),'tab_switch_limit':cfg.tab_switch_limit
         } if cfg else {}),
-        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'heartbeat_seconds':security.heartbeat_seconds} if security else {}),
+        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'require_exam_pin':bool(security.require_exam_pin),'heartbeat_seconds':security.heartbeat_seconds} if security else {}),
         'questions':[{'question':q.question,'question_type':canonical_question_type(q.question_type),'option_a':q.option_a,'option_b':q.option_b,'option_c':q.option_c,'option_d':q.option_d,'correct_answer':q.correct_answer,'answer_key':q.answer_key,'answer_tolerance':q.answer_tolerance,'answer_case_sensitive':bool(q.answer_case_sensitive),'marks':q.marks} for q in questions],
     }
 
@@ -1791,8 +1957,9 @@ def home():
         if valid:
             clear_auth_failures(s,throttle_key)
             if role=='student':
-                csrf=web_session.get('_csrf_token');web_session.clear();web_session['_csrf_token']=csrf
-                web_session.update(role='student',user_id=row.id,username=row.roll_no,_last_activity=int(time.time()));audit_event(s,'student_login','user',row.id,'student')
+                csrf=web_session.get('_csrf_token');device_token=web_session.get('_student_device_token') or secrets.token_urlsafe(24);web_session.clear();web_session['_csrf_token']=csrf;web_session['_student_device_token']=device_token
+                web_session.update(role='student',user_id=row.id,username=row.roll_no,_last_activity=int(time.time()))
+                audit_event(s,'student_login','user',row.id,'student')
                 s.commit();return redirect(url_for('student_dashboard'))
             if bool(getattr(row,'mfa_enabled',False)) and (getattr(row,'mfa_secret','') or '').strip():
                 return begin_staff_mfa(row,role)
@@ -1856,7 +2023,10 @@ def staff_mfa_settings():
 
 
 @app.route('/logout')
-def logout(): web_session.clear(); return redirect(url_for('home'))
+def logout():
+    device_token=web_session.get('_student_device_token');web_session.clear()
+    if device_token:web_session['_student_device_token']=device_token
+    return redirect(url_for('home'))
 
 @app.route('/health')
 def health():
@@ -3001,6 +3171,8 @@ def delete_exam(exam_id):
     s.execute(delete(ExamApproval).where(ExamApproval.exam_id==exam.id))
     s.execute(delete(ExamPracticeRelease).where(ExamPracticeRelease.exam_id==exam.id))
     s.execute(delete(ExamSecurityPolicy).where(ExamSecurityPolicy.exam_id==exam.id))
+    s.execute(delete(ExamStudentAccess).where(ExamStudentAccess.exam_id==exam.id))
+    s.execute(delete(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam.id))
     s.execute(delete(ExamCandidateCheckin).where(ExamCandidateCheckin.exam_id==exam.id))
     s.execute(delete(EdgePackageReceipt).where(EdgePackageReceipt.exam_id==exam.id))
     s.execute(delete(ExamConfig).where(ExamConfig.exam_id==exam.id))
@@ -3034,7 +3206,8 @@ def toggle_exam(exam_id):
                         flash(policy['message'] or 'This exam requires HOD / Exam Controller approval before activation. Use Request Approval first.','error');return redirect(request.referrer or url_for('exams'))
                 else:
                     flash('This exam requires HOD / Exam Controller approval before activation. Use Request Approval first.','error');return redirect(request.referrer or url_for('exams'))
-        e.is_active=not bool(e.is_active);audit_event(s,'exam_activated' if e.is_active else 'exam_deactivated','exam',e.id,e.title);s.commit()
+        e.is_active=not bool(e.is_active)
+        audit_event(s,'exam_activated' if e.is_active else 'exam_deactivated','exam',e.id,e.title);s.commit()
     return redirect(url_for('exams'))
 
 
@@ -3121,7 +3294,7 @@ def import_edge_exam_package():
         easy=int(cfg_data.get('easy_pct') or 30);medium=int(cfg_data.get('medium_pct') or 50);hard=int(cfg_data.get('hard_pct') or 20)
         if easy+medium+hard!=100:easy,medium,hard=30,50,20
         cfg.easy_pct=max(0,easy);cfg.medium_pct=max(0,medium);cfg.hard_pct=max(0,hard);cfg.unit_weights=str(cfg_data.get('unit_weights') or '')[:2000];cfg.randomize_questions=bool(cfg_data.get('randomize_questions',True));cfg.shuffle_options=bool(cfg_data.get('shuffle_options',True));cfg.require_fullscreen=bool(cfg_data.get('require_fullscreen',False));cfg.tab_switch_limit=max(0,min(100,int(cfg_data.get('tab_switch_limit') or 3)));cfg.last_generation_summary=f'Imported from encrypted Edge package {pid}.';cfg.updated_at=now_iso()
-        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.heartbeat_seconds=max(10,min(60,int(security_data.get('heartbeat_seconds') or 15)));security.updated_at=now_iso()
+        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(10,min(60,int(security_data.get('heartbeat_seconds') or 15)));security.updated_at=now_iso()
         for idx,item in enumerate(qrows,1):
             if not isinstance(item,dict):raise ValueError(f'Question {idx} is malformed.')
             qtype=canonical_question_type(item.get('question_type'));question_text=str(item.get('question') or '').strip();options={key:str(item.get(f'option_{key.lower()}') or '').strip() for key in 'ABCD'};answer_key=str(item.get('answer_key') or item.get('correct_answer') or '').strip() if qtype!='essay' else '';tolerance=str(item.get('answer_tolerance') or '').strip();error=validate_question_definition(qtype,question_text,options,answer_key,tolerance)
@@ -3215,7 +3388,7 @@ def exam_builder(exam_id):
         if easy+medium+hard!=100:flash('Difficulty distribution must total 100%.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         try:unit_weights=parse_unit_weights(request.form.get('unit_weights',''))
         except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
-        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.updated_at=now_iso();s.flush()
+        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.updated_at=now_iso();s.flush()
         if action=='generate':
             if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)>0:flash('This exam already has attempts. The question pool is locked to protect result integrity.','error');s.rollback();return redirect(url_for('exam_builder',exam_id=exam_id))
             stmt=select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
@@ -3237,11 +3410,68 @@ def exam_builder(exam_id):
             if unit_weights:summary+=' Units: '+', '.join(f'{k}={uc.get(k,0)}' for k in unit_weights)+'.'
             if added<pool_size:summary+=' Bank does not yet contain enough approved questions for the requested blueprint.'
             cfg.last_generation_summary=summary;audit_event(s,'exam_pool_generated','exam',exam_id,summary);s.commit();flash(summary);return redirect(url_for('exam_builder',exam_id=exam_id))
-        audit_event(s,'exam_blueprint_saved','exam',exam_id,f'questions={qcount}, pool={pool_size}');s.commit();flash('Exam blueprint and integrity settings saved.');return redirect(url_for('exam_builder',exam_id=exam_id))
+        audit_event(s,'exam_blueprint_saved','exam',exam_id,f'questions={qcount}, pool={pool_size}, rotating_pin={security.require_exam_pin}');s.commit();flash('Exam blueprint and integrity settings saved.');return redirect(url_for('exam_builder',exam_id=exam_id))
     subjects=s.scalars(select(BankQuestion.subject).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both'])).distinct().order_by(BankQuestion.subject)).all();pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0;attempt_count=s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0
     try:unit_weights_display=', '.join(f'{k}:{v}' for k,v in json.loads(cfg.unit_weights or '{}').items())
     except Exception:unit_weights_display=''
     groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);approval_policy=exam_approval_policy(s,exam);practice_release=get_exam_practice_release(s,exam_id,create=True);s.commit();return render_template('exam_builder.html',exam=exam,cfg=cfg,security=security,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,approval_policy=approval_policy,practice_release=practice_release,group_label=group_label,can_approve=can_approve_exams(s))
+
+@app.route('/admin/exam/<int:exam_id>/student-access')
+@staff_required
+def exam_student_access_admin(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    security=get_exam_security_policy(s,exam_id,create=True);students=eligible_students_for_exam(s,exam_id)
+    student_ids=[st.id for st in students]
+    lock_rows=s.scalars(select(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam_id,ExamDeviceLock.student_id.in_(student_ids))).all() if student_ids else []
+    lock_map={row.student_id:row for row in lock_rows};rows=[]
+    for st in students:
+        lock=lock_map.get(st.id)
+        rows.append(type('StudentAccessView',(),{'student':st,'locked':bool(lock),'last_seen_at':lock.last_seen_at if lock else ''})())
+    s.commit();return render_template('exam_student_access.html',exam=exam,security=security,rows=rows)
+
+
+@app.route('/admin/exam/<int:exam_id>/student-access/security',methods=['POST'])
+@staff_required
+def update_exam_student_access_security(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    security=get_exam_security_policy(s,exam_id,create=True);security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.updated_at=now_iso()
+    audit_event(s,'exam_rotating_pin_security_updated','exam',exam_id,f'enabled={security.require_exam_pin}');s.commit();flash('Rotating Exam PIN security enabled.' if security.require_exam_pin else 'Rotating Exam PIN security disabled.')
+    return redirect(url_for('exam_student_access_admin',exam_id=exam_id))
+
+
+@app.route('/admin/exam/<int:exam_id>/student-access/generate',methods=['POST'])
+@staff_required
+def generate_exam_student_access(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    flash('The Exam PIN is generated automatically and changes every 60 seconds.')
+    return redirect(url_for('exam_student_access_admin',exam_id=exam_id))
+
+
+@app.route('/admin/exam/<int:exam_id>/student-access.csv')
+@staff_required
+def exam_student_access_csv(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    students=eligible_students_for_exam(s,exam_id);out=io.StringIO(newline='');writer=csv.writer(out);writer.writerow(['roll_no','name','exam_title','exam_pin'])
+    for st in students:
+        access=exam_pin_record(s,exam_id,st.id);writer.writerow([st.roll_no,st.name,exam.title,decrypt_exam_pin(access.pin_ciphertext) if access else ''])
+    data=io.BytesIO(out.getvalue().encode('utf-8-sig'));audit_event(s,'exam_pin_list_exported','exam',exam_id,f'students={len(students)}');s.commit()
+    return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'exam_{exam_id}_student_pins.csv')
+
+
+@app.route('/admin/exam/<int:exam_id>/student-access/<int:student_id>/reset-device',methods=['POST'])
+@staff_required
+def reset_exam_student_device(exam_id,student_id):
+    s=DB();exam=s.get(Exam,exam_id);student=s.get(Student,student_id)
+    if not exam or not student:abort(404)
+    row=s.scalar(select(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam_id,ExamDeviceLock.student_id==student_id))
+    if row:s.delete(row)
+    audit_event(s,'exam_device_lock_reset','exam',exam_id,f'student={student.roll_no}, by={actor_label(s)}');s.commit();flash(f'Device lock reset for {student.roll_no}.')
+    return redirect(url_for('exam_student_access_admin',exam_id=exam_id))
+
 
 @app.route('/admin/exam/<int:exam_id>/practice-release',methods=['POST'])
 @staff_required
@@ -4079,6 +4309,40 @@ def student_dashboard():
         exam_groups.append({'subject':subject,'units':units})
     return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups)
 
+@app.route('/student/exam/<int:exam_id>/current-pin')
+@student_required
+def current_student_exam_pin(exam_id):
+    s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True));student=s.get(Student,web_session['user_id'])
+    if not exam or not student:abort(404)
+    security=get_exam_security_policy(s,exam_id,create=False)
+    if not security or not security.require_exam_pin:abort(404)
+    allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
+    if not allowed:return jsonify({'error':access_label}),403
+    response=jsonify({'pin':rotating_exam_pin(exam_id,student.id),'seconds_remaining':rotating_exam_pin_seconds_remaining()})
+    response.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0'
+    return response
+
+
+@app.route('/student/exam/<int:exam_id>/verify-pin',methods=['GET','POST'])
+@student_required
+def verify_student_exam_pin(exam_id):
+    s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True));student=s.get(Student,web_session['user_id'])
+    if not exam or not student:abort(404)
+    security=get_exam_security_policy(s,exam_id,create=False)
+    if not security or not security.require_exam_pin:return redirect(url_for('take_exam',exam_id=exam_id))
+    allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
+    if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
+    if request.method=='POST':
+        pin=(request.form.get('exam_pin') or '').strip()
+        if rotating_exam_pin_matches(exam_id,student.id,pin):
+            device_ok,_lock=ensure_exam_device_lock(s,exam_id,student.id)
+            if not device_ok:
+                s.commit();flash('This exam is already locked to another browser/device. Ask the invigilator to reset your device lock.','error');return redirect(url_for('student_dashboard'))
+            mark_exam_pin_verified(exam_id);audit_event(s,'student_rotating_exam_pin_verified','exam',exam_id,f'student_id={student.id}');s.commit();return redirect(url_for('take_exam',exam_id=exam_id))
+        audit_event(s,'student_rotating_exam_pin_failed','exam',exam_id,f'student_id={student.id}, ip={request.remote_addr or ""}');s.commit();flash('The PIN changed or was entered incorrectly. Use the PIN currently shown on screen.','error')
+    return render_template('exam_pin_verify.html',exam=exam,student=student,display_title=student_exam_display_title(s,exam),rotating_pin=rotating_exam_pin(exam_id,student.id),pin_seconds_remaining=rotating_exam_pin_seconds_remaining())
+
+
 @app.route('/student/exam/<int:exam_id>')
 @student_required
 def take_exam(exam_id):
@@ -4086,6 +4350,13 @@ def take_exam(exam_id):
     if not exam:flash('Exam is not active.','error');return redirect(url_for('student_dashboard'))
     allowed,access_label,_session=exam_access_for_student(s,web_session['user_id'],exam)
     if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
+    security=get_exam_security_policy(s,exam_id,create=False)
+    if security and security.require_exam_pin:
+        if not exam_pin_is_verified(exam_id):return redirect(url_for('verify_student_exam_pin',exam_id=exam_id))
+        device_ok,_lock=ensure_exam_device_lock(s,exam_id,web_session['user_id'])
+        if not device_ok:
+            s.commit();flash('This exam is already locked to another browser/device. Ask the invigilator to reset your device lock.','error');return redirect(url_for('student_dashboard'))
+        s.commit()
     cfg=normalize_legacy_manual_subject_exam(s,exam_id,get_exam_config(s,exam_id));attempt=get_attempt(s,web_session['user_id'],exam_id)
     if attempt and attempt.status=='submitted':return redirect(url_for('submitted',exam_id=exam_id))
     if not attempt:
@@ -4131,6 +4402,7 @@ def save_answer():
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt:return jsonify(error='Attempt not found'),404
     if attempt.status=='submitted':return jsonify(saved=False,submitted=True)
+    if not secure_exam_device_allowed(s,attempt):return jsonify(error='Exam is locked to another device.',device_locked=True),409
     if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt);return jsonify(saved=False,submitted=True)
     if qid not in attempt_question_ids(s,attempt):return jsonify(error='Question not part of this attempt'),400
     question=s.get(Question,qid)
@@ -4148,6 +4420,7 @@ def integrity_event():
     if event_type not in {'tab_hidden','fullscreen_exit','copy_attempt','paste_attempt','context_menu'}:return jsonify(saved=False),400
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt or attempt.status=='submitted':return jsonify(saved=False),404
+    if not secure_exam_device_allowed(s,attempt):return jsonify(saved=False,device_locked=True),409
     s.add(IntegrityEvent(attempt_id=attempt.id,event_type=event_type,details=str(data.get('details',''))[:250],created_at=now_iso()));s.commit();count=s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0;return jsonify(saved=True,count=count)
 
 @app.route('/student/heartbeat',methods=['POST'])
@@ -4158,6 +4431,9 @@ def student_heartbeat():
     except Exception:return jsonify(saved=False),400
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt or attempt.status=='submitted':return jsonify(saved=False),404
+    if not secure_exam_device_allowed(s,attempt):return jsonify(saved=False,device_locked=True),409
+    device_lock=s.scalar(select(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam_id,ExamDeviceLock.student_id==attempt.student_id))
+    if device_lock:device_lock.last_seen_at=now_iso()
     count=s.scalar(select(func.count()).select_from(Answer).where(Answer.attempt_id==attempt.id)) or 0
     row=s.scalar(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id==attempt.id));fingerprint=hashlib.sha256(((request.headers.get('User-Agent') or '')+'|'+(request.remote_addr or '')).encode('utf-8')).hexdigest()[:24]
     if not row:row=AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=int(count),client_state=str(data.get('state') or 'active')[:30],client_fingerprint=fingerprint);s.add(row)
@@ -4169,6 +4445,7 @@ def student_heartbeat():
 def submit_exam(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt:flash('Attempt not found.','error');return redirect(url_for('student_dashboard'))
+    if not secure_exam_device_allowed(s,attempt):flash('This exam is locked to another browser/device. Ask the invigilator to reset your device lock.','error');return redirect(url_for('student_dashboard'))
     allowed=set(attempt_question_ids(s,attempt))
     if attempt.status!='submitted':
         questions={q.id:q for q in (s.scalars(select(Question).where(Question.id.in_(allowed))).all() if allowed else [])}

@@ -431,3 +431,21 @@ function initPracticalMarks(){
   });
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initPracticalMarks); else initPracticalMarks();
+
+
+function startSecureExamFullscreenLock(){
+  const overlay=document.getElementById('secure-fullscreen-lock');
+  const button=document.getElementById('secure-fullscreen-enter');
+  if(!overlay) return;
+  const supported=typeof document.documentElement.requestFullscreen==='function';
+  const sync=()=>{
+    if(!supported){overlay.hidden=true;return;}
+    overlay.hidden=!!document.fullscreenElement;
+  };
+  if(button) button.addEventListener('click',async()=>{
+    try{await document.documentElement.requestFullscreen();}catch(_err){}
+    sync();
+  });
+  document.addEventListener('fullscreenchange',sync);
+  sync();
+}
