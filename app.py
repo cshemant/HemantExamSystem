@@ -2899,7 +2899,62 @@ def exams():
     for row in rows:
         grouped.setdefault(row.subject,[]).append(row)
     exam_groups=[{'subject':subject,'exams':grouped[subject]} for subject in sorted(grouped,key=lambda name:(name in {'General','Mixed Subjects'},name.casefold()))]
-    return render_template('exams.html',exams=rows,exam_groups=exam_groups,subject_exam_options=subject_exam_options)
+    return render_template(
+        'exams.html',exams=rows,exam_groups=exam_groups,
+        subject_exam_options=subject_exam_options,catalog_subjects=catalog_subjects
+    )
+
+@app.route('/admin/exam/<int:exam_id>/edit-metadata',methods=['POST'])
+@admin_required
+def edit_exam_metadata(exam_id):
+    s=DB()
+    if current_staff_role(s)!='super_admin':
+        abort(403)
+    exam=s.get(Exam,exam_id)
+    if not exam:
+        abort(404)
+
+    title=(request.form.get('title') or '').strip()
+    if not title:
+        flash('Exam title is required.','error')
+        return redirect(url_for('exams'))
+
+    subject_value=(request.form.get('subject_id') or '').strip()
+    if subject_value=='__general__':
+        subject_name='General'
+        course_semester=''
+    else:
+        try:
+            subject_id=int(subject_value)
+        except (TypeError,ValueError):
+            flash('Choose a valid subject section.','error')
+            return redirect(url_for('exams'))
+        catalog_subject=s.get(SubjectCatalog,subject_id)
+        if not catalog_subject or not catalog_subject.is_active:
+            flash('The selected subject is not available.','error')
+            return redirect(url_for('exams'))
+        subject_name=catalog_subject.name
+        course_semester=catalog_subject.course_semester or ''
+
+    cfg=get_exam_config(s,exam.id,create=True)
+    old_title=exam.title or ''
+    old_subject,_old_unit=student_exam_subject_unit(s,exam,cfg)
+    exam.title=title
+    cfg.subject=subject_name
+    if course_semester:
+        cfg.course_semester=course_semester
+    summary=(cfg.last_generation_summary or '').strip()
+    if 'manual_subject_override=1' not in summary.lower():
+        summary=(summary+'; ' if summary else '')+'manual_subject_override=1'
+    cfg.last_generation_summary=summary
+    cfg.updated_at=now_iso()
+    audit_event(
+        s,'exam_metadata_edited','exam',exam.id,
+        f'title={old_title} -> {title}, subject={old_subject} -> {subject_name}'
+    )
+    s.commit()
+    flash(f'Updated “{title}” and moved it to {subject_name}.')
+    return redirect(url_for('exams')+f'#exam-{exam.id}')
 
 @app.route('/admin/exam/<int:exam_id>/delete',methods=['POST'])
 @admin_required
@@ -3949,10 +4004,18 @@ def student_exam_subject_unit(s, exam, cfg):
     mapped_subjects=sorted({(row[0] or '').strip() for row in mapped if (row[0] or '').strip()},key=str.casefold)
     mapped_units=sorted({(row[1] or '').strip() for row in mapped if (row[1] or '').strip()},key=lambda value:(int(value) if str(value).isdigit() else 10**9,str(value).casefold()))
 
-    # The mapped Question Bank is the strongest source of truth for a Ready
-    # Exam. This prevents an exam from being placed under a title-like or stale
-    # ExamConfig subject when all of its questions belong to one real subject.
-    if len(mapped_subjects)==1:
+    # A Super Admin can explicitly repair legacy exam metadata from the Exam
+    # List. That intentional override must win over old Question Bank mappings;
+    # otherwise a corrected exam can jump back into its previous/General group.
+    manual_subject_override=bool(
+        cfg and 'manual_subject_override=1' in ((cfg.last_generation_summary or '').lower())
+    )
+
+    # For normal Ready Exams the mapped Question Bank remains the strongest
+    # source of truth. This protects newer exams from stale ExamConfig metadata.
+    if manual_subject_override and configured_subject:
+        subject=configured_subject
+    elif len(mapped_subjects)==1:
         subject=mapped_subjects[0]
     elif configured_subject:
         subject=configured_subject

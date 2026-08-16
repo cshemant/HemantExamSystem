@@ -67,9 +67,16 @@
     <div class="table-wrap"><table>
       <tr><th>Title</th><th>Duration</th><th>Pool</th><th>Per Student</th><th>Batch Sessions</th><th>Approval</th><th>Status</th><th>Actions</th></tr>
       {% for e in group.exams %}
-      <tr><td>
+      <tr id="exam-{{ e.id }}"><td>
         <div class="practical-register-leading">
           {% if staff_role=='super_admin' %}
+          <button type="button" class="exam-edit-icon exam-edit-trigger"
+                  data-edit-url="{{ url_for('edit_exam_metadata',exam_id=e.id) }}"
+                  data-exam-title="{{ e.title|e }}"
+                  data-current-subject="{{ e.subject|e }}"
+                  aria-label="Edit {{ e.title }}" title="Edit title / subject">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4zM13.5 6.5l4 4"/></svg>
+          </button>
           <button type="button" class="practical-delete-icon exam-delete-trigger"
                   data-delete-url="{{ url_for('delete_exam',exam_id=e.id) }}"
                   data-exam-title="{{ e.title|e }}"
@@ -90,6 +97,60 @@
 </div>
 
 {% if staff_role=='super_admin' %}
+<dialog id="exam-edit-dialog" style="max-width:560px;width:calc(100% - 32px);border:0;border-radius:16px;padding:0;box-shadow:0 18px 60px rgba(15,23,42,.22)">
+  <form id="exam-edit-form" method="post" style="padding:24px;margin:0">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <h2 style="margin-top:0">Edit Exam</h2>
+    <div style="display:grid;gap:16px;margin-bottom:22px">
+      <div>
+        <label for="exam-edit-title">Exam Title</label>
+        <input id="exam-edit-title" name="title" required>
+      </div>
+      <div>
+        <label for="exam-edit-subject">Subject Section</label>
+        <select id="exam-edit-subject" name="subject_id" required>
+          <option value="__general__" data-subject-name="General">General</option>
+          {% for subject in catalog_subjects %}
+          <option value="{{ subject.id }}" data-subject-name="{{ subject.name|e }}">{{ subject.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn secondary" id="exam-edit-cancel">Cancel</button>
+      <button type="submit" class="btn">Save Changes</button>
+    </div>
+  </form>
+</dialog>
+<script>
+(function(){
+  const dialog=document.getElementById('exam-edit-dialog');
+  const form=document.getElementById('exam-edit-form');
+  const titleInput=document.getElementById('exam-edit-title');
+  const subjectSelect=document.getElementById('exam-edit-subject');
+  const cancel=document.getElementById('exam-edit-cancel');
+  if(!dialog||!form||!titleInput||!subjectSelect||!cancel)return;
+  document.querySelectorAll('.exam-edit-trigger').forEach(function(button){
+    button.addEventListener('click',function(){
+      form.action=button.dataset.editUrl || '';
+      titleInput.value=button.dataset.examTitle || '';
+      const currentSubject=button.dataset.currentSubject || 'General';
+      let matched=false;
+      Array.from(subjectSelect.options).forEach(function(option){
+        if(option.dataset.subjectName===currentSubject){
+          subjectSelect.value=option.value;
+          matched=true;
+        }
+      });
+      if(!matched)subjectSelect.value='__general__';
+      dialog.showModal();
+      titleInput.focus();
+    });
+  });
+  cancel.addEventListener('click',function(){dialog.close();});
+})();
+</script>
+
 <dialog id="exam-delete-dialog" style="max-width:520px;width:calc(100% - 32px);border:0;border-radius:16px;padding:0;box-shadow:0 18px 60px rgba(15,23,42,.22)">
   <form id="exam-delete-form" method="post" style="padding:24px;margin:0">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

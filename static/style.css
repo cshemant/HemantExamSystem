@@ -497,3 +497,13 @@ body{overflow-x:hidden}
 .admin-exam-subject-group:first-of-type{margin-top:8px;padding-top:0;border-top:0}
 .admin-exam-subject-group>h3{margin:0 0 10px;font-size:19px;line-height:1.35}
 .admin-exam-subject-group table{margin:0}
+
+
+/* V54 Super Admin exam metadata edit icon */
+.exam-edit-icon{
+  width:30px;min-width:30px;height:30px;min-height:30px;padding:0;
+  border:1px solid #b9cffd;border-radius:8px;background:#fff;color:var(--primary);
+  box-shadow:none;transform:none
+}
+.exam-edit-icon:hover{background:#f2f6ff;color:#0b4cc4;transform:none;box-shadow:none}
+.exam-edit-icon svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
