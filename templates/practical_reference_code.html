@@ -7,6 +7,13 @@
     <textarea name="reference_code" rows="20" spellcheck="false" placeholder="Paste the correct experiment code here...">{{ experiment.reference_code }}</textarea>
     <label>or upload code file</label>
     <input type="file" name="code_file" accept=".txt,.java,.kt,.xml,.c,.cpp,.py,.html,.js,.css">
+
+    <div style="margin-top:24px">
+      <label>Penalty Words / Lines (0.5 mark per matched word)</label>
+      <textarea name="penalty_rules" rows="7" spellcheck="false" placeholder="One rule per line&#10;toggleButton&#10;toggleButton = findViewById(R.id.toggleButton);">{{ experiment.penalty_rules or '' }}</textarea>
+      <p class="muted">A single word deducts 0.5 for each exact occurrence. An exact multi-word line deducts 0.5 for each word in that configured line.</p>
+    </div>
+
     <div class="actions"><button type="submit">Save Reference Code</button><a class="btn secondary" href="{{ url_for('practical_register_detail',register_id=register.id) }}">Cancel</a></div>
   </form>
 </div>

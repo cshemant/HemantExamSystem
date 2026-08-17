@@ -560,6 +560,9 @@ class PracticalExperiment(Base):
     # Faculty reference program used for deterministic Practical Code evaluation.
     # It is never shown to students.
     reference_code:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    # Optional faculty-defined exact-match penalty rules for Practical Code.
+    # One rule per line; rules are never exposed to students.
+    penalty_rules:Mapped[str]=mapped_column(Text,nullable=False,default='')
     max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=10)
     sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     created_at:Mapped[str]=mapped_column(String,nullable=False)
@@ -661,6 +664,7 @@ def run_schema_upgrades():
         ('practical_registers','performance_max_marks','INTEGER NOT NULL DEFAULT 10'),
         ('practical_registers','viva_max_marks','INTEGER NOT NULL DEFAULT 10'),
         ('practical_experiments','reference_code',"TEXT NOT NULL DEFAULT ''"),
+        ('practical_experiments','penalty_rules',"TEXT NOT NULL DEFAULT ''"),
         ('practical_marks','attendance_marks','FLOAT'),
         ('practical_marks','record_marks','FLOAT'),
         ('practical_marks','performance_marks','FLOAT'),
@@ -2396,6 +2400,7 @@ def practical_reference_code(register_id,experiment_id):
     if not experiment or experiment.register_id!=register.id:abort(404)
     if request.method=='POST':
         upload=request.files.get('code_file');code=(request.form.get('reference_code') or '')
+        penalty_rules=(request.form.get('penalty_rules') or '')
         if upload and upload.filename:
             raw=upload.read()
             if len(raw)>512*1024:
@@ -2406,8 +2411,19 @@ def practical_reference_code(register_id,experiment_id):
         code=code.strip()
         if len(code)>250000:
             flash('Reference code is too large.','error');return redirect(url_for('practical_reference_code',register_id=register.id,experiment_id=experiment.id))
-        experiment.reference_code=code;register.updated_at=now_iso()
-        audit_event(s,'practical_reference_code_updated','practical_experiment',experiment.id,f'register={register.id}, experiment={experiment.experiment_no}, configured={bool(code)}')
+        if len(penalty_rules)>20000:
+            flash('Penalty rules are too large.','error');return redirect(url_for('practical_reference_code',register_id=register.id,experiment_id=experiment.id))
+        # Keep one non-empty rule per line and remove exact duplicates while
+        # preserving faculty order.  Rules remain private on the admin side.
+        cleaned_rules=[];seen_rules=set()
+        for rule in penalty_rules.replace('\r\n','\n').replace('\r','\n').split('\n'):
+            rule=rule.strip()
+            if rule and rule not in seen_rules:
+                cleaned_rules.append(rule);seen_rules.add(rule)
+        experiment.reference_code=code
+        experiment.penalty_rules='\n'.join(cleaned_rules)
+        register.updated_at=now_iso()
+        audit_event(s,'practical_reference_code_updated','practical_experiment',experiment.id,f'register={register.id}, experiment={experiment.experiment_no}, configured={bool(code)}, penalty_rules={len(cleaned_rules)}')
         s.commit();flash('Reference code saved.' if code else 'Reference code cleared.')
         return redirect(url_for('practical_register_detail',register_id=register.id))
     return render_template('practical_reference_code.html',register=register,experiment=experiment)
@@ -2763,6 +2779,45 @@ def evaluate_practical_code(reference_code,student_code):
     coverage_penalty=0.20+0.80*length_ratio
     score=(0.35*sequence+0.20*multiset+0.45*behavior)*coverage_penalty
     return max(0.0,min(1.0,score))
+
+
+def practical_code_exact_penalty(student_code,penalty_rules,per_word=0.5):
+    """Calculate faculty-defined exact-match deductions without executing code.
+
+    Rules are private and one-per-line.  A rule containing exactly one normal
+    identifier/keyword is matched as a case-sensitive whole word and deducts
+    ``per_word`` for every occurrence.  Any other rule is treated as an exact
+    code line after harmless whitespace normalization; each exact occurrence
+    deducts ``per_word`` for every word/token configured in that rule.
+    """
+    source=(student_code or '').replace('\r\n','\n').replace('\r','\n')
+    rules=(penalty_rules or '').replace('\r\n','\n').replace('\r','\n')
+    normalized_source_lines=[' '.join(line.strip().split()) for line in source.split('\n')]
+    details=[];total_units=0
+    seen=set()
+    for raw_rule in rules.split('\n'):
+        rule=raw_rule.strip()
+        if not rule or rule in seen:
+            continue
+        seen.add(rule)
+        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',rule):
+            pattern=rf'(?<![A-Za-z0-9_]){re.escape(rule)}(?![A-Za-z0-9_])'
+            occurrences=len(re.findall(pattern,source))
+            units=occurrences
+            kind='word'
+        else:
+            normalized_rule=' '.join(rule.split())
+            occurrences=sum(1 for line in normalized_source_lines if line==normalized_rule)
+            # "0.5 per word": count source-language words/identifiers/numbers in
+            # the configured line, with a minimum of one penalty unit.
+            words=re.findall(r'[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)?',rule)
+            units=occurrences*max(1,len(words))
+            kind='line'
+        if occurrences:
+            total_units+=units
+            details.append({'rule':rule,'kind':kind,'occurrences':occurrences,'units':units})
+    deduction=round(float(total_units)*float(per_word),2)
+    return {'deduction':deduction,'units':total_units,'matches':details}
 
 
 PRACTICAL_CODE_PEER_COPY_THRESHOLD=0.97
@@ -5338,8 +5393,11 @@ def student_practical_code():
 
         similarity=evaluate_practical_code(reference,source)
         performance_max=float(practical_marks_maxima(register)['performance'])
-        performance_value=round((similarity*performance_max)*2.0)/2.0
-        performance_value=max(0.0,min(performance_max,performance_value))
+        base_performance_value=round((similarity*performance_max)*2.0)/2.0
+        base_performance_value=max(0.0,min(performance_max,base_performance_value))
+        penalty=practical_code_exact_penalty(source,getattr(experiment,'penalty_rules','') or '',0.5)
+        penalty_deduction=min(base_performance_value,float(penalty.get('deduction',0.0) or 0.0))
+        performance_value=max(0.0,base_performance_value-penalty_deduction)
 
         # A correct solution may naturally resemble the faculty reference.  Copy
         # prevention therefore compares this submission only with OTHER students
@@ -5444,10 +5502,14 @@ def student_practical_code():
         audit_event(
             s,'practical_code_auto_evaluated','practical_mark',mark.id or '',
             f'exam={exam.id}, student={student.id}, roll={practical_student.roll_no}, experiment={experiment.experiment_no}, '
-            f'similarity={round(similarity*100,2)}, performance={performance_value}/{performance_max}, match={target.get("match_basis","")}'
+            f'similarity={round(similarity*100,2)}, base_performance={base_performance_value}/{performance_max}, '
+            f'penalty={penalty_deduction}, penalty_units={penalty.get("units",0)}, performance={performance_value}/{performance_max}, match={target.get("match_basis","")}'
         )
         s.commit()
-        flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g}.')
+        if penalty_deduction:
+            flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g} (exact-match deduction: {penalty_deduction:g}).')
+        else:
+            flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g}.')
         return redirect(url_for('student_practical_code',exam_id=exam.id))
 
     if not selected_exam_id and len(rows)==1:selected_exam_id=rows[0]['exam'].id
