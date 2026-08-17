@@ -1,5 +1,5 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div><div class="eyebrow">Practical Exam</div><h1>Practical Code</h1></div></div>
+<div class="page-head"><div><div class="eyebrow">Practical Exam</div><h1>Practical Marks</h1></div></div>
 {% for row in rows %}
 {% set exam=row.exam %}{% set target=row.target %}{% set submission=row.submission %}
 <div class="card" {% if selected_exam_id==exam.id %}id="practical-code-current"{% endif %}>
@@ -13,10 +13,11 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="exam_id" value="{{ exam.id }}">
         <label>Your Code</label>
-        <textarea name="source_code" rows="20" spellcheck="false" required placeholder="Paste your practical code here...">{{ submission.source_code if submission else '' }}</textarea>
+        <textarea name="source_code" rows="20" spellcheck="false" required autocomplete="off" data-practical-code-editor placeholder="Type your practical code here...">{{ submission.source_code if submission else '' }}</textarea>
+        <p class="muted" data-practical-paste-warning hidden>Clipboard paste is disabled for Practical Code. Type the code yourself.</p>
         <div class="actions"><button type="submit">Evaluate &amp; Save Performance</button></div>
       </form>
-      {% if submission %}<p class="muted">Last saved Performance: <strong>{{ '%g'|format(submission.performance_marks) }}</strong> / {{ target.register.performance_max_marks }}</p>{% endif %}
+      {% if submission %}<p class="muted">Performance Marks: <strong>{{ '%g'|format(submission.performance_marks) }}</strong> / {{ target.register.performance_max_marks }}</p>{% endif %}
     {% else %}
       <p class="muted">Reference code for this experiment has not been configured by faculty yet.</p>
     {% endif %}
@@ -25,4 +26,20 @@
   {% endif %}
 </div>
 {% endfor %}
+<script>
+document.addEventListener('DOMContentLoaded',()=>{
+  document.querySelectorAll('[data-practical-code-editor]').forEach(editor=>{
+    const warning=editor.parentElement.querySelector('[data-practical-paste-warning]');
+    const blockPaste=(event)=>{
+      event.preventDefault();
+      if(warning){warning.hidden=false;clearTimeout(warning._hideTimer);warning._hideTimer=setTimeout(()=>warning.hidden=true,3500);}
+    };
+    editor.addEventListener('paste',blockPaste);
+    editor.addEventListener('drop',blockPaste);
+    editor.addEventListener('beforeinput',event=>{
+      if(event.inputType==='insertFromPaste'||event.inputType==='insertFromDrop')blockPaste(event);
+    });
+  });
+});
+</script>
 {% endblock %}

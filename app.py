@@ -2781,7 +2781,7 @@ def evaluate_practical_code(reference_code,student_code):
     return max(0.0,min(1.0,score))
 
 
-def practical_code_exact_penalty(student_code,penalty_rules,per_word=1.0):
+def practical_code_exact_penalty(student_code,penalty_rules,per_word=0.5):
     """Calculate faculty-defined exact-match deductions without executing code.
 
     Rules are private and one-per-line.  A rule containing exactly one normal
@@ -5395,7 +5395,7 @@ def student_practical_code():
         performance_max=float(practical_marks_maxima(register)['performance'])
         base_performance_value=round((similarity*performance_max)*2.0)/2.0
         base_performance_value=max(0.0,min(performance_max,base_performance_value))
-        penalty=practical_code_exact_penalty(source,getattr(experiment,'penalty_rules','') or '',1.0)
+        penalty=practical_code_exact_penalty(source,getattr(experiment,'penalty_rules','') or '',0.5)
         penalty_deduction=min(base_performance_value,float(penalty.get('deduction',0.0) or 0.0))
         performance_value=max(0.0,base_performance_value-penalty_deduction)
 
@@ -5506,10 +5506,10 @@ def student_practical_code():
             f'penalty={penalty_deduction}, penalty_units={penalty.get("units",0)}, performance={performance_value}/{performance_max}, match={target.get("match_basis","")}'
         )
         s.commit()
-        if penalty_deduction:
-            flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g} (exact-match deduction: {penalty_deduction:g}).')
-        else:
-            flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g}.')
+        # Keep faculty-configured exact-match penalties private. Students only
+        # see their final Performance score; deduction details remain available
+        # to staff through the audit trail.
+        flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g}.')
         return redirect(url_for('student_practical_code',exam_id=exam.id))
 
     if not selected_exam_id and len(rows)==1:selected_exam_id=rows[0]['exam'].id
