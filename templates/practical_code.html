@@ -1,9 +1,8 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div><div class="eyebrow">Practical Exam</div><h1>Practical Marks</h1></div></div>
+<div class="page-head"><div><h1>Practical Marks</h1></div></div>
 {% for row in rows %}
 {% set exam=row.exam %}{% set target=row.target %}{% set submission=row.submission %}{% set mark=row.practical_mark %}{% set maxima=row.mark_maxima %}
 <div class="card" {% if selected_exam_id==exam.id %}id="practical-code-current"{% endif %}>
-  <h2>{{ exam.title }}</h2>
   <p class="muted">Experiment {{ row.meta.experiment_no }}{% if target.ok %} · {{ target.experiment.title }}{% endif %}</p>
   {% if target.ok %}
     <div class="table-wrap" style="margin:14px 0 18px">
