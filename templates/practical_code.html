@@ -27,19 +27,24 @@
         </tbody>
       </table>
     </div>
-    {% if not row.can_submit %}
-      <p class="muted">{{ row.access_label }}</p>
-    {% elif target.experiment.reference_code %}
-      <form method="post" action="{{ url_for('student_practical_code') }}">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <input type="hidden" name="exam_id" value="{{ exam.id }}">
+    {% if target.experiment.reference_code %}
+      {% if row.can_submit %}
+        <form method="post" action="{{ url_for('student_practical_code') }}" data-practical-code-form data-practical-end-epoch-ms="{{ row.code_window.end_epoch_ms or '' }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="exam_id" value="{{ exam.id }}">
+          <label>Your Code</label>
+          <textarea name="source_code" rows="20" spellcheck="false" required autocomplete="off" data-practical-code-editor placeholder="Type your practical code here...">{{ submission.source_code if submission else '' }}</textarea>
+          <p class="muted" data-practical-paste-warning hidden>Clipboard paste is disabled for Practical Code. Type the code yourself.</p>
+          <div class="actions"><button type="submit">Evaluate &amp; Save Performance</button></div>
+        </form>
+      {% else %}
+        {% if row.access_label %}<p class="muted">{{ row.access_label }}</p>{% endif %}
         <label>Your Code</label>
-        <textarea name="source_code" rows="20" spellcheck="false" required autocomplete="off" data-practical-code-editor placeholder="Type your practical code here...">{{ submission.source_code if submission else '' }}</textarea>
-        <p class="muted" data-practical-paste-warning hidden>Clipboard paste is disabled for Practical Code. Type the code yourself.</p>
-        <div class="actions"><button type="submit">Evaluate &amp; Save Performance</button></div>
-      </form>
+        <textarea rows="20" spellcheck="false" readonly aria-readonly="true">{{ submission.source_code if submission else '' }}</textarea>
+      {% endif %}
       {% if submission %}<p class="muted">Performance Marks: <strong>{{ '%g'|format(submission.performance_marks) }}</strong> / {{ target.register.performance_max_marks }}</p>{% endif %}
     {% else %}
+      {% if row.access_label %}<p class="muted">{{ row.access_label }}</p>{% endif %}
       <p class="muted">Reference code for this experiment has not been configured by faculty yet.</p>
     {% endif %}
   {% else %}
@@ -60,6 +65,23 @@ document.addEventListener('DOMContentLoaded',()=>{
     editor.addEventListener('beforeinput',event=>{
       if(event.inputType==='insertFromPaste'||event.inputType==='insertFromDrop')blockPaste(event);
     });
+  });
+
+  document.querySelectorAll('[data-practical-code-form]').forEach(form=>{
+    const endMs=Number(form.dataset.practicalEndEpochMs||0);
+    if(!endMs)return;
+    const editor=form.querySelector('[data-practical-code-editor]');
+    const button=form.querySelector('button[type="submit"]');
+    const lockEditor=()=>{
+      if(editor)editor.readOnly=true;
+      if(button){button.disabled=true;button.textContent='Editing Closed';}
+    };
+    const scheduleLock=()=>{
+      const remaining=endMs-Date.now();
+      if(remaining<=0){lockEditor();return;}
+      window.setTimeout(scheduleLock,Math.min(remaining,60000));
+    };
+    scheduleLock();
   });
 });
 </script>

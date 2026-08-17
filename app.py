@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.18.1'
+APP_VERSION='2.19.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -278,6 +278,10 @@ class ExamConfig(Base):
     # to a Practical Exam without recreating its question pool.
     exam_type:Mapped[str]=mapped_column(String,nullable=False,default='regular')
     practical_experiment_no:Mapped[str]=mapped_column(String,nullable=False,default='')
+    # Separate practical-code editing window. Values are stored as local
+    # institutional datetimes (YYYY-MM-DDTHH:MM:SS) in APP_TIMEZONE.
+    practical_code_start_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    practical_code_end_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     last_generation_summary:Mapped[str]=mapped_column(String,nullable=False,default='')
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
@@ -657,6 +661,8 @@ def run_schema_upgrades():
         ('exam_security_policies','require_exam_pin',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_configs','exam_type',"VARCHAR NOT NULL DEFAULT 'regular'"),
         ('exam_configs','practical_experiment_no',"VARCHAR NOT NULL DEFAULT ''"),
+        ('exam_configs','practical_code_start_at',"VARCHAR NOT NULL DEFAULT ''"),
+        ('exam_configs','practical_code_end_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('audit_logs','prev_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('audit_logs','event_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('practical_registers','attendance_max_marks','INTEGER NOT NULL DEFAULT 5'),
@@ -1381,6 +1387,60 @@ def parse_local_schedule(value):
     if not value:return ''
     try:return datetime.fromisoformat(value).strftime('%Y-%m-%dT%H:%M:%S')
     except ValueError:raise ValueError('Schedule date/time is invalid.')
+
+
+def practical_code_window_state(cfg,at_time=None):
+    """Return the server-authoritative Practical Code editing-window state.
+
+    Practical-code timestamps are saved as naive local institutional times, the
+    same format used by ExamSession.  This keeps Render/UTC hosts and offline
+    Windows deployments consistent with the APP_TIMEZONE selected by the college.
+    """
+    start_value=(getattr(cfg,'practical_code_start_at','') or '').strip() if cfg else ''
+    end_value=(getattr(cfg,'practical_code_end_at','') or '').strip() if cfg else ''
+    now_local=(at_time or now_dt()).astimezone(DISPLAY_TZ).replace(tzinfo=None)
+    start=None;end=None
+    try:start=datetime.fromisoformat(start_value) if start_value else None
+    except ValueError:start=None
+    try:end=datetime.fromisoformat(end_value) if end_value else None
+    except ValueError:end=None
+
+    configured=bool(start and end)
+    if not configured:
+        return {
+            'configured':False,'status':'unrestricted','can_edit':True,
+            'start_at':start_value,'end_at':end_value,'end_epoch_ms':None,'label':''
+        }
+    if now_local<start:
+        return {
+            'configured':True,'status':'upcoming','can_edit':False,
+            'start_at':start_value,'end_at':end_value,
+            'end_epoch_ms':int(end.replace(tzinfo=DISPLAY_TZ).timestamp()*1000),
+            'label':f'Practical code entry opens on {start.strftime("%d %b %Y, %I:%M %p")}.'
+        }
+    if now_local>=end:
+        return {
+            'configured':True,'status':'closed','can_edit':False,
+            'start_at':start_value,'end_at':end_value,
+            'end_epoch_ms':int(end.replace(tzinfo=DISPLAY_TZ).timestamp()*1000),
+            'label':f'Editing closed on {end.strftime("%d %b %Y, %I:%M %p")}. Your code and marks are view-only.'
+        }
+    return {
+        'configured':True,'status':'open','can_edit':True,
+        'start_at':start_value,'end_at':end_value,
+        'end_epoch_ms':int(end.replace(tzinfo=DISPLAY_TZ).timestamp()*1000),'label':''
+    }
+
+
+def practical_exam_assigned_to_student(s,student_id,exam):
+    """Check only batch/section assignment, not the normal exam clock window."""
+    sessions=s.scalars(select(ExamSession).where(ExamSession.exam_id==exam.id)).all()
+    if not sessions:
+        return True
+    membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student_id))
+    if not membership:
+        return False
+    return any(row.group_id==membership.group_id for row in sessions)
 
 
 def exam_access_for_student(s,student_id,exam):
@@ -2907,16 +2967,34 @@ def clear_code_review_remark(existing):
 def practical_code_exam_rows_for_student(s,student):
     rows=[]
     if not student:return rows
-    exams_list=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.id.desc())).all()
+
+    # Closed practical windows remain visible as a read-only marks/history page.
+    # Upcoming practical work is shown only after the exam has been activated.
+    exams_list=s.scalars(select(Exam).order_by(Exam.id.desc())).all()
     for exam in exams_list:
         meta=practical_exam_metadata_for_exam(s,exam.id)
         if not meta.get('is_practical') or not meta.get('valid'):
             continue
-        allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
-        if access_label=='Not assigned to your batch/section':
+        if not practical_exam_assigned_to_student(s,student.id,exam):
             continue
-        target=resolve_practical_target_for_student(s,student,meta.get('experiment_no',''),meta.get('subject',''))
-        submission=s.scalar(select(PracticalCodeSubmission).where(PracticalCodeSubmission.student_id==student.id,PracticalCodeSubmission.exam_id==exam.id))
+
+        cfg=get_exam_config(s,exam.id,create=False)
+        window=practical_code_window_state(cfg)
+        submission=s.scalar(select(PracticalCodeSubmission).where(
+            PracticalCodeSubmission.student_id==student.id,
+            PracticalCodeSubmission.exam_id==exam.id
+        ))
+
+        # Do not expose an inactive future practical exam.  Once a practical
+        # window has closed (or the student already submitted), retain it so
+        # the student can continue to view the frozen code and marks.
+        visible=bool(exam.is_active or submission or window.get('status')=='closed')
+        if not visible:
+            continue
+
+        target=resolve_practical_target_for_student(
+            s,student,meta.get('experiment_no',''),meta.get('subject','')
+        )
         practical_mark=None;mark_maxima=None;mark_total_max=None
         if target.get('ok'):
             practical_mark=s.scalar(select(PracticalMark).where(
@@ -2925,10 +3003,19 @@ def practical_code_exam_rows_for_student(s,student):
             ))
             mark_maxima=practical_marks_maxima(target['register'])
             mark_total_max=sum(mark_maxima.values())
+
+        can_submit=bool(exam.is_active and window.get('can_edit'))
+        if not exam.is_active and window.get('status')!='closed':
+            access_label='This Practical Exam is not active.'
+        elif not window.get('can_edit'):
+            access_label=window.get('label') or 'Practical code editing is closed.'
+        else:
+            access_label=''
+
         rows.append({
             'exam':exam,'meta':meta,'target':target,'submission':submission,
             'practical_mark':practical_mark,'mark_maxima':mark_maxima,'mark_total_max':mark_total_max,
-            'can_submit':allowed,'access_label':access_label
+            'can_submit':can_submit,'access_label':access_label,'code_window':window
         })
     return rows
 
@@ -4085,7 +4172,9 @@ def exams():
         resolved_meta=practical_exam_metadata_for_exam(s,e.id)
         exam_type=('practical_exam' if resolved_meta.get('is_practical') else ((getattr(cfg,'exam_type','') or 'regular') if cfg else 'regular'))
         practical_experiment_no=(resolved_meta.get('experiment_no') or (getattr(cfg,'practical_experiment_no','') if cfg else '') or '')
-        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no})())
+        practical_code_start_at=(getattr(cfg,'practical_code_start_at','') or '') if cfg else ''
+        practical_code_end_at=(getattr(cfg,'practical_code_end_at','') or '') if cfg else ''
+        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no,'practical_code_start_at':practical_code_start_at,'practical_code_end_at':practical_code_end_at})())
 
     grouped={}
     for row in rows:
@@ -4120,6 +4209,23 @@ def edit_exam_metadata(exam_id):
         flash('Practical Experiment No. is required for a Practical Exam.','error')
         return redirect(url_for('exams'))
 
+    practical_code_start_at=''
+    practical_code_end_at=''
+    if exam_type=='practical_exam':
+        try:
+            practical_code_start_at=parse_local_schedule(request.form.get('practical_code_start_at',''))
+            practical_code_end_at=parse_local_schedule(request.form.get('practical_code_end_at',''))
+        except ValueError:
+            flash('Practical Code start/end time is invalid.','error')
+            return redirect(url_for('exams'))
+        if bool(practical_code_start_at)!=bool(practical_code_end_at):
+            flash('Set both Practical Code start and end time, or leave both blank.','error')
+            return redirect(url_for('exams'))
+        if practical_code_start_at and practical_code_end_at:
+            if datetime.fromisoformat(practical_code_end_at)<=datetime.fromisoformat(practical_code_start_at):
+                flash('Practical Code end time must be after the start time.','error')
+                return redirect(url_for('exams'))
+
     subject_value=(request.form.get('subject_id') or '').strip()
     if subject_value=='__general__':
         subject_name='General'
@@ -4142,12 +4248,16 @@ def edit_exam_metadata(exam_id):
     old_subject,_old_unit=student_exam_subject_unit(s,exam,cfg)
     old_exam_type=(getattr(cfg,'exam_type','') or 'regular')
     old_experiment_no=(getattr(cfg,'practical_experiment_no','') or '')
+    old_code_start=(getattr(cfg,'practical_code_start_at','') or '')
+    old_code_end=(getattr(cfg,'practical_code_end_at','') or '')
     exam.title=title
     cfg.subject=subject_name
     if course_semester:
         cfg.course_semester=course_semester
     cfg.exam_type=exam_type
     cfg.practical_experiment_no=practical_experiment_no
+    cfg.practical_code_start_at=practical_code_start_at if exam_type=='practical_exam' else ''
+    cfg.practical_code_end_at=practical_code_end_at if exam_type=='practical_exam' else ''
 
     # Exam Question rows are exam-specific snapshots, so keep their practical
     # serial aligned with the explicit exam-level setting.  This makes later
@@ -4164,7 +4274,9 @@ def edit_exam_metadata(exam_id):
     audit_event(
         s,'exam_metadata_edited','exam',exam.id,
         f'title={old_title} -> {title}, subject={old_subject} -> {subject_name}, '
-        f'type={old_exam_type} -> {exam_type}, experiment={old_experiment_no} -> {practical_experiment_no}'
+        f'type={old_exam_type} -> {exam_type}, experiment={old_experiment_no} -> {practical_experiment_no}, '
+        f'code_window={old_code_start or "-"}..{old_code_end or "-"} -> '
+        f'{cfg.practical_code_start_at or "-"}..{cfg.practical_code_end_at or "-"}'
     )
     s.commit()
     if exam_type=='practical_exam':
@@ -5376,7 +5488,7 @@ def student_practical_code():
     if not student:abort(404)
     rows=practical_code_exam_rows_for_student(s,student)
     if not rows:
-        flash('Practical Code is available only while an assigned Practical Exam is active.','error')
+        flash('Practical Marks are available only when a Practical Exam is assigned.','error')
         return redirect(url_for('student_dashboard'))
 
     selected_exam_id=request.args.get('exam_id',type=int)

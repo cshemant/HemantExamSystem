@@ -76,6 +76,8 @@
                   data-current-subject="{{ e.subject|e }}"
                   data-exam-type="{{ e.exam_type|e }}"
                   data-practical-experiment-no="{{ e.practical_experiment_no|e }}"
+                  data-practical-code-start-at="{{ (e.practical_code_start_at or '')[:16]|e }}"
+                  data-practical-code-end-at="{{ (e.practical_code_end_at or '')[:16]|e }}"
                   aria-label="Edit {{ e.title }}" title="Edit exam">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4zM13.5 6.5l4 4"/></svg>
           </button>
@@ -124,9 +126,19 @@
           <option value="practical_exam">Practical Exam</option>
         </select>
       </div>
-      <div id="exam-edit-practical-mapping" hidden>
-        <label for="exam-edit-practical-experiment-no">Practical Experiment No.</label>
-        <input id="exam-edit-practical-experiment-no" name="practical_experiment_no" placeholder="1" maxlength="24">
+      <div id="exam-edit-practical-mapping" hidden style="display:grid;gap:16px">
+        <div>
+          <label for="exam-edit-practical-experiment-no">Practical Experiment No.</label>
+          <input id="exam-edit-practical-experiment-no" name="practical_experiment_no" placeholder="1" maxlength="24">
+        </div>
+        <div>
+          <label for="exam-edit-practical-code-start">Practical Code Start</label>
+          <input id="exam-edit-practical-code-start" name="practical_code_start_at" type="datetime-local">
+        </div>
+        <div>
+          <label for="exam-edit-practical-code-end">Practical Code End</label>
+          <input id="exam-edit-practical-code-end" name="practical_code_end_at" type="datetime-local">
+        </div>
       </div>
     </div>
     <div class="actions">
@@ -144,13 +156,20 @@
   const typeSelect=document.getElementById('exam-edit-type');
   const practicalWrap=document.getElementById('exam-edit-practical-mapping');
   const practicalInput=document.getElementById('exam-edit-practical-experiment-no');
+  const practicalStart=document.getElementById('exam-edit-practical-code-start');
+  const practicalEnd=document.getElementById('exam-edit-practical-code-end');
   const cancel=document.getElementById('exam-edit-cancel');
-  if(!dialog||!form||!titleInput||!subjectSelect||!typeSelect||!practicalWrap||!practicalInput||!cancel)return;
+  if(!dialog||!form||!titleInput||!subjectSelect||!typeSelect||!practicalWrap||!practicalInput||!practicalStart||!practicalEnd||!cancel)return;
   function syncPracticalFields(){
     const active=typeSelect.value==='practical_exam';
     practicalWrap.hidden=!active;
+    practicalWrap.style.display=active?'grid':'none';
     practicalInput.required=active;
-    if(!active)practicalInput.value='';
+    if(!active){
+      practicalInput.value='';
+      practicalStart.value='';
+      practicalEnd.value='';
+    }
   }
   typeSelect.addEventListener('change',syncPracticalFields);
   document.querySelectorAll('.exam-edit-trigger').forEach(function(button){
@@ -168,6 +187,8 @@
       if(!matched)subjectSelect.value='__general__';
       typeSelect.value=(button.dataset.examType==='practical_exam' ? 'practical_exam' : 'regular');
       practicalInput.value=button.dataset.practicalExperimentNo || '';
+      practicalStart.value=button.dataset.practicalCodeStartAt || '';
+      practicalEnd.value=button.dataset.practicalCodeEndAt || '';
       syncPracticalFields();
       dialog.showModal();
       titleInput.focus();
