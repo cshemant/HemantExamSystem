@@ -1,11 +1,33 @@
 {% extends 'base.html' %}{% block content %}
 <div class="page-head"><div><div class="eyebrow">Practical Exam</div><h1>Practical Marks</h1></div></div>
 {% for row in rows %}
-{% set exam=row.exam %}{% set target=row.target %}{% set submission=row.submission %}
+{% set exam=row.exam %}{% set target=row.target %}{% set submission=row.submission %}{% set mark=row.practical_mark %}{% set maxima=row.mark_maxima %}
 <div class="card" {% if selected_exam_id==exam.id %}id="practical-code-current"{% endif %}>
   <h2>{{ exam.title }}</h2>
   <p class="muted">Experiment {{ row.meta.experiment_no }}{% if target.ok %} · {{ target.experiment.title }}{% endif %}</p>
   {% if target.ok %}
+    <div class="table-wrap" style="margin:14px 0 18px">
+      <table aria-label="Practical marks breakdown">
+        <thead>
+          <tr>
+            <th>Attendance / {{ maxima.attendance }}</th>
+            <th>Record / {{ maxima.record }}</th>
+            <th>Performance / {{ maxima.performance }}</th>
+            <th>Viva / {{ maxima.viva }}</th>
+            <th>Total / {{ row.mark_total_max }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>{{ '%g'|format(mark.attendance_marks) if mark and mark.attendance_marks is not none else '—' }}</strong></td>
+            <td><strong>{{ '%g'|format(mark.record_marks) if mark and mark.record_marks is not none else '—' }}</strong></td>
+            <td><strong>{{ '%g'|format(mark.performance_marks) if mark and mark.performance_marks is not none else '—' }}</strong></td>
+            <td><strong>{{ '%g'|format(mark.viva_marks) if mark and mark.viva_marks is not none else '—' }}</strong></td>
+            <td><strong>{{ '%g'|format(mark.marks) if mark and mark.marks is not none else '—' }}</strong></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
     {% if not row.can_submit %}
       <p class="muted">{{ row.access_label }}</p>
     {% elif target.experiment.reference_code %}

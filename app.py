@@ -2781,7 +2781,7 @@ def evaluate_practical_code(reference_code,student_code):
     return max(0.0,min(1.0,score))
 
 
-def practical_code_exact_penalty(student_code,penalty_rules,per_word=0.5):
+def practical_code_exact_penalty(student_code,penalty_rules,per_word=1.0):
     """Calculate faculty-defined exact-match deductions without executing code.
 
     Rules are private and one-per-line.  A rule containing exactly one normal
@@ -2917,7 +2917,19 @@ def practical_code_exam_rows_for_student(s,student):
             continue
         target=resolve_practical_target_for_student(s,student,meta.get('experiment_no',''),meta.get('subject',''))
         submission=s.scalar(select(PracticalCodeSubmission).where(PracticalCodeSubmission.student_id==student.id,PracticalCodeSubmission.exam_id==exam.id))
-        rows.append({'exam':exam,'meta':meta,'target':target,'submission':submission,'can_submit':allowed,'access_label':access_label})
+        practical_mark=None;mark_maxima=None;mark_total_max=None
+        if target.get('ok'):
+            practical_mark=s.scalar(select(PracticalMark).where(
+                PracticalMark.practical_student_id==target['practical_student'].id,
+                PracticalMark.practical_experiment_id==target['experiment'].id
+            ))
+            mark_maxima=practical_marks_maxima(target['register'])
+            mark_total_max=sum(mark_maxima.values())
+        rows.append({
+            'exam':exam,'meta':meta,'target':target,'submission':submission,
+            'practical_mark':practical_mark,'mark_maxima':mark_maxima,'mark_total_max':mark_total_max,
+            'can_submit':allowed,'access_label':access_label
+        })
     return rows
 
 
@@ -5395,7 +5407,7 @@ def student_practical_code():
         performance_max=float(practical_marks_maxima(register)['performance'])
         base_performance_value=round((similarity*performance_max)*2.0)/2.0
         base_performance_value=max(0.0,min(performance_max,base_performance_value))
-        penalty=practical_code_exact_penalty(source,getattr(experiment,'penalty_rules','') or '',0.5)
+        penalty=practical_code_exact_penalty(source,getattr(experiment,'penalty_rules','') or '',1.0)
         penalty_deduction=min(base_performance_value,float(penalty.get('deduction',0.0) or 0.0))
         performance_value=max(0.0,base_performance_value-penalty_deduction)
 
