@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.18.0'
+APP_VERSION='2.18.1'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -2450,10 +2450,15 @@ def _save_practical_mark(s,register,student_id,experiment_id,attendance,attendan
     legacy_total=(row.marks if row and row.marks is not None and all(getattr(row,name,None) is None for name in ('attendance_marks','record_marks','performance_marks','viva_marks')) else None)
     total=(sum(value or 0 for value in component_values.values()) if has_component else legacy_total)
     if attendance=='A':total=0.0
+    remarks_value=(remarks or '').strip()[:500]
+    # A faculty save with a Performance value is treated as the manual review
+    # decision for an anti-copy flag, so the temporary Review marker is cleared.
+    if component_values['performance'] is not None and '[CODE REVIEW]' in remarks_value:
+        remarks_value=remarks_value.split('[CODE REVIEW]',1)[0].rstrip()[:500]
     if not row:
-        row=PracticalMark(register_id=register.id,practical_student_id=student.id,practical_experiment_id=experiment.id,attendance=attendance,attendance_marks=component_values['attendance'],record_marks=component_values['record'],performance_marks=component_values['performance'],viva_marks=component_values['viva'],marks=total,remarks=(remarks or '').strip()[:500],updated_by=actor_label(s),updated_at=now_iso());s.add(row)
+        row=PracticalMark(register_id=register.id,practical_student_id=student.id,practical_experiment_id=experiment.id,attendance=attendance,attendance_marks=component_values['attendance'],record_marks=component_values['record'],performance_marks=component_values['performance'],viva_marks=component_values['viva'],marks=total,remarks=remarks_value,updated_by=actor_label(s),updated_at=now_iso());s.add(row)
     else:
-        row.attendance=attendance;row.attendance_marks=component_values['attendance'];row.record_marks=component_values['record'];row.performance_marks=component_values['performance'];row.viva_marks=component_values['viva'];row.marks=total;row.remarks=(remarks or '').strip()[:500];row.updated_by=actor_label(s);row.updated_at=now_iso()
+        row.attendance=attendance;row.attendance_marks=component_values['attendance'];row.record_marks=component_values['record'];row.performance_marks=component_values['performance'];row.viva_marks=component_values['viva'];row.marks=total;row.remarks=remarks_value;row.updated_by=actor_label(s);row.updated_at=now_iso()
     experiment.max_marks=practical_total_max(register)
     return row
 
@@ -2664,21 +2669,184 @@ def _code_tokens(value):
     return re.findall(r'[A-Za-z_][A-Za-z0-9_]*|==|!=|<=|>=|&&|\|\||\+\+|--|->|::|[{}()\[\].,;:+\-*/%<>=!?:]',text.casefold())
 
 
+PRACTICAL_CODE_LANGUAGE_KEYWORDS={
+    'package','import','class','interface','enum','extends','implements','public','private','protected',
+    'static','final','abstract','void','int','long','float','double','boolean','char','byte','short','string',
+    'new','this','super','return','if','else','for','while','do','switch','case','default','break','continue',
+    'try','catch','finally','throw','throws','synchronized','volatile','transient','native','instanceof',
+    'override','const','auto','struct','namespace','using','include','define','def','lambda','in','is','not',
+    'and','or','true','false','null','none','with','as','from','pass','yield','async','await'
+}
+
+
+def _code_semantic_tokens(value):
+    """Normalize renameable identifiers while preserving behavior/API structure.
+
+    A student's local variable names and Android resource names are implementation
+    choices, not correctness requirements.  This normalization therefore treats
+    ``toggleButton`` and ``myButton`` (or ``R.id.toggleButton`` and
+    ``R.id.my_toggle``) as equivalent, while keeping method/API names such as
+    ``findViewById`` / ``setText`` so genuinely different behavior still affects
+    the score.
+    """
+    tokens=_code_tokens(value)
+    out=[];identifier_map={};next_identifier=1;i=0
+    while i<len(tokens):
+        token=tokens[i]
+        # Android-style resource references: R.id.some_name, R.layout.some_name,
+        # R.string.some_name, etc.  The final resource identifier is arbitrary.
+        if (i+4<len(tokens) and token=='r' and tokens[i+1]=='.' and
+                re.fullmatch(r'[a-z_][a-z0-9_]*',tokens[i+2] or '') and
+                tokens[i+3]=='.' and re.fullmatch(r'[a-z_][a-z0-9_]*',tokens[i+4] or '')):
+            out.extend(['r','.',tokens[i+2],'.','RESOURCE_ID'])
+            i+=5;continue
+        if re.fullmatch(r'[a-z_][a-z0-9_]*',token or ''):
+            previous=tokens[i-1] if i else ''
+            following=tokens[i+1] if i+1<len(tokens) else ''
+            # Language words and callable/member API names carry semantic meaning.
+            if token in PRACTICAL_CODE_LANGUAGE_KEYWORDS or previous in {'.','::'} or following=='(':
+                out.append(token)
+            else:
+                if token not in identifier_map:
+                    identifier_map[token]=f'ID{next_identifier}'
+                    next_identifier+=1
+                out.append(identifier_map[token])
+        else:
+            out.append(token)
+        i+=1
+    return out
+
+
+def _code_behavior_tokens(value):
+    """Extract callable/member tokens so behavior has explicit grading weight."""
+    tokens=_code_tokens(value);out=[]
+    for i,token in enumerate(tokens):
+        if not re.fullmatch(r'[a-z_][a-z0-9_]*',token or ''):
+            continue
+        previous=tokens[i-1] if i else ''
+        following=tokens[i+1] if i+1<len(tokens) else ''
+        if following=='(' and token not in {'if','for','while','switch','catch','synchronized'}:
+            out.append('CALL:'+token)
+        elif previous in {'.','::'}:
+            # Ignore the arbitrary final name in R.id.foo / R.layout.foo.
+            if i>=4 and tokens[i-4]=='r' and tokens[i-3]=='.' and tokens[i-1]=='.':
+                continue
+            out.append('MEMBER:'+token)
+    return out
+
+
 def evaluate_practical_code(reference_code,student_code):
-    """Return deterministic 0..1 structural similarity for pasted practical code."""
-    ref=_code_tokens(reference_code);sub=_code_tokens(student_code)
+    """Return deterministic 0..1 logic-oriented similarity for practical code.
+
+    The score deliberately ignores harmless local-variable/resource-ID renaming,
+    but still rewards matching APIs, operators, control structure and overall
+    program coverage.  It never executes student code.
+    """
+    ref=_code_semantic_tokens(reference_code);sub=_code_semantic_tokens(student_code)
     if len(ref)<6 or len(sub)<3:
         return 0.0
     sequence=difflib.SequenceMatcher(None,ref,sub,autojunk=False).ratio()
-    # Multiset overlap rewards the required APIs/keywords even when line order or
-    # formatting differs, while the length penalty discourages tiny snippets.
     from collections import Counter
     rc,sc=Counter(ref),Counter(sub)
     common=sum((rc & sc).values())
     multiset=(2.0*common/(len(ref)+len(sub))) if ref or sub else 0.0
+
+    ref_behavior=_code_behavior_tokens(reference_code);sub_behavior=_code_behavior_tokens(student_code)
+    if ref_behavior or sub_behavior:
+        rb,sb=Counter(ref_behavior),Counter(sub_behavior)
+        behavior_common=sum((rb & sb).values())
+        behavior=(2.0*behavior_common/(len(ref_behavior)+len(sub_behavior))) if (ref_behavior or sub_behavior) else 0.0
+    else:
+        behavior=sequence
+
     length_ratio=min(len(ref),len(sub))/max(len(ref),len(sub))
-    score=(0.65*sequence+0.35*multiset)*(0.25+0.75*length_ratio)
+    coverage_penalty=0.20+0.80*length_ratio
+    score=(0.35*sequence+0.20*multiset+0.45*behavior)*coverage_penalty
     return max(0.0,min(1.0,score))
+
+
+PRACTICAL_CODE_PEER_COPY_THRESHOLD=0.97
+PRACTICAL_CODE_PEER_MIN_TOKENS=40
+PRACTICAL_CODE_LANGUAGE_WORDS={
+    'package','import','class','interface','enum','extends','implements','public','private','protected',
+    'static','final','abstract','void','int','long','float','double','boolean','char','byte','short','string',
+    'new','this','super','return','if','else','for','while','do','switch','case','default','break','continue',
+    'try','catch','finally','throw','throws','synchronized','volatile','transient','native','instanceof',
+    'override','const','auto','struct','namespace','using','include','define','def','lambda','in','is','not',
+    'and','or','true','false','null','none','with','as','from','pass','yield','async','await'
+}
+
+
+def _code_clone_tokens(value):
+    """Normalize cosmetic identifier renames for plagiarism/clone review only."""
+    tokens=_code_tokens(value);out=[];previous=''
+    for token in tokens:
+        if re.fullmatch(r'[a-z_][a-z0-9_]*',token):
+            # Keep language words and member/API names after . or ::, while local
+            # variable / helper identifiers collapse to ID.  Thus changing only
+            # toggleButton -> myButton does not evade the clone detector.
+            if token in PRACTICAL_CODE_LANGUAGE_WORDS or previous in {'.','::'}:
+                out.append(token)
+            else:
+                out.append('ID')
+        else:
+            out.append(token)
+        previous=token
+    return out
+
+
+def practical_code_peer_similarity(first_code,second_code):
+    """Return 0..1 similarity used only to flag near-clone student submissions.
+
+    Formatting, comments, literals and small cosmetic changes are intentionally
+    discounted by _code_tokens(), so changing whitespace or a message string does
+    not defeat the copy check.  The threshold is deliberately very high because
+    beginner practical programs can legitimately share framework boilerplate.
+    """
+    first=_code_clone_tokens(first_code);second=_code_clone_tokens(second_code)
+    if min(len(first),len(second))<PRACTICAL_CODE_PEER_MIN_TOKENS:
+        return 0.0
+    sequence=difflib.SequenceMatcher(None,first,second,autojunk=False).ratio()
+    # Token 4-grams make the test resistant to whitespace/comment/literal edits
+    # while still requiring almost the same program structure before we flag it.
+    def grams(tokens,size=4):
+        return {tuple(tokens[i:i+size]) for i in range(max(0,len(tokens)-size+1))}
+    ga,gb=grams(first),grams(second)
+    gram_score=(len(ga & gb)/len(ga | gb)) if ga and gb else 0.0
+    length_ratio=min(len(first),len(second))/max(len(first),len(second))
+    return max(0.0,min(1.0,(0.70*sequence+0.30*gram_score)*length_ratio))
+
+
+def find_practical_code_peer_clone(s,student_id,exam_id,experiment_id,source_code):
+    """Find the closest prior submission from another student in this exam."""
+    submissions=s.scalars(select(PracticalCodeSubmission).where(
+        PracticalCodeSubmission.exam_id==exam_id,
+        PracticalCodeSubmission.practical_experiment_id==experiment_id,
+        PracticalCodeSubmission.student_id!=student_id
+    ).order_by(PracticalCodeSubmission.id)).all()
+    best=None;best_similarity=0.0
+    for item in submissions:
+        similarity=practical_code_peer_similarity(source_code,item.source_code or '')
+        if similarity>best_similarity:
+            best=item;best_similarity=similarity
+    if best and best_similarity>=PRACTICAL_CODE_PEER_COPY_THRESHOLD:
+        return best,best_similarity
+    return None,best_similarity
+
+
+def append_code_review_remark(existing,text_value):
+    existing=(existing or '').strip()
+    marker='[CODE REVIEW]'
+    # Replace an older auto-generated review note instead of growing the remarks
+    # on every re-submission. Faculty-written remarks before the marker are kept.
+    base=existing.split(marker,1)[0].rstrip()
+    review=f'{marker} {text_value}'.strip()
+    return f'{base} {review}'.strip()[:500]
+
+
+def clear_code_review_remark(existing):
+    existing=(existing or '').strip()
+    return existing.split('[CODE REVIEW]',1)[0].rstrip()[:500]
 
 
 def practical_code_exam_rows_for_student(s,student):
@@ -5164,7 +5332,7 @@ def student_practical_code():
             return redirect(url_for('student_practical_code',exam_id=exam.id))
         source=(request.form.get('source_code') or '').strip()
         if not source:
-            flash('Paste your practical code before submitting.','error');return redirect(url_for('student_practical_code',exam_id=exam.id))
+            flash('Type your practical code before submitting.','error');return redirect(url_for('student_practical_code',exam_id=exam.id))
         if len(source)>250000:
             flash('Submitted code is too large.','error');return redirect(url_for('student_practical_code',exam_id=exam.id))
 
@@ -5172,15 +5340,98 @@ def student_practical_code():
         performance_max=float(practical_marks_maxima(register)['performance'])
         performance_value=round((similarity*performance_max)*2.0)/2.0
         performance_value=max(0.0,min(performance_max,performance_value))
+
+        # A correct solution may naturally resemble the faculty reference.  Copy
+        # prevention therefore compares this submission only with OTHER students
+        # in the same practical exam and flags only near-clones at a very high
+        # structural similarity threshold.
+        peer_submission,peer_similarity=find_practical_code_peer_clone(
+            s,student.id,exam.id,experiment.id,source
+        )
+
+        submission=s.scalar(select(PracticalCodeSubmission).where(
+            PracticalCodeSubmission.student_id==student.id,
+            PracticalCodeSubmission.exam_id==exam.id
+        ))
+        if not submission:
+            submission=PracticalCodeSubmission(
+                student_id=student.id,exam_id=exam.id,register_id=register.id,
+                practical_student_id=practical_student.id,practical_experiment_id=experiment.id,
+                experiment_no=experiment.experiment_no,source_code=source,
+                similarity_pct=round(similarity*100,2),performance_marks=0.0,submitted_at=now_iso()
+            )
+            s.add(submission);s.flush()
+        else:
+            submission.register_id=register.id
+            submission.practical_student_id=practical_student.id
+            submission.practical_experiment_id=experiment.id
+            submission.experiment_no=experiment.experiment_no
+            submission.source_code=source
+            submission.similarity_pct=round(similarity*100,2)
+            submission.submitted_at=now_iso()
+
         mark=s.scalar(select(PracticalMark).where(
             PracticalMark.practical_student_id==practical_student.id,
             PracticalMark.practical_experiment_id==experiment.id
         ))
+
+        if peer_submission:
+            # Do not auto-award Performance marks for a near-clone.  Preserve
+            # faculty-entered marks, but remove an earlier automatic Practical
+            # Code award from this student and flag both submissions for review.
+            peer_student=s.get(Student,peer_submission.student_id)
+            peer_roll=(getattr(peer_student,'registration_no','') or getattr(peer_student,'roll_no','') or str(peer_submission.student_id)).strip()
+            current_roll=(practical_student.roll_no or student.registration_no or student.roll_no or str(student.id)).strip()
+            review_text=f'Near-identical Practical Code detected with Roll No. {peer_roll} ({peer_similarity*100:.1f}% structural similarity).'
+
+            if not mark:
+                mark=PracticalMark(
+                    register_id=register.id,practical_student_id=practical_student.id,
+                    practical_experiment_id=experiment.id,attendance='',attendance_marks=None,
+                    record_marks=None,performance_marks=None,viva_marks=None,marks=None,
+                    remarks=append_code_review_remark('',review_text),updated_by='Practical Code Review',updated_at=now_iso()
+                )
+                s.add(mark);s.flush()
+            else:
+                if mark.updated_by=='Practical Code':
+                    mark.performance_marks=None
+                    components=[mark.attendance_marks,mark.record_marks,mark.performance_marks,mark.viva_marks]
+                    mark.marks=sum(value or 0 for value in components) if any(value is not None for value in components) else None
+                mark.remarks=append_code_review_remark(mark.remarks,review_text)
+                mark.updated_by='Practical Code Review';mark.updated_at=now_iso()
+
+            peer_mark=s.scalar(select(PracticalMark).where(
+                PracticalMark.practical_student_id==peer_submission.practical_student_id,
+                PracticalMark.practical_experiment_id==peer_submission.practical_experiment_id
+            ))
+            if peer_mark:
+                peer_review=f'Near-identical Practical Code detected with Roll No. {current_roll} ({peer_similarity*100:.1f}% structural similarity).'
+                peer_mark.remarks=append_code_review_remark(peer_mark.remarks,peer_review)
+                peer_mark.updated_at=now_iso()
+
+            submission.performance_marks=0.0
+            register.updated_at=now_iso()
+            audit_event(
+                s,'practical_code_peer_clone_flagged','practical_code_submission',submission.id or '',
+                f'exam={exam.id}, student={student.id}, roll={current_roll}, experiment={experiment.experiment_no}, '
+                f'peer_student={peer_submission.student_id}, peer_roll={peer_roll}, peer_similarity={round(peer_similarity*100,2)}, '
+                f'reference_similarity={round(similarity*100,2)}'
+            )
+            s.commit()
+            flash('This code is almost identical to another student submission. Performance marks were not auto-awarded; faculty review is required.','error')
+            return redirect(url_for('student_practical_code',exam_id=exam.id))
+
         if not mark:
-            mark=PracticalMark(register_id=register.id,practical_student_id=practical_student.id,practical_experiment_id=experiment.id,attendance='',attendance_marks=None,record_marks=None,performance_marks=performance_value,viva_marks=None,marks=performance_value,remarks='',updated_by='Practical Code',updated_at=now_iso())
+            mark=PracticalMark(
+                register_id=register.id,practical_student_id=practical_student.id,
+                practical_experiment_id=experiment.id,attendance='',attendance_marks=None,
+                record_marks=None,performance_marks=performance_value,viva_marks=None,marks=performance_value,
+                remarks='',updated_by='Practical Code',updated_at=now_iso()
+            )
             s.add(mark);s.flush()
         else:
             mark.performance_marks=performance_value
+            mark.remarks=clear_code_review_remark(mark.remarks)
             if (mark.attendance or '').upper()=='A':
                 mark.marks=0.0
             else:
@@ -5188,17 +5439,13 @@ def student_practical_code():
                 mark.marks=sum(value or 0 for value in components) if any(value is not None for value in components) else performance_value
             mark.updated_by='Practical Code';mark.updated_at=now_iso()
 
-        submission=s.scalar(select(PracticalCodeSubmission).where(
-            PracticalCodeSubmission.student_id==student.id,
-            PracticalCodeSubmission.exam_id==exam.id
-        ))
-        if not submission:
-            submission=PracticalCodeSubmission(student_id=student.id,exam_id=exam.id,register_id=register.id,practical_student_id=practical_student.id,practical_experiment_id=experiment.id,experiment_no=experiment.experiment_no,source_code=source,similarity_pct=round(similarity*100,2),performance_marks=performance_value,submitted_at=now_iso())
-            s.add(submission)
-        else:
-            submission.register_id=register.id;submission.practical_student_id=practical_student.id;submission.practical_experiment_id=experiment.id;submission.experiment_no=experiment.experiment_no;submission.source_code=source;submission.similarity_pct=round(similarity*100,2);submission.performance_marks=performance_value;submission.submitted_at=now_iso()
+        submission.performance_marks=performance_value
         register.updated_at=now_iso()
-        audit_event(s,'practical_code_auto_evaluated','practical_mark',mark.id or '',f'exam={exam.id}, student={student.id}, roll={practical_student.roll_no}, experiment={experiment.experiment_no}, similarity={round(similarity*100,2)}, performance={performance_value}/{performance_max}, match={target.get("match_basis","")}')
+        audit_event(
+            s,'practical_code_auto_evaluated','practical_mark',mark.id or '',
+            f'exam={exam.id}, student={student.id}, roll={practical_student.roll_no}, experiment={experiment.experiment_no}, '
+            f'similarity={round(similarity*100,2)}, performance={performance_value}/{performance_max}, match={target.get("match_basis","")}'
+        )
         s.commit()
         flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g}.')
         return redirect(url_for('student_practical_code',exam_id=exam.id))
