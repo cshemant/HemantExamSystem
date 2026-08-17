@@ -5636,7 +5636,17 @@ def student_practical_code():
         flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g}.')
         return redirect(url_for('student_practical_code',exam_id=exam.id))
 
-    if not selected_exam_id and len(rows)==1:selected_exam_id=rows[0]['exam'].id
+    # Keep the Practical Marks page focused on one practical at a time.  The
+    # previous implementation rendered every assigned/closed Practical Exam,
+    # which produced multiple marks cards and multiple code editors on the same
+    # page.  A direct ?exam_id= link still opens that exact historical exam; the
+    # menu/default view shows only the newest/current practical.
+    if selected_exam_id:
+        selected_row=next((row for row in rows if row['exam'].id==selected_exam_id),None)
+        rows=[selected_row] if selected_row else rows[:1]
+    else:
+        rows=rows[:1]
+        if rows:selected_exam_id=rows[0]['exam'].id
     return render_template('practical_code.html',student=student,rows=rows,selected_exam_id=selected_exam_id)
 
 @app.route('/student/exam/<int:exam_id>/current-pin')
