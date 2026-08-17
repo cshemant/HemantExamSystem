@@ -32,6 +32,7 @@ def _key(value) -> str:
         'experiment':'experiment_no','experiment_no':'experiment_no','experiment_number':'experiment_no','exp':'experiment_no','exp_no':'experiment_no','no':'experiment_no','s_no':'experiment_no','sno':'experiment_no',
         'title':'title','experiment_name':'title','experiment_title':'title','name_of_experiment':'title','description':'title','practical':'title',
         'marks':'max_marks','max_marks':'max_marks','maximum_marks':'max_marks',
+        'code':'reference_code','reference_code':'reference_code','reference_program':'reference_code','source_code':'reference_code','solution_code':'reference_code','experiment_code':'reference_code',
     }
     return aliases.get(text,text)
 
@@ -179,7 +180,7 @@ def parse_experiment_text(text: str, default_marks: int=10) -> list[dict]:
                 code=match.group(1);title=match.group(2).strip()
         if not title:
             continue
-        rows.append({'experiment_no':normalize_experiment_code(code,idx),'title':title,'max_marks':max(1,int(default_marks))})
+        rows.append({'experiment_no':normalize_experiment_code(code,idx),'title':title,'max_marks':max(1,int(default_marks)),'reference_code':''})
     return _dedupe_experiments(rows)
 
 
@@ -195,6 +196,7 @@ def parse_experiment_bytes(filename: str, raw: bytes, default_marks: int=10) -> 
             title_col=keys.index('title')
             code_col=keys.index('experiment_no') if 'experiment_no' in keys else None
             marks_col=keys.index('max_marks') if 'max_marks' in keys else None
+            reference_col=keys.index('reference_code') if 'reference_code' in keys else None
             output=[]
             for pos,data in enumerate(rows[header_idx+1:],start=1):
                 title=cell_text(data[title_col] if title_col<len(data) else '')
@@ -202,9 +204,10 @@ def parse_experiment_bytes(filename: str, raw: bytes, default_marks: int=10) -> 
                     continue
                 code=cell_text(data[code_col] if code_col is not None and code_col<len(data) else '')
                 marks=cell_text(data[marks_col] if marks_col is not None and marks_col<len(data) else '')
+                reference_code=cell_text(data[reference_col] if reference_col is not None and reference_col<len(data) else '')
                 try:marks_value=max(1,int(float(marks))) if marks else max(1,int(default_marks))
                 except ValueError:marks_value=max(1,int(default_marks))
-                output.append({'experiment_no':normalize_experiment_code(code,pos),'title':title,'max_marks':marks_value})
+                output.append({'experiment_no':normalize_experiment_code(code,pos),'title':title,'max_marks':marks_value,'reference_code':reference_code})
             output=_dedupe_experiments(output)
             if output:return output
 
@@ -243,7 +246,7 @@ def parse_experiment_bytes(filename: str, raw: bytes, default_marks: int=10) -> 
                 continue
         if len(title)<4:
             continue
-        output.append({'experiment_no':normalize_experiment_code(code,pos),'title':title,'max_marks':max(1,int(default_marks))})
+        output.append({'experiment_no':normalize_experiment_code(code,pos),'title':title,'max_marks':max(1,int(default_marks)),'reference_code':''})
     output=_dedupe_experiments(output)
     if not output:
         raise ValueError('No experiments could be detected. Use the template or paste one experiment per line.')
@@ -266,5 +269,5 @@ def _dedupe_experiments(rows: Iterable[dict]) -> list[dict]:
         used_codes.add(code.casefold());used_titles.add(title_key)
         try:marks=max(1,int(row.get('max_marks') or 10))
         except (TypeError,ValueError):marks=10
-        out.append({'experiment_no':code,'title':title,'max_marks':marks})
+        out.append({'experiment_no':code,'title':title,'max_marks':marks,'reference_code':cell_text(row.get('reference_code'))})
     return out

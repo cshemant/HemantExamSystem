@@ -36,8 +36,8 @@
 
 <div class="card">
   <div class="import-header"><div><h2>Experiments</h2></div>{% if experiments and students %}<a class="btn" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=experiments[0].id) }}">Start Live Entry</a>{% endif %}</div>
-  <div class="table-wrap"><table><tr><th>No.</th><th>Experiment</th><th>Total Marks</th><th>Live Entry</th></tr>
-  {% for e in experiments %}<tr><td><strong>{{ e.experiment_no }}</strong></td><td>{{ e.title }}</td><td>{{ e.max_marks }}</td><td>{% if students %}<a class="btn secondary small" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=e.id) }}">Enter Marks</a>{% else %}<span class="muted">Upload students first</span>{% endif %}</td></tr>{% else %}<tr><td colspan="4">No experiments uploaded yet.</td></tr>{% endfor %}
+  <div class="table-wrap"><table><tr><th>No.</th><th>Experiment</th><th>Reference Code</th><th>Total Marks</th><th>Live Entry</th></tr>
+  {% for e in experiments %}<tr><td><strong>{{ e.experiment_no }}</strong></td><td>{{ e.title }}</td><td><a class="btn secondary small" href="{{ url_for('practical_reference_code',register_id=register.id,experiment_id=e.id) }}">{{ 'Edit Code' if e.reference_code else 'Add Code' }}</a></td><td>{{ e.max_marks }}</td><td>{% if students %}<a class="btn secondary small" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=e.id) }}">Enter Marks</a>{% else %}<span class="muted">Upload students first</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5">No experiments uploaded yet.</td></tr>{% endfor %}
   </table></div>
 </div>
 

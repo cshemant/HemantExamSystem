@@ -1,4 +1,4 @@
-import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re
+import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re, difflib
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.17.0'
+APP_VERSION='2.18.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -557,6 +557,9 @@ class PracticalExperiment(Base):
     register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
     experiment_no:Mapped[str]=mapped_column(String,nullable=False)
     title:Mapped[str]=mapped_column(Text,nullable=False)
+    # Faculty reference program used for deterministic Practical Code evaluation.
+    # It is never shown to students.
+    reference_code:Mapped[str]=mapped_column(Text,nullable=False,default='')
     max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=10)
     sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     created_at:Mapped[str]=mapped_column(String,nullable=False)
@@ -578,6 +581,22 @@ class PracticalMark(Base):
     remarks:Mapped[str]=mapped_column(Text,nullable=False,default='')
     updated_by:Mapped[str]=mapped_column(String,nullable=False,default='')
     updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+
+class PracticalCodeSubmission(Base):
+    __tablename__='practical_code_submissions'
+    __table_args__=(UniqueConstraint('student_id','exam_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
+    practical_student_id:Mapped[int]=mapped_column(ForeignKey('practical_students.id'),nullable=False)
+    practical_experiment_id:Mapped[int]=mapped_column(ForeignKey('practical_experiments.id'),nullable=False)
+    experiment_no:Mapped[str]=mapped_column(String,nullable=False,default='')
+    source_code:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    similarity_pct:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
+    performance_marks:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
+    submitted_at:Mapped[str]=mapped_column(String,nullable=False)
 
 
 def _configure_database_reliability():
@@ -641,6 +660,7 @@ def run_schema_upgrades():
         ('practical_registers','record_max_marks','INTEGER NOT NULL DEFAULT 5'),
         ('practical_registers','performance_max_marks','INTEGER NOT NULL DEFAULT 10'),
         ('practical_registers','viva_max_marks','INTEGER NOT NULL DEFAULT 10'),
+        ('practical_experiments','reference_code',"TEXT NOT NULL DEFAULT ''"),
         ('practical_marks','attendance_marks','FLOAT'),
         ('practical_marks','record_marks','FLOAT'),
         ('practical_marks','performance_marks','FLOAT'),
@@ -1646,11 +1666,14 @@ def csrf_and_session_setup():
 
 @app.context_processor
 def globals_for_templates():
+    practical_code_available=False
     try:
         s=DB();institution=get_institution(s,create=True);staff_role=current_staff_role(s) if web_session.get('role') in {'admin','faculty'} else web_session.get('role','');staff_display_name=current_staff_name(s) if web_session.get('role') in {'admin','faculty'} else ''
+        if web_session.get('role')=='student':
+            practical_code_available=student_practical_code_available(s,web_session.get('user_id'))
     except Exception:
         institution=None;staff_role=web_session.get('role','');staff_display_name=(web_session.get('username') or '').replace('.',' ').replace('_',' ').strip().title()
-    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'is_online':APP_MODE=='online','app_version':APP_VERSION,'institution':institution,'staff_role':staff_role,'staff_role_label':ROLE_LABELS.get(staff_role,staff_role.replace('_',' ').title() if staff_role else ''),'staff_display_name':staff_display_name,'edge_package_enabled':len(EXAM_PACKAGE_SIGNING_KEY.encode('utf-8'))>=32}
+    return {'csrf_token':web_session.get('_csrf_token',''),'web_session':web_session,'is_online':APP_MODE=='online','app_version':APP_VERSION,'institution':institution,'staff_role':staff_role,'staff_role_label':ROLE_LABELS.get(staff_role,staff_role.replace('_',' ').title() if staff_role else ''),'staff_display_name':staff_display_name,'edge_package_enabled':len(EXAM_PACKAGE_SIGNING_KEY.encode('utf-8'))>=32,'practical_code_available':practical_code_available}
 
 @app.before_request
 def offline_first_run_guard():
@@ -2264,6 +2287,7 @@ def delete_practical_register(register_id):
     )
     # Delete dependent practical data explicitly so this works consistently on
     # both PostgreSQL production databases and SQLite/LAN deployments.
+    s.execute(delete(PracticalCodeSubmission).where(PracticalCodeSubmission.register_id==register.id))
     s.execute(delete(PracticalMark).where(PracticalMark.register_id==register.id))
     s.execute(delete(PracticalStudent).where(PracticalStudent.register_id==register.id))
     s.execute(delete(PracticalExperiment).where(PracticalExperiment.register_id==register.id))
@@ -2354,10 +2378,39 @@ def practical_experiments_import(register_id):
             # legacy label, correct only its label; its ID/marks remain intact.
             if current.experiment_no.casefold()!=key and key not in by_code:
                 old_key=current.experiment_no.casefold();current.experiment_no=item['experiment_no'];by_code.pop(old_key,None);by_code[key]=current
-            current.title=item['title'];current.max_marks=total_max;updated+=1
+            current.title=item['title'];current.max_marks=total_max
+            # Re-uploading the experiment sheet may add/update a reference program.
+            # A blank reference_code never erases an already configured solution.
+            if (item.get('reference_code') or '').strip():
+                current.reference_code=(item.get('reference_code') or '').strip()
+            updated+=1
         else:
-            order+=1;current=PracticalExperiment(register_id=register.id,experiment_no=item['experiment_no'],title=item['title'],max_marks=total_max,sort_order=order,created_at=now_iso());s.add(current);s.flush();by_code[key]=current;by_title[title_key]=current;added+=1
+            order+=1;current=PracticalExperiment(register_id=register.id,experiment_no=item['experiment_no'],title=item['title'],reference_code=(item.get('reference_code') or '').strip(),max_marks=total_max,sort_order=order,created_at=now_iso());s.add(current);s.flush();by_code[key]=current;by_title[title_key]=current;added+=1
     register.updated_at=now_iso();audit_event(s,'practical_experiments_imported','practical_register',register.id,f'added={added}, updated={updated}');s.commit();flash(f'Experiment list processed: {added} added, {updated} updated.');return redirect(url_for('practical_register_detail',register_id=register.id))
+
+
+@app.route('/admin/practicals/<int:register_id>/experiment/<int:experiment_id>/reference-code',methods=['GET','POST'])
+@practical_required
+def practical_reference_code(register_id,experiment_id):
+    s=DB();register=practical_register_access(s,register_id);experiment=s.get(PracticalExperiment,experiment_id)
+    if not experiment or experiment.register_id!=register.id:abort(404)
+    if request.method=='POST':
+        upload=request.files.get('code_file');code=(request.form.get('reference_code') or '')
+        if upload and upload.filename:
+            raw=upload.read()
+            if len(raw)>512*1024:
+                flash('Reference code file is too large. Keep it below 512 KB.','error');return redirect(url_for('practical_reference_code',register_id=register.id,experiment_id=experiment.id))
+            try:code=raw.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                flash('Reference code file must be UTF-8 text.','error');return redirect(url_for('practical_reference_code',register_id=register.id,experiment_id=experiment.id))
+        code=code.strip()
+        if len(code)>250000:
+            flash('Reference code is too large.','error');return redirect(url_for('practical_reference_code',register_id=register.id,experiment_id=experiment.id))
+        experiment.reference_code=code;register.updated_at=now_iso()
+        audit_event(s,'practical_reference_code_updated','practical_experiment',experiment.id,f'register={register.id}, experiment={experiment.experiment_no}, configured={bool(code)}')
+        s.commit();flash('Reference code saved.' if code else 'Reference code cleared.')
+        return redirect(url_for('practical_register_detail',register_id=register.id))
+    return render_template('practical_reference_code.html',register=register,experiment=experiment)
 
 
 @app.route('/admin/practicals/<int:register_id>/mark-entry')
@@ -2515,6 +2568,140 @@ def practical_exam_metadata_for_exam(s,exam_id):
     return {'is_practical':True,'valid':True,'reason':'','experiment_no':next(iter(experiment_numbers)),'subject':subject,'source':'questions'}
 
 
+
+def resolve_practical_target_for_student(s,student,experiment_no,subject=''):
+    """Resolve one practical row using full roll identity + exact experiment serial.
+
+    This intentionally mirrors the safe Viva mapping rules.  Section/year and
+    subject are only disambiguators; if more than one target remains, nothing is
+    graded automatically.
+    """
+    if not student:
+        return {'ok':False,'reason':'student_not_found','matches':0}
+    registration_key=_roll_identity_key(student.registration_no)
+    login_key=_roll_identity_key(student.roll_no)
+    if not registration_key and not login_key:
+        return {'ok':False,'reason':'student_roll_missing','matches':0}
+    target_experiment=normalize_practical_exam_no(experiment_no)
+    if not target_experiment:
+        return {'ok':False,'reason':'missing_practical_experiment_no','matches':0}
+
+    stmt=select(PracticalStudent)
+    roll_filters=[]
+    if student.registration_no:
+        roll_filters.append(func.lower(PracticalStudent.roll_no)==student.registration_no.strip().casefold())
+    if student.roll_no:
+        roll_filters.append(PracticalStudent.roll_no.endswith(student.roll_no))
+    if roll_filters:
+        stmt=stmt.where(or_(*roll_filters))
+    student_rows=s.scalars(stmt).all()
+    candidates=[]
+    for practical_student in student_rows:
+        practical_roll_key=_roll_identity_key(practical_student.roll_no)
+        if registration_key:
+            if practical_roll_key!=registration_key:
+                continue
+        elif not (login_key and practical_roll_key.endswith(login_key)):
+            continue
+        register=s.get(PracticalRegister,practical_student.register_id)
+        if not register:
+            continue
+        experiment=s.scalar(select(PracticalExperiment).where(
+            PracticalExperiment.register_id==register.id,
+            PracticalExperiment.experiment_no==target_experiment
+        ))
+        if not experiment:
+            experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()
+            experiment=next((row for row in experiments if normalize_practical_exam_no(row.experiment_no)==target_experiment),None)
+        if experiment:
+            candidates.append((register,practical_student,experiment))
+
+    match_basis='roll+experiment'
+    if len(candidates)>1:
+        group=student_group(s,student.id)
+        group_section=(getattr(group,'section','') or '').strip().upper() if group else ''
+        group_year=(getattr(group,'academic_year','') or '').strip().casefold() if group else ''
+        if group_section:
+            section_matches=[item for item in candidates if _practical_register_section_code(item[0])==group_section]
+            if group_year and len(section_matches)>1:
+                year_matches=[item for item in section_matches if (item[0].academic_year or '').strip().casefold()==group_year]
+                if year_matches:
+                    section_matches=year_matches
+            if len(section_matches)==1:
+                candidates=section_matches;match_basis='roll+experiment+section'
+            elif section_matches:
+                candidates=section_matches
+    if len(candidates)>1:
+        target_subject=_practical_subject_key(subject)
+        if target_subject:
+            subject_matches=[item for item in candidates if _practical_subject_key(item[0].subject)==target_subject]
+            if len(subject_matches)==1:
+                candidates=subject_matches;match_basis+=' + subject'
+            elif subject_matches:
+                candidates=subject_matches
+    if len(candidates)!=1:
+        return {'ok':False,'reason':'practical_target_not_unique','matches':len(candidates)}
+    register,practical_student,experiment=candidates[0]
+    return {'ok':True,'reason':'','register':register,'practical_student':practical_student,'experiment':experiment,'match_basis':match_basis}
+
+
+def _strip_code_comments(value):
+    """Remove common source comments before similarity scoring."""
+    text=value or ''
+    text=re.sub(r'/\*.*?\*/',' ',text,flags=re.S)
+    text=re.sub(r'(?m)//[^\n\r]*$',' ',text)
+    text=re.sub(r'(?m)^\s*#(?!\s*(include|define|if|ifdef|ifndef|endif|pragma)\b).*$',' ',text,flags=re.I)
+    return text
+
+
+def _code_tokens(value):
+    text=_strip_code_comments(value).replace('\r\n','\n').replace('\r','\n')
+    # Strings/numbers are normalized so harmless literal changes do not dominate
+    # the structural comparison.  Identifiers and operators are retained.
+    text=re.sub(r'"(?:\\.|[^"\\])*"', ' STR ', text)
+    text=re.sub(r"'(?:\\.|[^'\\])*'", ' CHR ', text)
+    text=re.sub(r'\b\d+(?:\.\d+)?\b',' NUM ',text)
+    return re.findall(r'[A-Za-z_][A-Za-z0-9_]*|==|!=|<=|>=|&&|\|\||\+\+|--|->|::|[{}()\[\].,;:+\-*/%<>=!?:]',text.casefold())
+
+
+def evaluate_practical_code(reference_code,student_code):
+    """Return deterministic 0..1 structural similarity for pasted practical code."""
+    ref=_code_tokens(reference_code);sub=_code_tokens(student_code)
+    if len(ref)<6 or len(sub)<3:
+        return 0.0
+    sequence=difflib.SequenceMatcher(None,ref,sub,autojunk=False).ratio()
+    # Multiset overlap rewards the required APIs/keywords even when line order or
+    # formatting differs, while the length penalty discourages tiny snippets.
+    from collections import Counter
+    rc,sc=Counter(ref),Counter(sub)
+    common=sum((rc & sc).values())
+    multiset=(2.0*common/(len(ref)+len(sub))) if ref or sub else 0.0
+    length_ratio=min(len(ref),len(sub))/max(len(ref),len(sub))
+    score=(0.65*sequence+0.35*multiset)*(0.25+0.75*length_ratio)
+    return max(0.0,min(1.0,score))
+
+
+def practical_code_exam_rows_for_student(s,student):
+    rows=[]
+    if not student:return rows
+    exams_list=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.id.desc())).all()
+    for exam in exams_list:
+        meta=practical_exam_metadata_for_exam(s,exam.id)
+        if not meta.get('is_practical') or not meta.get('valid'):
+            continue
+        allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
+        if access_label=='Not assigned to your batch/section':
+            continue
+        target=resolve_practical_target_for_student(s,student,meta.get('experiment_no',''),meta.get('subject',''))
+        submission=s.scalar(select(PracticalCodeSubmission).where(PracticalCodeSubmission.student_id==student.id,PracticalCodeSubmission.exam_id==exam.id))
+        rows.append({'exam':exam,'meta':meta,'target':target,'submission':submission,'can_submit':allowed,'access_label':access_label})
+    return rows
+
+
+def student_practical_code_available(s,student_id):
+    student=s.get(Student,student_id) if student_id else None
+    return bool(practical_code_exam_rows_for_student(s,student))
+
 def sync_practical_viva_from_attempt(s,attempt):
     """Copy a submitted Practical Exam score into exactly one Viva column.
 
@@ -2662,7 +2849,7 @@ def resync_submitted_practical_attempts(s,exam_id):
 def practical_template(register_id,kind,fmt):
     s=DB();register=practical_register_access(s,register_id)
     if kind=='students':headers=['roll_no','name'];example=['2024/17008','Student Name'];base='practical_student_roster'
-    elif kind=='experiments':headers=['experiment_no','title'];example=['1','Installation of Android Studio'];base='practical_experiment_list'
+    elif kind=='experiments':headers=['experiment_no','title','reference_code'];example=['1','Installation of Android Studio','Paste the faculty reference program here (optional)'];base='practical_experiment_list'
     else:abort(404)
     if fmt=='csv':
         out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerow(example);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{base}.csv')
@@ -2670,6 +2857,7 @@ def practical_template(register_id,kind,fmt):
         wb=Workbook();ws=wb.active;ws.title='Students' if kind=='students' else 'Experiments';ws.append(headers);ws.append(example)
         for cell in ws[1]:cell.font=Font(bold=True)
         ws.column_dimensions['A'].width=20;ws.column_dimensions['B'].width=70 if kind=='experiments' else 34
+        if kind=='experiments':ws.column_dimensions['C'].width=80
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{base}.xlsx')
     abort(404)
 
@@ -3793,6 +3981,7 @@ def delete_exam(exam_id):
     if question_ids:
         s.execute(delete(Question).where(Question.id.in_(question_ids)))
 
+    s.execute(delete(PracticalCodeSubmission).where(PracticalCodeSubmission.exam_id==exam.id))
     s.execute(delete(PracticeAttempt).where(PracticeAttempt.exam_id==exam.id))
     s.execute(delete(ExamSession).where(ExamSession.exam_id==exam.id))
     s.execute(delete(ExamApproval).where(ExamApproval.exam_id==exam.id))
@@ -4943,6 +5132,79 @@ def student_dashboard():
             units.append({'label':unit_label,'exams':grouped[subject][unit_label]})
         exam_groups.append({'subject':subject,'units':units})
     return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups)
+
+
+@app.route('/student/practical-code',methods=['GET','POST'])
+@student_required
+def student_practical_code():
+    s=DB();student=s.get(Student,web_session['user_id'])
+    if not student:abort(404)
+    rows=practical_code_exam_rows_for_student(s,student)
+    if not rows:
+        flash('Practical Code is available only while an assigned Practical Exam is active.','error')
+        return redirect(url_for('student_dashboard'))
+
+    selected_exam_id=request.args.get('exam_id',type=int)
+    if request.method=='POST':
+        try:exam_id=int(request.form.get('exam_id','0'))
+        except (TypeError,ValueError):exam_id=0
+        selected=next((row for row in rows if row['exam'].id==exam_id),None)
+        if not selected:
+            flash('This Practical Exam is not currently available.','error');return redirect(url_for('student_practical_code'))
+        if not selected.get('can_submit'):
+            flash(selected.get('access_label') or 'This Practical Exam is not open yet.','error');return redirect(url_for('student_practical_code',exam_id=selected['exam'].id))
+        target=selected['target'];meta=selected['meta'];exam=selected['exam']
+        if not target.get('ok'):
+            flash('Your practical register mapping could not be resolved safely. Ask the faculty member to verify your Roll No. and Experiment No.','error')
+            return redirect(url_for('student_practical_code',exam_id=exam.id))
+        register=target['register'];practical_student=target['practical_student'];experiment=target['experiment']
+        reference=(experiment.reference_code or '').strip()
+        if not reference:
+            flash(f'Reference code has not been configured for Experiment {experiment.experiment_no}.','error')
+            return redirect(url_for('student_practical_code',exam_id=exam.id))
+        source=(request.form.get('source_code') or '').strip()
+        if not source:
+            flash('Paste your practical code before submitting.','error');return redirect(url_for('student_practical_code',exam_id=exam.id))
+        if len(source)>250000:
+            flash('Submitted code is too large.','error');return redirect(url_for('student_practical_code',exam_id=exam.id))
+
+        similarity=evaluate_practical_code(reference,source)
+        performance_max=float(practical_marks_maxima(register)['performance'])
+        performance_value=round((similarity*performance_max)*2.0)/2.0
+        performance_value=max(0.0,min(performance_max,performance_value))
+        mark=s.scalar(select(PracticalMark).where(
+            PracticalMark.practical_student_id==practical_student.id,
+            PracticalMark.practical_experiment_id==experiment.id
+        ))
+        if not mark:
+            mark=PracticalMark(register_id=register.id,practical_student_id=practical_student.id,practical_experiment_id=experiment.id,attendance='',attendance_marks=None,record_marks=None,performance_marks=performance_value,viva_marks=None,marks=performance_value,remarks='',updated_by='Practical Code',updated_at=now_iso())
+            s.add(mark);s.flush()
+        else:
+            mark.performance_marks=performance_value
+            if (mark.attendance or '').upper()=='A':
+                mark.marks=0.0
+            else:
+                components=[mark.attendance_marks,mark.record_marks,mark.performance_marks,mark.viva_marks]
+                mark.marks=sum(value or 0 for value in components) if any(value is not None for value in components) else performance_value
+            mark.updated_by='Practical Code';mark.updated_at=now_iso()
+
+        submission=s.scalar(select(PracticalCodeSubmission).where(
+            PracticalCodeSubmission.student_id==student.id,
+            PracticalCodeSubmission.exam_id==exam.id
+        ))
+        if not submission:
+            submission=PracticalCodeSubmission(student_id=student.id,exam_id=exam.id,register_id=register.id,practical_student_id=practical_student.id,practical_experiment_id=experiment.id,experiment_no=experiment.experiment_no,source_code=source,similarity_pct=round(similarity*100,2),performance_marks=performance_value,submitted_at=now_iso())
+            s.add(submission)
+        else:
+            submission.register_id=register.id;submission.practical_student_id=practical_student.id;submission.practical_experiment_id=experiment.id;submission.experiment_no=experiment.experiment_no;submission.source_code=source;submission.similarity_pct=round(similarity*100,2);submission.performance_marks=performance_value;submission.submitted_at=now_iso()
+        register.updated_at=now_iso()
+        audit_event(s,'practical_code_auto_evaluated','practical_mark',mark.id or '',f'exam={exam.id}, student={student.id}, roll={practical_student.roll_no}, experiment={experiment.experiment_no}, similarity={round(similarity*100,2)}, performance={performance_value}/{performance_max}, match={target.get("match_basis","")}')
+        s.commit()
+        flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g}.')
+        return redirect(url_for('student_practical_code',exam_id=exam.id))
+
+    if not selected_exam_id and len(rows)==1:selected_exam_id=rows[0]['exam'].id
+    return render_template('practical_code.html',student=student,rows=rows,selected_exam_id=selected_exam_id)
 
 @app.route('/student/exam/<int:exam_id>/current-pin')
 @student_required

@@ -1,0 +1,28 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><div class="eyebrow">Practical Exam</div><h1>Practical Code</h1></div></div>
+{% for row in rows %}
+{% set exam=row.exam %}{% set target=row.target %}{% set submission=row.submission %}
+<div class="card" {% if selected_exam_id==exam.id %}id="practical-code-current"{% endif %}>
+  <h2>{{ exam.title }}</h2>
+  <p class="muted">Experiment {{ row.meta.experiment_no }}{% if target.ok %} · {{ target.experiment.title }}{% endif %}</p>
+  {% if target.ok %}
+    {% if not row.can_submit %}
+      <p class="muted">{{ row.access_label }}</p>
+    {% elif target.experiment.reference_code %}
+      <form method="post" action="{{ url_for('student_practical_code') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="exam_id" value="{{ exam.id }}">
+        <label>Your Code</label>
+        <textarea name="source_code" rows="20" spellcheck="false" required placeholder="Paste your practical code here...">{{ submission.source_code if submission else '' }}</textarea>
+        <div class="actions"><button type="submit">Evaluate &amp; Save Performance</button></div>
+      </form>
+      {% if submission %}<p class="muted">Last saved Performance: <strong>{{ '%g'|format(submission.performance_marks) }}</strong> / {{ target.register.performance_max_marks }}</p>{% endif %}
+    {% else %}
+      <p class="muted">Reference code for this experiment has not been configured by faculty yet.</p>
+    {% endif %}
+  {% else %}
+    <p class="muted">Your Roll No. and Experiment No. could not be mapped safely to one practical register.</p>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}
