@@ -74,7 +74,9 @@
                   data-edit-url="{{ url_for('edit_exam_metadata',exam_id=e.id) }}"
                   data-exam-title="{{ e.title|e }}"
                   data-current-subject="{{ e.subject|e }}"
-                  aria-label="Edit {{ e.title }}" title="Edit title / subject">
+                  data-exam-type="{{ e.exam_type|e }}"
+                  data-practical-experiment-no="{{ e.practical_experiment_no|e }}"
+                  aria-label="Edit {{ e.title }}" title="Edit exam">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4zM13.5 6.5l4 4"/></svg>
           </button>
           <button type="button" class="practical-delete-icon exam-delete-trigger"
@@ -115,6 +117,17 @@
           {% endfor %}
         </select>
       </div>
+      <div>
+        <label for="exam-edit-type">Exam Type</label>
+        <select id="exam-edit-type" name="exam_type" required>
+          <option value="regular">Regular Exam</option>
+          <option value="practical_exam">Practical Exam</option>
+        </select>
+      </div>
+      <div id="exam-edit-practical-mapping" hidden>
+        <label for="exam-edit-practical-experiment-no">Practical Experiment No.</label>
+        <input id="exam-edit-practical-experiment-no" name="practical_experiment_no" placeholder="1" maxlength="24">
+      </div>
     </div>
     <div class="actions">
       <button type="button" class="btn secondary" id="exam-edit-cancel">Cancel</button>
@@ -128,8 +141,18 @@
   const form=document.getElementById('exam-edit-form');
   const titleInput=document.getElementById('exam-edit-title');
   const subjectSelect=document.getElementById('exam-edit-subject');
+  const typeSelect=document.getElementById('exam-edit-type');
+  const practicalWrap=document.getElementById('exam-edit-practical-mapping');
+  const practicalInput=document.getElementById('exam-edit-practical-experiment-no');
   const cancel=document.getElementById('exam-edit-cancel');
-  if(!dialog||!form||!titleInput||!subjectSelect||!cancel)return;
+  if(!dialog||!form||!titleInput||!subjectSelect||!typeSelect||!practicalWrap||!practicalInput||!cancel)return;
+  function syncPracticalFields(){
+    const active=typeSelect.value==='practical_exam';
+    practicalWrap.hidden=!active;
+    practicalInput.required=active;
+    if(!active)practicalInput.value='';
+  }
+  typeSelect.addEventListener('change',syncPracticalFields);
   document.querySelectorAll('.exam-edit-trigger').forEach(function(button){
     button.addEventListener('click',function(){
       form.action=button.dataset.editUrl || '';
@@ -143,6 +166,9 @@
         }
       });
       if(!matched)subjectSelect.value='__general__';
+      typeSelect.value=(button.dataset.examType==='practical_exam' ? 'practical_exam' : 'regular');
+      practicalInput.value=button.dataset.practicalExperimentNo || '';
+      syncPracticalFields();
       dialog.showModal();
       titleInput.focus();
     });

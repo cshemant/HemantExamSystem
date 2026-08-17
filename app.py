@@ -22,14 +22,14 @@ from enterprise_core import QUESTION_TYPE_LABELS, canonical_question_type, norma
 from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
-from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence
+from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.16.2'
+APP_VERSION='2.17.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -164,6 +164,9 @@ class Question(Base):
     answer_tolerance:Mapped[str]=mapped_column(String,nullable=False,default='')
     answer_case_sensitive:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     marks:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
+    # Snapshot of practical-exam mapping at the time the bank question is copied.
+    # Blank means this is a normal/official exam question.
+    practical_experiment_no:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 class Attempt(Base):
     __tablename__='attempts'
@@ -219,6 +222,7 @@ class BankQuestion(Base):
     pso_mapping:Mapped[str]=mapped_column(String,nullable=False,default='')
     tags:Mapped[str]=mapped_column(String,nullable=False,default='')
     practice_visibility:Mapped[str]=mapped_column(String,nullable=False,default='official_only')
+    practical_experiment_no:Mapped[str]=mapped_column(String,nullable=False,default='')
     explanation:Mapped[str]=mapped_column(Text,nullable=False,default='')
     status:Mapped[str]=mapped_column(String,nullable=False,default='draft')
     version:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
@@ -270,6 +274,10 @@ class ExamConfig(Base):
     shuffle_options:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
     require_fullscreen:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     tab_switch_limit:Mapped[int]=mapped_column(Integer,nullable=False,default=3)
+    # Exam-level classification.  This lets an already-created exam be converted
+    # to a Practical Exam without recreating its question pool.
+    exam_type:Mapped[str]=mapped_column(String,nullable=False,default='regular')
+    practical_experiment_no:Mapped[str]=mapped_column(String,nullable=False,default='')
     last_generation_summary:Mapped[str]=mapped_column(String,nullable=False,default='')
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
@@ -605,6 +613,7 @@ def run_schema_upgrades():
         ('questions','answer_key',"TEXT NOT NULL DEFAULT ''"),
         ('questions','answer_tolerance',"VARCHAR NOT NULL DEFAULT ''"),
         ('questions','answer_case_sensitive',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('questions','practical_experiment_no',"VARCHAR NOT NULL DEFAULT ''"),
         ('answers','answer_value',"TEXT NOT NULL DEFAULT ''"),
         ('answers','manual_score',"INTEGER"),
         ('answers','grader_comment',"TEXT NOT NULL DEFAULT ''"),
@@ -617,12 +626,15 @@ def run_schema_upgrades():
         ('bank_questions','po_mapping',"VARCHAR NOT NULL DEFAULT ''"),
         ('bank_questions','pso_mapping',"VARCHAR NOT NULL DEFAULT ''"),
         ('bank_questions','practice_visibility',"VARCHAR NOT NULL DEFAULT 'official_only'"),
+        ('bank_questions','practical_experiment_no',"VARCHAR NOT NULL DEFAULT ''"),
         ('bank_questions','explanation',"TEXT NOT NULL DEFAULT ''"),
         ('admins','mfa_secret',"VARCHAR NOT NULL DEFAULT ''"),
         ('admins','mfa_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('faculty_users','mfa_secret',"VARCHAR NOT NULL DEFAULT ''"),
         ('faculty_users','mfa_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_policies','require_exam_pin',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_configs','exam_type',"VARCHAR NOT NULL DEFAULT 'regular'"),
+        ('exam_configs','practical_experiment_no',"VARCHAR NOT NULL DEFAULT ''"),
         ('audit_logs','prev_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('audit_logs','event_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('practical_registers','attendance_max_marks','INTEGER NOT NULL DEFAULT 5'),
@@ -832,13 +844,20 @@ PRACTICE_VISIBILITY_LABELS={
     'official_only':'Official Exam Only',
     'practice_only':'Practice Only',
     'both':'Official + Practice',
+    'practical_exam':'Practical Exam',
 }
 
 def normalize_practice_visibility(value):
     value=(value or 'official_only').strip().lower()
-    aliases={'official':'official_only','exam':'official_only','practice':'practice_only','published':'practice_only','all':'both'}
+    aliases={'official':'official_only','exam':'official_only','practice':'practice_only','published':'practice_only','all':'both','practical':'practical_exam','practical exam':'practical_exam'}
     value=aliases.get(value,value)
     return value if value in PRACTICE_VISIBILITY_LABELS else 'official_only'
+
+def normalize_practical_exam_no(value):
+    value=(value or '').strip()
+    if not value:
+        return ''
+    return normalize_experiment_code(value,1)
 
 def get_exam_practice_release(s,exam_id,create=False):
     row=s.scalar(select(ExamPracticeRelease).where(ExamPracticeRelease.exam_id==exam_id))
@@ -857,7 +876,7 @@ def question_is_practice_eligible(q):
     return bool(q and q.status=='approved' and normalize_practice_visibility(q.practice_visibility) in {'practice_only','both'} and canonical_question_type(q.question_type)!='essay')
 
 def question_is_official_eligible(q):
-    return bool(q and q.status=='approved' and normalize_practice_visibility(q.practice_visibility) in {'official_only','both'})
+    return bool(q and q.status=='approved' and normalize_practice_visibility(q.practice_visibility) in {'official_only','both','practical_exam'})
 
 def safe_json_load(value,default):
     try:
@@ -1789,7 +1808,7 @@ def result_performance(score,total_marks):
 def get_exam_config(s,exam_id,create=False):
     cfg=s.scalar(select(ExamConfig).where(ExamConfig.exam_id==exam_id))
     if not cfg and create:
-        cfg=ExamConfig(exam_id=exam_id,question_count=0,pool_size=0,easy_pct=30,medium_pct=50,hard_pct=20,unit_weights='',randomize_questions=True,shuffle_options=True,require_fullscreen=False,tab_switch_limit=3,last_generation_summary='',updated_at=now_iso())
+        cfg=ExamConfig(exam_id=exam_id,question_count=0,pool_size=0,easy_pct=30,medium_pct=50,hard_pct=20,unit_weights='',randomize_questions=True,shuffle_options=True,require_fullscreen=False,tab_switch_limit=3,exam_type='regular',practical_experiment_no='',last_generation_summary='',updated_at=now_iso())
         s.add(cfg); s.flush()
     return cfg
 
@@ -1833,8 +1852,19 @@ def recalculate_attempt_score(s,attempt,questions=None,saved=None):
 
 
 def finalize_attempt(s,attempt):
-    if attempt.status=='submitted': return attempt
-    recalculate_attempt_score(s,attempt);attempt.status='submitted';attempt.submitted_at=now_iso();s.commit();return attempt
+    if attempt.status!='submitted':
+        recalculate_attempt_score(s,attempt);attempt.status='submitted';attempt.submitted_at=now_iso();s.commit()
+    # Practical-viva sync is deliberately best-effort: a practical mapping issue
+    # must never break the student's normal exam submission/result flow.
+    try:
+        result=sync_practical_viva_from_attempt(s,attempt)
+        if result.get('updated'):
+            s.commit()
+    except Exception:
+        s.rollback()
+        try:app.logger.exception('Practical Exam viva auto-sync failed for attempt %s',attempt.id)
+        except Exception:pass
+    return attempt
 
 def canonical_difficulty(value):
     v=(value or 'Medium').strip().lower()
@@ -1896,7 +1926,7 @@ def choose_blueprint_questions(candidates,total,unit_weights,diff_weights):
 
 def copy_bank_question_to_exam(s,bq,exam_id):
     if s.scalar(select(ExamBankMap).where(ExamBankMap.exam_id==exam_id,ExamBankMap.bank_question_id==bq.id)): return False
-    q=Question(exam_id=exam_id,question=bq.question,option_a=bq.option_a,option_b=bq.option_b,option_c=bq.option_c,option_d=bq.option_d,correct_answer=bq.correct_answer,question_type=canonical_question_type(bq.question_type),answer_key=(bq.answer_key or bq.correct_answer),answer_tolerance=bq.answer_tolerance or '',answer_case_sensitive=bool(bq.answer_case_sensitive),marks=bq.marks)
+    q=Question(exam_id=exam_id,question=bq.question,option_a=bq.option_a,option_b=bq.option_b,option_c=bq.option_c,option_d=bq.option_d,correct_answer=bq.correct_answer,question_type=canonical_question_type(bq.question_type),answer_key=(bq.answer_key or bq.correct_answer),answer_tolerance=bq.answer_tolerance or '',answer_case_sensitive=bool(bq.answer_case_sensitive),marks=bq.marks,practical_experiment_no=(normalize_practical_exam_no(bq.practical_experiment_no) if normalize_practice_visibility(bq.practice_visibility)=='practical_exam' else ''))
     s.add(q); s.flush(); s.add(ExamBankMap(exam_id=exam_id,exam_question_id=q.id,bank_question_id=bq.id)); return True
 
 def sync_manual_exam_question_count(s,exam_id):
@@ -1938,7 +1968,7 @@ def edge_exam_payload(s,exam):
             'randomize_questions':bool(cfg.randomize_questions),'shuffle_options':bool(cfg.shuffle_options),'require_fullscreen':bool(cfg.require_fullscreen),'tab_switch_limit':cfg.tab_switch_limit
         } if cfg else {}),
         'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'require_exam_pin':bool(security.require_exam_pin),'heartbeat_seconds':security.heartbeat_seconds} if security else {}),
-        'questions':[{'question':q.question,'question_type':canonical_question_type(q.question_type),'option_a':q.option_a,'option_b':q.option_b,'option_c':q.option_c,'option_d':q.option_d,'correct_answer':q.correct_answer,'answer_key':q.answer_key,'answer_tolerance':q.answer_tolerance,'answer_case_sensitive':bool(q.answer_case_sensitive),'marks':q.marks} for q in questions],
+        'questions':[{'question':q.question,'question_type':canonical_question_type(q.question_type),'option_a':q.option_a,'option_b':q.option_b,'option_c':q.option_c,'option_d':q.option_d,'correct_answer':q.correct_answer,'answer_key':q.answer_key,'answer_tolerance':q.answer_tolerance,'answer_case_sensitive':bool(q.answer_case_sensitive),'marks':q.marks,'practical_experiment_no':q.practical_experiment_no or ''} for q in questions],
     }
 
 
@@ -2426,6 +2456,207 @@ def practical_mark_all_present(register_id):
     register.updated_at=now_iso();s.commit();flash('All unmarked students set to Present.');return redirect(url_for('practical_mark_entry',register_id=register.id,experiment_id=experiment.id))
 
 
+def _roll_identity_key(value):
+    return re.sub(r'[^a-z0-9]+','',(value or '').strip().casefold())
+
+
+def _practical_subject_key(value):
+    tokens=re.findall(r'[a-z0-9]+',(value or '').casefold())
+    ignored={'lab','laboratory','practical'}
+    return ''.join(token for token in tokens if token not in ignored)
+
+
+def practical_exam_metadata_for_exam(s,exam_id):
+    """Resolve one safe practical mapping for an exam.
+
+    Preferred mapping is stored at exam level so an already-created exam can be
+    converted to a Practical Exam from the Exams -> Edit dialog.  Existing V64
+    question-level mappings remain supported as a backward-compatible fallback.
+
+    Safety rule: if an exam-level Practical Exam mapping exists, any question
+    that already carries a practical serial must either match that same serial
+    or the mapping is rejected.  Unmapped legacy questions are allowed because
+    converting an existing regular exam is an explicit administrator action.
+    """
+    cfg=get_exam_config(s,exam_id,create=False)
+    subject=(cfg.subject or '').strip() if cfg else ''
+    exam_type=((getattr(cfg,'exam_type','') or 'regular').strip().lower() if cfg else 'regular')
+    configured_experiment=normalize_practical_exam_no(getattr(cfg,'practical_experiment_no','') if cfg else '')
+    questions=s.scalars(select(Question).where(Question.exam_id==exam_id).order_by(Question.id)).all()
+
+    if exam_type=='practical_exam':
+        if not configured_experiment:
+            return {'is_practical':True,'valid':False,'reason':'missing_practical_experiment_no'}
+        if not subject:
+            return {'is_practical':True,'valid':False,'reason':'missing_exam_subject'}
+        # A mapped question may never silently point to a different experiment.
+        conflicting=[normalize_practical_exam_no(q.practical_experiment_no) for q in questions
+                     if normalize_practical_exam_no(q.practical_experiment_no)
+                     and normalize_practical_exam_no(q.practical_experiment_no)!=configured_experiment]
+        if conflicting:
+            return {'is_practical':True,'valid':False,'reason':'question_experiment_conflicts_with_exam'}
+        return {'is_practical':True,'valid':True,'reason':'','experiment_no':configured_experiment,'subject':subject,'source':'exam'}
+
+    # Backward compatibility for practical exams created under V64.1, where the
+    # mapping was snapshotted only onto individual Exam Question rows.
+    if not questions:
+        return {'is_practical':False,'valid':False,'reason':'no_questions'}
+    mapped=[normalize_practical_exam_no(q.practical_experiment_no) for q in questions]
+    practical=[value for value in mapped if value]
+    if not practical:
+        return {'is_practical':False,'valid':True,'reason':'normal_exam'}
+    if len(practical)!=len(questions):
+        return {'is_practical':True,'valid':False,'reason':'mixed_practical_and_regular_questions'}
+    experiment_numbers=set(practical)
+    if len(experiment_numbers)!=1:
+        return {'is_practical':True,'valid':False,'reason':'multiple_experiment_numbers'}
+    if not subject:
+        return {'is_practical':True,'valid':False,'reason':'missing_exam_subject'}
+    return {'is_practical':True,'valid':True,'reason':'','experiment_no':next(iter(experiment_numbers)),'subject':subject,'source':'questions'}
+
+
+def sync_practical_viva_from_attempt(s,attempt):
+    """Copy a submitted Practical Exam score into exactly one Viva column.
+
+    Matching is intentionally strict: exam subject + practical experiment serial +
+    the student's full registration/roll number must resolve to one practical row.
+    If the mapping is ambiguous, no practical mark is changed.
+    """
+    if not attempt or attempt.status!='submitted':
+        return {'updated':False,'reason':'attempt_not_submitted'}
+    if (attempt.grading_status or 'complete')!='complete':
+        return {'updated':False,'reason':'grading_pending'}
+    meta=practical_exam_metadata_for_exam(s,attempt.exam_id)
+    if not meta.get('is_practical'):
+        return {'updated':False,'reason':'normal_exam'}
+    if not meta.get('valid'):
+        return {'updated':False,'reason':meta.get('reason') or 'invalid_practical_mapping'}
+    student=s.get(Student,attempt.student_id)
+    if not student:
+        return {'updated':False,'reason':'student_not_found'}
+    registration_key=_roll_identity_key(student.registration_no)
+    login_key=_roll_identity_key(student.roll_no)
+    if not registration_key and not login_key:
+        return {'updated':False,'reason':'student_roll_missing'}
+
+    # Match the student primarily by the full university registration / roll number.
+    # The practical register subject is NOT a hard requirement: an administrator may
+    # convert an already-created exam to a Practical Exam even if the exam's catalog
+    # subject label differs from the lab-register subject.  Safety is instead enforced
+    # by the exact roll identity + exact experiment serial, with batch/section used as
+    # a disambiguator when the same student exists in more than one practical register.
+    stmt=select(PracticalStudent)
+    roll_filters=[]
+    if student.registration_no:
+        roll_filters.append(func.lower(PracticalStudent.roll_no)==student.registration_no.strip().casefold())
+    if student.roll_no:
+        roll_filters.append(PracticalStudent.roll_no.endswith(student.roll_no))
+    if roll_filters:
+        stmt=stmt.where(or_(*roll_filters))
+    student_rows=s.scalars(stmt).all()
+    candidates=[]
+    target_experiment=normalize_practical_exam_no(meta['experiment_no'])
+    for practical_student in student_rows:
+        practical_roll_key=_roll_identity_key(practical_student.roll_no)
+        if registration_key:
+            if practical_roll_key!=registration_key:
+                continue
+        elif not (login_key and practical_roll_key.endswith(login_key)):
+            continue
+        register=s.get(PracticalRegister,practical_student.register_id)
+        if not register:
+            continue
+        experiment=s.scalar(select(PracticalExperiment).where(
+            PracticalExperiment.register_id==register.id,
+            PracticalExperiment.experiment_no==target_experiment
+        ))
+        if not experiment:
+            # Backward-compatible fallback for legacy serial formatting such as 01 / Exp-1.
+            experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()
+            experiment=next((row for row in experiments if normalize_practical_exam_no(row.experiment_no)==target_experiment),None)
+        if experiment:
+            candidates.append((register,practical_student,experiment))
+
+    match_basis='roll+experiment'
+    if len(candidates)>1:
+        group=student_group(s,student.id)
+        group_section=(getattr(group,'section','') or '').strip().upper() if group else ''
+        group_year=(getattr(group,'academic_year','') or '').strip().casefold() if group else ''
+        if group_section:
+            section_matches=[item for item in candidates if _practical_register_section_code(item[0])==group_section]
+            if group_year and len(section_matches)>1:
+                year_matches=[item for item in section_matches if (item[0].academic_year or '').strip().casefold()==group_year]
+                if year_matches:
+                    section_matches=year_matches
+            if len(section_matches)==1:
+                candidates=section_matches
+                match_basis='roll+experiment+section'
+            elif section_matches:
+                candidates=section_matches
+
+    # Subject is only a final tie-breaker. It must never block an otherwise unique
+    # roll + experiment mapping, which is the mapping requested for Practical Exams.
+    if len(candidates)>1:
+        target_subject=_practical_subject_key(meta.get('subject',''))
+        if target_subject:
+            subject_matches=[item for item in candidates if _practical_subject_key(item[0].subject)==target_subject]
+            if len(subject_matches)==1:
+                candidates=subject_matches
+                match_basis+=' + subject'
+            elif subject_matches:
+                candidates=subject_matches
+
+    if len(candidates)!=1:
+        return {'updated':False,'reason':'practical_target_not_unique','matches':len(candidates)}
+
+    register,practical_student,experiment=candidates[0]
+    score=float(attempt.score or 0)
+    total=float(attempt.total_marks or 0)
+    viva_max=float(practical_marks_maxima(register)['viva'])
+    if total<=0 or viva_max<0:
+        return {'updated':False,'reason':'invalid_exam_or_viva_max'}
+    # Normal case: a 10-mark viva exam copies its earned score directly. If a
+    # practical exam is configured above the Viva maximum, scale proportionally
+    # so the value cannot exceed the configured Viva column maximum.
+    viva_value=score if total<=viva_max else (score*viva_max/total)
+    viva_value=max(0.0,min(viva_max,round(viva_value,2)))
+    mark=s.scalar(select(PracticalMark).where(PracticalMark.practical_student_id==practical_student.id,PracticalMark.practical_experiment_id==experiment.id))
+    if mark and mark.viva_marks is not None and abs(float(mark.viva_marks)-viva_value)<0.0001:
+        return {'updated':False,'reason':'already_synced','register_id':register.id,'practical_student_id':practical_student.id,'experiment_id':experiment.id,'experiment_no':target_experiment,'viva_marks':viva_value,'viva_max':viva_max}
+    if not mark:
+        mark=PracticalMark(register_id=register.id,practical_student_id=practical_student.id,practical_experiment_id=experiment.id,attendance='',attendance_marks=None,record_marks=None,performance_marks=None,viva_marks=viva_value,marks=viva_value,remarks='',updated_by='Practical Exam',updated_at=now_iso())
+        s.add(mark);s.flush()
+    else:
+        mark.viva_marks=viva_value
+        if (mark.attendance or '').upper()=='A':
+            mark.marks=0.0
+        else:
+            components=[mark.attendance_marks,mark.record_marks,mark.performance_marks,mark.viva_marks]
+            mark.marks=sum(value or 0 for value in components) if any(value is not None for value in components) else viva_value
+        mark.updated_by='Practical Exam';mark.updated_at=now_iso()
+    register.updated_at=now_iso()
+    audit_event(s,'practical_viva_auto_synced','practical_mark',mark.id or '',f'exam={attempt.exam_id}, attempt={attempt.id}, roll={practical_student.roll_no}, experiment={target_experiment}, viva={viva_value}/{viva_max}, match={match_basis}')
+    return {'updated':True,'reason':'','register_id':register.id,'practical_student_id':practical_student.id,'experiment_id':experiment.id,'experiment_no':target_experiment,'viva_marks':viva_value,'viva_max':viva_max,'match_basis':match_basis}
+
+
+def resync_submitted_practical_attempts(s,exam_id):
+    """Repair Viva marks for attempts submitted before an exam was mapped as practical."""
+    attempts=s.scalars(select(Attempt).where(Attempt.exam_id==exam_id,Attempt.status=='submitted').order_by(Attempt.id)).all()
+    updated=0;skipped=0;reasons={}
+    for attempt in attempts:
+        try:
+            result=sync_practical_viva_from_attempt(s,attempt)
+            if result.get('updated'):
+                s.commit();updated+=1
+            else:
+                skipped+=1;reason=result.get('reason') or 'not_updated';reasons[reason]=reasons.get(reason,0)+1
+        except Exception:
+            s.rollback();skipped+=1;reasons['exception']=reasons.get('exception',0)+1
+            try:app.logger.exception('Practical Exam retroactive viva sync failed for attempt %s',attempt.id)
+            except Exception:pass
+    return {'attempts':len(attempts),'updated':updated,'skipped':skipped,'reasons':reasons}
+
+
 @app.route('/admin/practicals/<int:register_id>/template/<kind>/<fmt>')
 @practical_required
 def practical_template(register_id,kind,fmt):
@@ -2839,11 +3070,16 @@ def question_bank():
             except ValueError:marks=1
             status='approved' if can_approve_content(s) and request.form.get('status')=='approved' else 'draft'
             course_semester=request.form.get('course_semester','').strip() or catalog_subject.course_semester
+            visibility=normalize_practice_visibility(request.form.get('practice_visibility'))
+            practical_experiment_no=normalize_practical_exam_no(request.form.get('practical_experiment_no')) if visibility=='practical_exam' else ''
+            if visibility=='practical_exam' and not practical_experiment_no:
+                flash('Enter the Practical Experiment No. before saving a Practical Exam question.','error')
+                return redirect(url_for('question_bank',subject=catalog_subject.name)+'#add-bank-question')
             opts=qdef['options']
             bq=BankQuestion(subject=catalog_subject.name,course_semester=course_semester,unit=request.form.get('unit','').strip(),topic=request.form.get('topic','').strip(),question_type=qdef['question_type'],question=question,
                 option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks,
-                difficulty=canonical_difficulty(request.form.get('difficulty')),bloom_level=canonical_bloom(request.form.get('bloom_level')),co_mapping=request.form.get('co_mapping','').strip(),po_mapping=request.form.get('po_mapping','').strip(),pso_mapping=request.form.get('pso_mapping','').strip(),tags=request.form.get('tags','').strip(),practice_visibility=normalize_practice_visibility(request.form.get('practice_visibility')),explanation=request.form.get('explanation','').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso())
-            s.add(bq);s.flush();audit_event(s,'bank_question_created','bank_question',bq.id,f'status={status}, type={qdef["question_type"]}, subject={catalog_subject.name}, category={catalog_subject.category}');s.commit();flash('Question added to the bank.')
+                difficulty=canonical_difficulty(request.form.get('difficulty')),bloom_level=canonical_bloom(request.form.get('bloom_level')),co_mapping=request.form.get('co_mapping','').strip(),po_mapping=request.form.get('po_mapping','').strip(),pso_mapping=request.form.get('pso_mapping','').strip(),tags=request.form.get('tags','').strip(),practice_visibility=visibility,practical_experiment_no=practical_experiment_no,explanation=request.form.get('explanation','').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso())
+            s.add(bq);s.flush();audit_event(s,'bank_question_created','bank_question',bq.id,f'status={status}, type={qdef["question_type"]}, subject={catalog_subject.name}, category={catalog_subject.category}, visibility={visibility}, practical_experiment={practical_experiment_no}');s.commit();flash('Question added to the bank.')
             return redirect(url_for('question_bank',subject=catalog_subject.name)+'#subject-workspace')
     q=(request.args.get('q') or '').strip(); category=(request.args.get('category') or '').strip(); subject=(request.args.get('subject') or '').strip(); unit=(request.args.get('unit') or '').strip(); difficulty=(request.args.get('difficulty') or '').strip(); status=(request.args.get('status') or '').strip(); practice_visibility=normalize_practice_visibility(request.args.get('practice_visibility')) if request.args.get('practice_visibility') else ''
     catalog_rows=s.scalars(select(SubjectCatalog).where(SubjectCatalog.is_active==True).order_by(SubjectCatalog.category,SubjectCatalog.name)).all()
@@ -3194,21 +3430,24 @@ def import_question_bank():
             duplicates+=1;continue
         legacy=answer_key.strip().upper() if qtype=='single_choice' else 'A';legacy=legacy if legacy in {'A','B','C','D'} else 'A'
         case_sensitive=str(r.get('answer_case_sensitive') or '').strip().lower() in {'1','true','yes','y','on'}
-        s.add(BankQuestion(subject=subject_name,course_semester=course,unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type=qtype,question=question,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=case_sensitive,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),po_mapping=(r.get('po_mapping') or '').strip(),pso_mapping=(r.get('pso_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),practice_visibility=normalize_practice_visibility(r.get('practice_visibility')),explanation=(r.get('explanation') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso()));added+=1
+        visibility=normalize_practice_visibility(r.get('practice_visibility'));practical_experiment_no=normalize_practical_exam_no(r.get('practical_experiment_no')) if visibility=='practical_exam' else ''
+        if visibility=='practical_exam' and not practical_experiment_no:
+            invalid+=1;continue
+        s.add(BankQuestion(subject=subject_name,course_semester=course,unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type=qtype,question=question,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=case_sensitive,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),po_mapping=(r.get('po_mapping') or '').strip(),pso_mapping=(r.get('pso_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),practice_visibility=visibility,practical_experiment_no=practical_experiment_no,explanation=(r.get('explanation') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso()));added+=1
     audit_event(s,'question_bank_bulk_import','bank_question','',f'added={added}, invalid={invalid}, duplicates={duplicates}, target_subject={target_subject or "mixed"}')
     s.commit();flash(f'Imported {added} question(s).'+(f' Skipped {invalid} invalid row(s).' if invalid else '')+(f' Skipped {duplicates} duplicate(s).' if duplicates else ''));return redirect(redirect_url)
 
 @app.route('/admin/question-bank/template/<fmt>')
 @staff_required
 def question_bank_template(fmt):
-    headers=['category','subject','course_semester','unit','topic','question_type','question','option_a','option_b','option_c','option_d','correct_answer','answer_key','answer_tolerance','answer_case_sensitive','marks','difficulty','bloom_level','co_mapping','po_mapping','pso_mapping','tags','practice_visibility','explanation','status']
+    headers=['category','subject','course_semester','unit','topic','question_type','question','option_a','option_b','option_c','option_d','correct_answer','answer_key','answer_tolerance','answer_case_sensitive','marks','difficulty','bloom_level','co_mapping','po_mapping','pso_mapping','tags','practice_visibility','practical_experiment_no','explanation','status']
     subject_name=(request.args.get('subject') or '').strip()
     category='Computer Science'; course='B.Tech CSE / Sem 5'
     if subject_name:
         s=DB(); row=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True))
         if row: category=row.category; course=row.course_semester; subject_name=row.name
         else: subject_name=''
-    example=[category,subject_name or 'Mobile Application Development',course or 'B.Tech CSE / Sem 5','1','Introduction','single_choice','Replace this sample with your question','Option A','Option B','Option C','Option D','A','A','','false','1','Medium','Understand','CO1','PO1','PSO1','custom','official_only','Explain why option A is correct.','approved']
+    example=[category,subject_name or 'Mobile Application Development',course or 'B.Tech CSE / Sem 5','1','Introduction','single_choice','Replace this sample with your question','Option A','Option B','Option C','Option D','A','A','','false','1','Medium','Understand','CO1','PO1','PSO1','custom','official_only','','Explain why option A is correct.','approved']
     safe_name=''.join(ch if ch.isalnum() else '_' for ch in (subject_name or 'question_bank')).strip('_') or 'question_bank'
     if fmt=='csv':
         out=io.StringIO(newline='');writer=csv.writer(out);writer.writerow(headers);writer.writerow(example);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{safe_name}_question_bank_template.csv')
@@ -3233,7 +3472,10 @@ def edit_bank_question(question_id):
         subject_name=request.form.get('subject','').strip();catalog_subject=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True));q.subject=catalog_subject.name if catalog_subject else q.subject;q.course_semester=request.form.get('course_semester','').strip() or (catalog_subject.course_semester if catalog_subject else q.course_semester);q.unit=request.form.get('unit','').strip();q.topic=request.form.get('topic','').strip();q.question=request.form.get('question','').strip();q.question_type=qdef['question_type'];q.option_a=qdef['options']['A'];q.option_b=qdef['options']['B'];q.option_c=qdef['options']['C'];q.option_d=qdef['options']['D'];q.correct_answer=qdef['legacy_correct_answer'];q.answer_key=qdef['answer_key'];q.answer_tolerance=qdef['answer_tolerance'];q.answer_case_sensitive=qdef['answer_case_sensitive']
         try:q.marks=max(1,int(request.form.get('marks','1')))
         except ValueError:q.marks=1
-        q.difficulty=canonical_difficulty(request.form.get('difficulty'));q.bloom_level=canonical_bloom(request.form.get('bloom_level'));q.co_mapping=request.form.get('co_mapping','').strip();q.po_mapping=request.form.get('po_mapping','').strip();q.pso_mapping=request.form.get('pso_mapping','').strip();q.tags=request.form.get('tags','').strip();q.practice_visibility=normalize_practice_visibility(request.form.get('practice_visibility'));q.explanation=request.form.get('explanation','').strip();q.version+=1;q.updated_at=now_iso()
+        visibility=normalize_practice_visibility(request.form.get('practice_visibility'));practical_experiment_no=normalize_practical_exam_no(request.form.get('practical_experiment_no')) if visibility=='practical_exam' else ''
+        if visibility=='practical_exam' and not practical_experiment_no:
+            s.rollback();flash('Enter the Practical Experiment No. before saving a Practical Exam question.','error');return redirect(url_for('edit_bank_question',question_id=q.id))
+        q.difficulty=canonical_difficulty(request.form.get('difficulty'));q.bloom_level=canonical_bloom(request.form.get('bloom_level'));q.co_mapping=request.form.get('co_mapping','').strip();q.po_mapping=request.form.get('po_mapping','').strip();q.pso_mapping=request.form.get('pso_mapping','').strip();q.tags=request.form.get('tags','').strip();q.practice_visibility=visibility;q.practical_experiment_no=practical_experiment_no;q.explanation=request.form.get('explanation','').strip();q.version+=1;q.updated_at=now_iso()
         if can_approve_content(s):q.status=request.form.get('status','draft') if request.form.get('status') in {'draft','approved'} else 'draft'
         else:q.status='draft'
         audit_event(s,'bank_question_edited','bank_question',q.id,f'version={q.version}, status={q.status}');s.commit();flash('Question updated. Previous version was preserved.');return redirect(url_for('edit_bank_question',question_id=q.id))
@@ -3264,13 +3506,28 @@ def bank_add_to_exam():
     stmt=select(BankQuestion).where(
         BankQuestion.id.in_(ids),
         BankQuestion.status=='approved',
-        BankQuestion.practice_visibility.in_(['official_only','both'])
+        BankQuestion.practice_visibility.in_(['official_only','both','practical_exam'])
     )
     # If the exam belongs to an existing subject, prevent accidental
     # cross-subject question mixing. Questions are never copied to any other exam.
     if cfg and (cfg.subject or '').strip():
         stmt=stmt.where(BankQuestion.subject==cfg.subject.strip())
     rows=s.scalars(stmt).all();added=0
+    incoming_practical=[q for q in rows if normalize_practice_visibility(q.practice_visibility)=='practical_exam']
+    incoming_regular=[q for q in rows if normalize_practice_visibility(q.practice_visibility)!='practical_exam']
+    existing_questions=s.scalars(select(Question).where(Question.exam_id==exam_id)).all()
+    existing_practical=[q for q in existing_questions if normalize_practical_exam_no(q.practical_experiment_no)]
+    existing_regular=[q for q in existing_questions if not normalize_practical_exam_no(q.practical_experiment_no)]
+    if incoming_practical:
+        experiment_numbers={normalize_practical_exam_no(q.practical_experiment_no) for q in incoming_practical if normalize_practical_exam_no(q.practical_experiment_no)}
+        missing_mapping=any(not normalize_practical_exam_no(q.practical_experiment_no) for q in incoming_practical)
+        existing_numbers={normalize_practical_exam_no(q.practical_experiment_no) for q in existing_practical if normalize_practical_exam_no(q.practical_experiment_no)}
+        if incoming_regular or existing_regular or missing_mapping or len(experiment_numbers)!=1 or (existing_numbers and existing_numbers!=experiment_numbers):
+            flash('Practical Exam questions must be the only questions in the exam and must all use the same Practical Experiment No.','error')
+            return redirect(url_for('question_bank',subject=(cfg.subject if cfg else ''),target_exam_id=exam_id)+'#bank-questions')
+    elif existing_practical and incoming_regular:
+        flash('This exam is already mapped as a Practical Exam. Add only Practical Exam questions for the same experiment number.','error')
+        return redirect(url_for('question_bank',subject=(cfg.subject if cfg else ''),target_exam_id=exam_id)+'#bank-questions')
     for q in rows:
         if copy_bank_question_to_exam(s,q,exam_id):added+=1
 
@@ -3287,6 +3544,9 @@ def bank_add_to_exam():
 @staff_required
 def set_question_practice_visibility():
     visibility=normalize_practice_visibility(request.form.get('practice_visibility'))
+    practical_experiment_no=normalize_practical_exam_no(request.form.get('practical_experiment_no')) if visibility=='practical_exam' else ''
+    if visibility=='practical_exam' and not practical_experiment_no:
+        flash('Enter the Practical Experiment No. before marking questions as Practical Exam.','error');return redirect(request.referrer or url_for('question_bank'))
     ids=[]
     for value in request.form.getlist('question_ids'):
         try:ids.append(int(value))
@@ -3295,9 +3555,9 @@ def set_question_practice_visibility():
         flash('Select at least one question to update its student-practice visibility.','error');return redirect(request.referrer or url_for('question_bank'))
     s=DB();rows=s.scalars(select(BankQuestion).where(BankQuestion.id.in_(ids))).all();updated=0;draft_count=0
     for row in rows:
-        row.practice_visibility=visibility;row.updated_at=now_iso();updated+=1
+        row.practice_visibility=visibility;row.practical_experiment_no=practical_experiment_no if visibility=='practical_exam' else '';row.updated_at=now_iso();updated+=1
         if row.status!='approved' and visibility in {'practice_only','both'}:draft_count+=1
-    audit_event(s,'practice_visibility_bulk_updated','bank_question','',f'visibility={visibility}, updated={updated}');s.commit()
+    audit_event(s,'practice_visibility_bulk_updated','bank_question','',f'visibility={visibility}, practical_experiment={practical_experiment_no}, updated={updated}');s.commit()
     message=f'Updated {updated} question(s) to {PRACTICE_VISIBILITY_LABELS[visibility]}.'
     if draft_count:message+=f' {draft_count} draft question(s) remain hidden from students until approved.'
     flash(message);return redirect(request.referrer or url_for('question_bank'))
@@ -3376,7 +3636,7 @@ def exams():
             .where(
                 BankQuestion.subject==catalog_subject.name,
                 BankQuestion.status=='approved',
-                BankQuestion.practice_visibility.in_(['official_only','both'])
+                BankQuestion.practice_visibility.in_(['official_only','both','practical_exam'])
             )
             .group_by(BankQuestion.unit)
             .order_by(BankQuestion.unit)
@@ -3399,7 +3659,10 @@ def exams():
         approval=get_exam_approval(s,e.id,create=True);session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.exam_id==e.id)) or 0
         policy=exam_approval_policy(s,e)
         subject,unit_label=student_exam_subject_unit(s,e,cfg)
-        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label})())
+        resolved_meta=practical_exam_metadata_for_exam(s,e.id)
+        exam_type=('practical_exam' if resolved_meta.get('is_practical') else ((getattr(cfg,'exam_type','') or 'regular') if cfg else 'regular'))
+        practical_experiment_no=(resolved_meta.get('experiment_no') or (getattr(cfg,'practical_experiment_no','') if cfg else '') or '')
+        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no})())
 
     grouped={}
     for row in rows:
@@ -3425,6 +3688,15 @@ def edit_exam_metadata(exam_id):
         flash('Exam title is required.','error')
         return redirect(url_for('exams'))
 
+    exam_type=(request.form.get('exam_type') or 'regular').strip().lower()
+    if exam_type not in {'regular','practical_exam'}:
+        flash('Choose a valid exam type.','error')
+        return redirect(url_for('exams'))
+    practical_experiment_no=normalize_practical_exam_no(request.form.get('practical_experiment_no')) if exam_type=='practical_exam' else ''
+    if exam_type=='practical_exam' and not practical_experiment_no:
+        flash('Practical Experiment No. is required for a Practical Exam.','error')
+        return redirect(url_for('exams'))
+
     subject_value=(request.form.get('subject_id') or '').strip()
     if subject_value=='__general__':
         subject_name='General'
@@ -3445,10 +3717,22 @@ def edit_exam_metadata(exam_id):
     cfg=get_exam_config(s,exam.id,create=True)
     old_title=exam.title or ''
     old_subject,_old_unit=student_exam_subject_unit(s,exam,cfg)
+    old_exam_type=(getattr(cfg,'exam_type','') or 'regular')
+    old_experiment_no=(getattr(cfg,'practical_experiment_no','') or '')
     exam.title=title
     cfg.subject=subject_name
     if course_semester:
         cfg.course_semester=course_semester
+    cfg.exam_type=exam_type
+    cfg.practical_experiment_no=practical_experiment_no
+
+    # Exam Question rows are exam-specific snapshots, so keep their practical
+    # serial aligned with the explicit exam-level setting.  This makes later
+    # additions/mixing checks safe and prevents a different experiment from
+    # receiving Viva marks by mistake.
+    exam_questions=s.scalars(select(Question).where(Question.exam_id==exam.id)).all()
+    for question in exam_questions:
+        question.practical_experiment_no=practical_experiment_no if exam_type=='practical_exam' else ''
     summary=(cfg.last_generation_summary or '').strip()
     if 'manual_subject_override=1' not in summary.lower():
         summary=(summary+'; ' if summary else '')+'manual_subject_override=1'
@@ -3456,10 +3740,17 @@ def edit_exam_metadata(exam_id):
     cfg.updated_at=now_iso()
     audit_event(
         s,'exam_metadata_edited','exam',exam.id,
-        f'title={old_title} -> {title}, subject={old_subject} -> {subject_name}'
+        f'title={old_title} -> {title}, subject={old_subject} -> {subject_name}, '
+        f'type={old_exam_type} -> {exam_type}, experiment={old_experiment_no} -> {practical_experiment_no}'
     )
     s.commit()
-    flash(f'Updated “{title}” and moved it to {subject_name}.')
+    if exam_type=='practical_exam':
+        # If this exam had already been submitted before it was converted to a
+        # Practical Exam, repair those Viva entries immediately.
+        resync_submitted_practical_attempts(s,exam.id)
+        flash(f'Updated “{title}” as Practical Exam · Experiment {practical_experiment_no}.')
+    else:
+        flash(f'Updated “{title}” as Regular Exam.')
     return redirect(url_for('exams')+f'#exam-{exam.id}')
 
 @app.route('/admin/exam/<int:exam_id>/delete',methods=['POST'])
@@ -3638,7 +3929,7 @@ def import_edge_exam_package():
             try:marks=max(1,int(item.get('marks') or 1))
             except Exception:marks=1
             legacy=str(item.get('correct_answer') or '').upper();legacy=legacy if legacy in {'A','B','C','D'} else (answer_key[:1].upper() if qtype=='single_choice' and answer_key[:1].upper() in {'A','B','C','D'} else 'A')
-            s.add(Question(exam_id=exam.id,question=question_text,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,question_type=qtype,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=bool(item.get('answer_case_sensitive',False)),marks=marks))
+            s.add(Question(exam_id=exam.id,question=question_text,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,question_type=qtype,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=bool(item.get('answer_case_sensitive',False)),marks=marks,practical_experiment_no=normalize_practical_exam_no(item.get('practical_experiment_no'))))
         source=payload.get('source') or {};s.add(EdgePackageReceipt(package_id=pid,exam_id=exam.id,source_mode=str(source.get('mode') or '')[:20],source_exam_id=str(source.get('exam_id') or '')[:80],imported_by=actor_label(s),imported_at=now_iso()));audit_event(s,'edge_exam_package_imported','exam',exam.id,f'package={pid}, source={source.get("mode","")}:{source.get("exam_id","")}');s.commit();flash(f'Encrypted Edge package verified and imported as Draft Exam #{exam.id}. Assign the local batch/session, then approve and activate it.');return redirect(url_for('exam_builder',exam_id=exam.id))
     except (ValueError,TypeError,json.JSONDecodeError,UnicodeDecodeError) as exc:
         s.rollback();flash(f'Edge package rejected: {exc}','error');return redirect(url_for('exam_centre'))
@@ -3930,7 +4221,15 @@ def manual_grade_attempt(attempt_id):
             ans.manual_score=score;ans.grader_comment=comment;ans.graded_by=actor_label(s);ans.graded_at=now_iso()
         if errors:
             s.rollback();flash(' '.join(errors),'error');return redirect(url_for('manual_grade_attempt',attempt_id=attempt.id))
-        recalculate_attempt_score(s,attempt,questions,answers);audit_event(s,'attempt_manual_graded','attempt',attempt.id,f'status={attempt.grading_status}, score={attempt.score}/{attempt.total_marks}');s.commit();flash('Manual grading saved.');return redirect(url_for('manual_grade_attempt',attempt_id=attempt.id))
+        recalculate_attempt_score(s,attempt,questions,answers);audit_event(s,'attempt_manual_graded','attempt',attempt.id,f'status={attempt.grading_status}, score={attempt.score}/{attempt.total_marks}');s.commit()
+        try:
+            sync_result=sync_practical_viva_from_attempt(s,attempt)
+            if sync_result.get('updated'):s.commit()
+        except Exception:
+            s.rollback()
+            try:app.logger.exception('Practical Exam viva re-sync failed after manual grading for attempt %s',attempt.id)
+            except Exception:pass
+        flash('Manual grading saved.');return redirect(url_for('manual_grade_attempt',attempt_id=attempt.id))
     return render_template('manual_grade.html',attempt=attempt,student=student,exam=exam,questions=essay_questions,answers=amap)
 
 
@@ -4817,6 +5116,14 @@ def submitted(exam_id):
     s=DB();exam=s.get(Exam,exam_id);attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not exam or not attempt:abort(404)
     if attempt.status!='submitted' and now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt)
+    if attempt.status=='submitted':
+        try:
+            sync_result=sync_practical_viva_from_attempt(s,attempt)
+            if sync_result.get('updated'):s.commit()
+        except Exception:
+            s.rollback()
+            try:app.logger.exception('Practical Exam viva repair failed while showing result for attempt %s',attempt.id)
+            except Exception:pass
     violations=s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0
     percentage,grade,grade_class=result_performance(attempt.score,attempt.total_marks)
     return render_template('submitted.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,violations=violations,percentage=percentage,grade=grade,grade_class=grade_class,answer_review_exam_id=exam.id if attempt.status=='submitted' else None)
