@@ -45,7 +45,6 @@
       {% if submission %}<p class="muted">Performance Marks: <strong>{{ '%g'|format(submission.performance_marks) }}</strong> / {{ target.register.performance_max_marks }}</p>{% endif %}
     {% else %}
       {% if row.access_label %}<p class="muted">{{ row.access_label }}</p>{% endif %}
-      <p class="muted">Reference code for this experiment has not been configured by faculty yet.</p>
     {% endif %}
   {% else %}
     <p class="muted">Your Roll No. and Experiment No. could not be mapped safely to one practical register.</p>
