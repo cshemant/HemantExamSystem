@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 from urllib.parse import urlparse
 
-from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request
+from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, has_request_context
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -1060,6 +1060,13 @@ def display_dt(value):
     return parse_dt(value).astimezone(DISPLAY_TZ)
 
 def actor_label(s=None):
+    # Startup migrations (for example init_db() during Gunicorn import) run
+    # outside an HTTP request. Flask's session proxy is unavailable there,
+    # so record those audit events as a system action instead of touching
+    # web_session and crashing the deployment.
+    if not has_request_context():
+        return 'system'
+
     role=web_session.get('role','system')
     uid=web_session.get('user_id')
     if role=='admin':
