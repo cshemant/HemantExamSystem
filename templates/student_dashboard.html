@@ -43,4 +43,27 @@
 {% else %}
   <div class="card">No examinations are currently assigned to you.</div>
 {% endif %}
+{% if auto_refresh_at_epoch %}
+<script>
+(function(){
+  // One scheduled reload only: no recurring polling and no constant Render traffic.
+  const serverNow={{ server_now_epoch|int }};
+  const refreshAt={{ auto_refresh_at_epoch|int }};
+  const initialDelay=Math.max(0,(refreshAt-serverNow)*1000);
+  // Spread a class across a few seconds instead of making every browser hit the
+  // free instance in exactly the same millisecond.
+  const targetClientTime=Date.now()+initialDelay+750+Math.floor(Math.random()*2500);
+  let due=false;
+  function reloadWhenDue(){
+    const remaining=targetClientTime-Date.now();
+    if(remaining>0){setTimeout(reloadWhenDue,Math.min(remaining,60*60*1000));return;}
+    due=true;
+    if(document.visibilityState==='hidden')return;
+    window.location.reload();
+  }
+  setTimeout(reloadWhenDue,Math.min(Math.max(0,targetClientTime-Date.now()),60*60*1000));
+  document.addEventListener('visibilitychange',()=>{if(due && document.visibilityState==='visible')window.location.reload();});
+})();
+</script>
+{% endif %}
 {% endblock %}

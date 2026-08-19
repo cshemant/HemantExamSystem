@@ -46,7 +46,16 @@
     guard.id='silent-fullscreen-guard';
     guard.className='silent-fullscreen-guard';
     guard.hidden=true;
+    guard.innerHTML=`<div class="fullscreen-reentry-card"><h2>Exam paused</h2><p>Full-screen mode was exited and the integrity event has been recorded.</p><p id="fullscreen-reentry-status" class="muted">Click Return to Exam to continue securely.</p><button type="button" id="fullscreen-reentry-btn" class="btn">Return to Exam</button></div>`;
     document.body.appendChild(guard);
+    const resume=guard.querySelector('#fullscreen-reentry-btn');
+    const status=guard.querySelector('#fullscreen-reentry-status');
+    resume.addEventListener('click',async()=>{
+      if(status)status.textContent='Restoring full-screen mode…';
+      await requestFullscreenFromGesture();
+      if(document.fullscreenElement){guard.hidden=true;if(status)status.textContent='Click Return to Exam to continue securely.';}
+      else if(status)status.textContent='Full-screen could not be restored. Click Return to Exam again or ask the invigilator for help.';
+    });
     return guard;
   }
 
@@ -71,7 +80,7 @@
     if(guard)guard.hidden=!!document.fullscreenElement;
   }
 
-  document.addEventListener('fullscreenchange',()=>{
+  document.addEventListener('fullscreenchange',async()=>{
     if(examFinished || !shellActive)return;
     if(document.fullscreenElement){
       fullscreenEstablished=true;
@@ -80,8 +89,8 @@
     }
     if(!fullscreenEstablished)return;
     ensureGuard().hidden=false;
-    logIntegrity({{ exam.id }},'fullscreen_exit','Secure exam shell left full-screen');
-    tryRestoreFullscreen();
+    const data=await logIntegrity({{ exam.id }},'fullscreen_exit','Secure exam shell left full-screen',{navigateOnSubmit:false});
+    if(data && data.submitted){finishShell('{{ url_for("submitted",exam_id=exam.id) }}');}
   });
 
   function finishShell(url){
@@ -90,9 +99,12 @@
     shellActive=false;
     document.body.classList.remove('secure-exam-running');
     if(guard)guard.hidden=true;
+    shell.hidden=true;shell.setAttribute('aria-hidden','true');shell.replaceChildren();
     try{if(navigator.keyboard && navigator.keyboard.unlock)navigator.keyboard.unlock();}catch(_err){}
-    const done=()=>{window.location.href=url;};
-    if(document.fullscreenElement && document.exitFullscreen){document.exitFullscreen().catch(()=>{}).finally(done);}else done();
+    // Navigation itself ends full-screen. Do not wait on exitFullscreen(),
+    // because waiting here could leave the student on an empty shell page.
+    try{if(document.fullscreenElement && document.exitFullscreen)document.exitFullscreen().catch(()=>{});}catch(_err){}
+    window.location.replace(url);
   }
 
   function launchExam(url){
@@ -122,17 +134,19 @@
     });
   }
 
+  window.addEventListener('message',event=>{
+    if(event.origin!==window.location.origin)return;
+    const data=event.data || {};
+    if(data.type==='secure-exam-submitted' && Number(data.exam_id)==={{ exam.id }}){
+      finishShell(data.url || '{{ url_for("submitted",exam_id=exam.id) }}');
+    }
+  });
+
   window.addEventListener('popstate',()=>{
     if(!shellActive || examFinished)return;
     try{history.pushState({secureExam:true},'',window.location.href);}catch(_err){}
-    if(fullscreenEstablished && !document.fullscreenElement){ensureGuard().hidden=false;tryRestoreFullscreen();}
+    if(fullscreenEstablished && !document.fullscreenElement)ensureGuard().hidden=false;
   });
-
-  document.addEventListener('pointerdown',()=>{if(shellActive && fullscreenEstablished && !document.fullscreenElement)tryRestoreFullscreen();},true);
-  document.addEventListener('touchstart',()=>{if(shellActive && fullscreenEstablished && !document.fullscreenElement)tryRestoreFullscreen();},{passive:true,capture:true});
-  document.addEventListener('keydown',event=>{
-    if(shellActive && fullscreenEstablished && !document.fullscreenElement){event.preventDefault();tryRestoreFullscreen();}
-  },true);
 
   setInterval(()=>{remaining=Math.max(0,remaining-1);countdownEl.textContent=remaining;if(remaining<=0)refreshPin();},1000);
 

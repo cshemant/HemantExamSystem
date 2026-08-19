@@ -5763,11 +5763,26 @@ def student_exam_unit_sort_key(label):
 @student_required
 def student_dashboard():
     s=DB();st=s.get(Student,web_session['user_id']);exams_list=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.id.desc())).all();rows=[]
+    dashboard_now=now_dt();dashboard_now_naive=dashboard_now.astimezone(DISPLAY_TZ).replace(tzinfo=None);auto_refresh_epochs=[]
     for e in exams_list:
         allowed,access_label,session_row=exam_access_for_student(s,st.id,e)
         if access_label=='Not assigned to your batch/section':continue
         pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=normalize_legacy_manual_subject_exam(s,e.id,get_exam_config(s,e.id));display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
         subject,unit_label=student_exam_subject_unit(s,e,cfg);security=get_exam_security_policy(s,e.id,create=False)
+
+        # Do not poll Render just to discover that a scheduled exam has opened.
+        # The dashboard knows the next server-side start time already, so the
+        # browser performs one staggered reload at that transition.  This makes
+        # the Start button appear automatically with one request per student,
+        # instead of repeated requests every few seconds for the whole class.
+        start_value=(session_row.scheduled_start or '').strip() if session_row else ''
+        if not start_value and cfg and security and security.strict_start_window and (cfg.exam_type or '').strip().lower()=='practical_exam':
+            start_value=(cfg.practical_code_start_at or '').strip()
+        try:dashboard_start=datetime.fromisoformat(start_value) if start_value else None
+        except Exception:dashboard_start=None
+        if not allowed and dashboard_start and dashboard_start>dashboard_now_naive:
+            auto_refresh_epochs.append(int(dashboard_start.replace(tzinfo=DISPLAY_TZ).timestamp()))
+
         rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_grouped_exam_display_title(s,e,subject),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label,'pin_required':bool(security and security.require_exam_pin)})())
 
     grouped={}
@@ -5779,7 +5794,7 @@ def student_dashboard():
         for unit_label in sorted(grouped[subject],key=student_exam_unit_sort_key):
             units.append({'label':unit_label,'exams':grouped[subject][unit_label]})
         exam_groups.append({'subject':subject,'units':units})
-    return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups)
+    return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups,auto_refresh_at_epoch=min(auto_refresh_epochs) if auto_refresh_epochs else None,server_now_epoch=int(dashboard_now.timestamp()))
 
 
 @app.route('/student/practical-code',methods=['GET','POST'])

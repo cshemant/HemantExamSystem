@@ -528,7 +528,11 @@ body.secure-exam-running>.site-footer,
 body.secure-exam-running>.skip-link{visibility:hidden}
 body.secure-exam-running>.secure-exam-shell{visibility:visible}
 .silent-fullscreen-guard[hidden]{display:none!important}
-.silent-fullscreen-guard{position:fixed;inset:0;z-index:30000;background:#fff;cursor:default}
+.silent-fullscreen-guard{position:fixed;inset:0;z-index:30000;background:#f4f7fb;cursor:default;display:grid;place-items:center;padding:24px}
+.fullscreen-reentry-card{width:min(560px,100%);background:#fff;border:1px solid #d9e2ef;border-radius:18px;box-shadow:0 18px 55px rgba(15,23,42,.14);padding:30px;text-align:center}
+.fullscreen-reentry-card h2{margin:0 0 10px;font-size:30px;color:#0f172a}
+.fullscreen-reentry-card p{margin:8px 0 18px;line-height:1.55}
+.fullscreen-reentry-card .btn{min-width:180px}
 body.secure-exam-shell-page>.site-header,
 body.secure-exam-shell-page>.mobile-menu,
 body.secure-exam-shell-page>.site-footer,

@@ -38,7 +38,7 @@ function startTimer(endEpoch){
   };
   tick();handle=setInterval(tick,1000);
 }
-async function logIntegrity(examId,eventType,details=''){
+async function logIntegrity(examId,eventType,details='',options={}){
   try{
     const res=await fetch('/student/integrity-event',{
       method:'POST',
@@ -50,7 +50,16 @@ async function logIntegrity(examId,eventType,details=''){
     if(data.submitted){
       window.alert(data.message || 'Your exam has been automatically submitted because the integrity limit was reached.');
       const resultUrl=`/student/submitted/${examId}`;
-      if(window.top!==window.self) window.top.location.href=resultUrl; else window.location.href=resultUrl;
+      const navigateOnSubmit=options.navigateOnSubmit!==false;
+      if(navigateOnSubmit){
+        // Inside the secure iframe, ask the same-origin parent shell to finish
+        // cleanly.  The fallback keeps normal/non-shell exam pages working.
+        const secureFrame=document.body && document.body.classList.contains('secure-exam-shell-page') && window.parent!==window;
+        if(secureFrame){
+          try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:Number(examId),url:resultUrl},window.location.origin);return data;}catch(_err){}
+        }
+        if(window.top!==window.self) window.top.location.href=resultUrl; else window.location.href=resultUrl;
+      }
       return data;
     }
     if(!data.duplicate && ['warning','final_warning'].includes(data.level)){
