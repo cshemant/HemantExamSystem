@@ -80,7 +80,7 @@
     }
     if(!fullscreenEstablished)return;
     ensureGuard().hidden=false;
-    fetch('/student/integrity-event',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':'{{ csrf_token }}'},body:JSON.stringify({exam_id:{{ exam.id }},event_type:'fullscreen_exit',details:'Secure exam shell left full-screen'})}).catch(()=>{});
+    logIntegrity({{ exam.id }},'fullscreen_exit','Secure exam shell left full-screen');
     tryRestoreFullscreen();
   });
 

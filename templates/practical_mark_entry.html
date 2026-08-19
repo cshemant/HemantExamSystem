@@ -32,7 +32,7 @@
     <td><input class="practical-component-input" name="performance_marks_{{ st.id }}" data-practical-component data-practical-component-key="performance_marks" type="number" min="0" max="{{ component_maxima.performance }}" step="0.5" value="{{ m.performance_marks if m and m.performance_marks is not none else '' }}" inputmode="decimal"></td>
     <td><input class="practical-component-input" name="viva_marks_{{ st.id }}" data-practical-component data-practical-component-key="viva_marks" type="number" min="0" max="{{ component_maxima.viva }}" step="0.5" value="{{ m.viva_marks if m and m.viva_marks is not none else '' }}" inputmode="decimal"></td>
     <td><input class="practical-total-input" data-practical-total type="number" value="{{ m.marks if m and m.marks is not none else '' }}" readonly tabindex="-1"></td>
-    <td><span class="practical-save-state {% if m %}saved{% endif %}" data-practical-status>{% if m %}Saved{% else %}—{% endif %}</span></td>
+    <td>{% if m and '[CODE REVIEW]' in (m.remarks or '') %}<span class="practical-save-state" data-practical-status title="{{ m.remarks }}">Review</span>{% else %}<span class="practical-save-state {% if m %}saved{% endif %}" data-practical-status>{% if m %}Saved{% else %}—{% endif %}</span>{% endif %}</td>
   </tr>{% else %}<tr><td colspan="10">No students are available in this register.</td></tr>{% endfor %}
   </tbody></table></div></div>
   <div class="practical-sticky-save"><span>Changes autosave while you work. Use Save All as a final checkpoint.</span><button type="submit">Save All</button></div>

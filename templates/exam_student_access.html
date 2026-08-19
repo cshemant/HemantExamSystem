@@ -4,9 +4,16 @@
   <div class="import-header"><div><h2>Student Access Security</h2></div><span class="badge {{ 'success' if security and security.require_exam_pin else 'gray' }}">{{ 'Enabled' if security and security.require_exam_pin else 'Disabled' }}</span></div>
   <form method="post" action="{{ url_for('update_exam_student_access_security',exam_id=exam.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <label class="checkline"><input type="checkbox" name="require_exam_pin" {% if security and security.require_exam_pin %}checked{% endif %}> Require rotating 6-digit Exam PIN + single-device lock</label>
+    <div class="integrity-options">
+      <label class="checkline"><input type="checkbox" name="require_exam_pin" {% if security and security.require_exam_pin %}checked{% endif %}> Require rotating 6-digit Exam PIN + single-device lock</label>
+      <label class="checkline"><input type="checkbox" name="block_ip_roll_switch" {% if security and security.block_ip_roll_switch %}checked{% endif %}> Prevent a different roll number from using the same IP in this exam session</label>
+      <div class="mini-meta">Best for lab/LAN networks with one IP per exam computer. Shared Wi-Fi/NAT can make multiple students appear under one public IP.</div>
+    </div>
     <button>Save Security</button>
   </form>
+</div>
+<div class="card">
+  <div class="import-header"><div><h2>IP / Roll Session Locks</h2><p class="mini-meta">{{ ip_lock_count }} active/stored lock(s) for this exam. A lock is scoped to the configured exam session/window.</p></div>{% if ip_lock_count %}<form method="post" action="{{ url_for('reset_exam_ip_session_locks',exam_id=exam.id) }}" onsubmit="return confirm('Reset all IP/session locks for this exam?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn secondary small">Reset IP Locks</button></form>{% endif %}</div>
 </div>
 <div class="card">
   <h2>Device Locks</h2>

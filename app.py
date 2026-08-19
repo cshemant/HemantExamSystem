@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.19.0'
+APP_VERSION='2.21.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -429,6 +429,14 @@ class ExamSecurityPolicy(Base):
     require_candidate_checkin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     require_exam_pin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     heartbeat_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=15)
+    # V2.20 secure-practical defaults. These remain editable after the one-time
+    # default profile is applied, so a faculty member can relax a setting later.
+    strict_start_window:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    start_grace_minutes:Mapped[int]=mapped_column(Integer,nullable=False,default=5)
+    auto_submit_on_integrity_limit:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    defer_results_until_end:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    block_ip_roll_switch:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    practical_defaults_applied:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class ExamStudentAccess(Base):
@@ -449,6 +457,18 @@ class ExamDeviceLock(Base):
     exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
     student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
     device_hash:Mapped[str]=mapped_column(String(64),nullable=False)
+    locked_at:Mapped[str]=mapped_column(String,nullable=False)
+    last_seen_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class ExamIPSessionLock(Base):
+    __tablename__='exam_ip_session_locks'
+    __table_args__=(UniqueConstraint('exam_id','session_scope','ip_hash'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    session_scope:Mapped[str]=mapped_column(String,nullable=False,default='')
+    ip_hash:Mapped[str]=mapped_column(String(64),nullable=False)
+    roll_no_snapshot:Mapped[str]=mapped_column(String,nullable=False,default='')
     locked_at:Mapped[str]=mapped_column(String,nullable=False)
     last_seen_at:Mapped[str]=mapped_column(String,nullable=False)
 
@@ -659,6 +679,12 @@ def run_schema_upgrades():
         ('faculty_users','mfa_secret',"VARCHAR NOT NULL DEFAULT ''"),
         ('faculty_users','mfa_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_policies','require_exam_pin',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_policies','strict_start_window',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_policies','start_grace_minutes',"INTEGER NOT NULL DEFAULT 5"),
+        ('exam_security_policies','auto_submit_on_integrity_limit',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_policies','defer_results_until_end',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_policies','block_ip_roll_switch',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_policies','practical_defaults_applied',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_configs','exam_type',"VARCHAR NOT NULL DEFAULT 'regular'"),
         ('exam_configs','practical_experiment_no',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','practical_code_start_at',"VARCHAR NOT NULL DEFAULT ''"),
@@ -691,9 +717,37 @@ def run_schema_upgrades():
 def get_exam_security_policy(s,exam_id,create=False):
     row=s.scalar(select(ExamSecurityPolicy).where(ExamSecurityPolicy.exam_id==exam_id))
     if not row and create:
-        row=ExamSecurityPolicy(exam_id=exam_id,require_candidate_checkin=False,require_exam_pin=False,heartbeat_seconds=15,updated_at=now_iso())
+        row=ExamSecurityPolicy(
+            exam_id=exam_id,require_candidate_checkin=False,require_exam_pin=False,heartbeat_seconds=15,
+            strict_start_window=False,start_grace_minutes=5,auto_submit_on_integrity_limit=False,
+            defer_results_until_end=False,block_ip_roll_switch=False,practical_defaults_applied=False,
+            updated_at=now_iso()
+        )
         s.add(row);s.flush()
     return row
+
+
+def apply_practical_exam_security_defaults(s,exam_id,cfg=None,security=None,force=False):
+    """Apply the secure Practical Exam profile once, while keeping it editable later."""
+    cfg=cfg or get_exam_config(s,exam_id,create=True)
+    security=security or get_exam_security_policy(s,exam_id,create=True)
+    if (getattr(cfg,'exam_type','') or 'regular').strip().lower()!='practical_exam':
+        return False
+    if security.practical_defaults_applied and not force:
+        return False
+    cfg.randomize_questions=True
+    cfg.shuffle_options=True
+    cfg.require_fullscreen=True
+    cfg.tab_switch_limit=3
+    security.require_exam_pin=True
+    security.strict_start_window=True
+    security.start_grace_minutes=max(1,int(security.start_grace_minutes or 5))
+    security.auto_submit_on_integrity_limit=True
+    security.defer_results_until_end=True
+    security.block_ip_roll_switch=True
+    security.practical_defaults_applied=True
+    cfg.updated_at=now_iso();security.updated_at=now_iso();s.flush()
+    return True
 
 
 def candidate_is_checked_in(s,exam_id,student_id):
@@ -1447,19 +1501,25 @@ def exam_access_for_student(s,student_id,exam):
     security=get_exam_security_policy(s,exam.id,create=False)
     if security and security.require_candidate_checkin and not candidate_is_checked_in(s,exam.id,student_id):
         return False,'Identity check-in required at the exam centre',None
-    sessions=s.scalars(select(ExamSession).where(ExamSession.exam_id==exam.id)).all()
-    if not sessions:return True,'Available',None
-    membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student_id))
-    if not membership:return False,'Not assigned to your batch/section',None
-    matched=next((x for x in sessions if x.group_id==membership.group_id),None)
-    if not matched:return False,'Not assigned to your batch/section',None
-    now=now_dt().replace(tzinfo=None)
-    if matched.scheduled_start:
-        start=datetime.fromisoformat(matched.scheduled_start)
-        if now<start:return False,f'Scheduled for {start.strftime("%d %b, %I:%M %p")}',matched
-    if matched.scheduled_end:
-        end=datetime.fromisoformat(matched.scheduled_end)
-        if now>end:return False,'Exam window closed',matched
+    window=resolved_exam_window_for_student(s,student_id,exam)
+    sessions=window['sessions'];matched=window['matched']
+    if sessions and not window['assigned']:
+        return False,'Not assigned to your batch/section',None
+    now=now_dt().replace(tzinfo=None);start=window.get('start');end=window.get('end')
+    if security and security.strict_start_window:
+        cfg=get_exam_config(s,exam.id,create=False)
+        is_practical=bool(cfg and (cfg.exam_type or '').strip().lower()=='practical_exam')
+        if is_practical and (not start or not end):
+            return False,'Practical Exam start/end time is not configured',matched
+    if start and now<start:
+        return False,f'Scheduled for {start.strftime("%d %b, %I:%M %p")}',matched
+    if end and now>end:
+        return False,'Exam window closed',matched
+    if security and security.strict_start_window and start:
+        attempt=get_attempt(s,student_id,exam.id)
+        grace=max(0,int(security.start_grace_minutes or 0))
+        if not attempt and now>start+timedelta(minutes=grace):
+            return False,f'Entry window closed · start was {start.strftime("%I:%M %p")}',matched
     return True,'Available',matched
 
 
@@ -1696,6 +1756,15 @@ def init_db():
         if APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP:
             ensure_super_admin_identity(s)
             get_institution(s,create=True)
+        # V2.20 one-time migration: existing exams already classified as
+        # Practical Exam receive the same secure defaults as newly selected
+        # practical exams. practical_defaults_applied prevents future startups
+        # from overwriting intentional admin changes.
+        practical_cfgs=s.scalars(select(ExamConfig).where(ExamConfig.exam_type=='practical_exam')).all()
+        for cfg in practical_cfgs:
+            security=get_exam_security_policy(s,cfg.exam_id,create=True)
+            if apply_practical_exam_security_defaults(s,cfg.exam_id,cfg,security):
+                audit_event(s,'practical_exam_secure_defaults_applied','exam',cfg.exam_id,'startup migration')
         s.commit()
     except IntegrityError:
         s.rollback()
@@ -1706,7 +1775,6 @@ def needs_offline_setup():
     s=DB()
     return (s.scalar(select(func.count()).select_from(Admin)) or 0)==0
 
-init_db()
 
 @app.teardown_appcontext
 def cleanup(_exc=None): DB.remove()
@@ -1899,6 +1967,129 @@ def get_exam_config(s,exam_id,create=False):
         s.add(cfg); s.flush()
     return cfg
 
+def _student_exam_session_match(s,student_id,exam_id):
+    sessions=s.scalars(select(ExamSession).where(ExamSession.exam_id==exam_id)).all()
+    if not sessions:
+        return sessions,None,True
+    membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student_id))
+    if not membership:
+        return sessions,None,False
+    matched=next((row for row in sessions if row.group_id==membership.group_id),None)
+    return sessions,matched,bool(matched)
+
+
+def resolved_exam_window_for_student(s,student_id,exam,matched_session=None):
+    """Resolve the common exam window and a stable IP-lock scope for one student."""
+    cfg=get_exam_config(s,exam.id,create=False)
+    security=get_exam_security_policy(s,exam.id,create=False)
+    sessions,matched,assigned=_student_exam_session_match(s,student_id,exam.id)
+    if matched_session is not None:
+        matched=matched_session
+    start_value=(matched.scheduled_start or '').strip() if matched else ''
+    end_value=(matched.scheduled_end or '').strip() if matched else ''
+    source='session' if matched else ''
+    # Practical Code Start/End doubles as the secure common exam window when
+    # a practical exam has no batch-specific session clock configured.
+    if not sessions and cfg and security and security.strict_start_window and (cfg.exam_type or '').strip().lower()=='practical_exam':
+        if not start_value:start_value=(cfg.practical_code_start_at or '').strip()
+        if not end_value:end_value=(cfg.practical_code_end_at or '').strip()
+        if start_value or end_value:source='practical_window'
+    start=None;end=None
+    try:start=datetime.fromisoformat(start_value) if start_value else None
+    except Exception:start=None
+    try:end=datetime.fromisoformat(end_value) if end_value else None
+    except Exception:end=None
+    scope_seed=f'{exam.id}|{source}|{matched.id if matched else 0}|{start_value}|{end_value}'
+    scope='window:'+hashlib.sha256(scope_seed.encode('utf-8')).hexdigest()[:24]
+    return {'sessions':sessions,'matched':matched,'assigned':assigned,'start':start,'end':end,'start_value':start_value,'end_value':end_value,'source':source,'scope':scope}
+
+
+def exam_result_release_at(s,student_id,exam):
+    security=get_exam_security_policy(s,exam.id,create=False)
+    if not security or not security.defer_results_until_end:
+        return None
+    window=resolved_exam_window_for_student(s,student_id,exam)
+    return window.get('end')
+
+
+def _client_ip_hash():
+    ip=(request.remote_addr or '').strip()
+    if not ip:
+        return '', ''
+    digest=hmac.new(str(app.secret_key).encode('utf-8'),('exam-ip-lock-v1|'+ip).encode('utf-8'),hashlib.sha256).hexdigest()
+    return ip,digest
+
+
+def ensure_exam_ip_session_lock(s,exam,student,window=None):
+    """Bind one practical exam/session IP to one roll number when enabled."""
+    security=get_exam_security_policy(s,exam.id,create=False)
+    if not security or not security.block_ip_roll_switch:
+        return True,None
+    window=window or resolved_exam_window_for_student(s,student.id,exam)
+    ip,ip_hash=_client_ip_hash()
+    if not ip_hash:
+        return True,None
+    scope=window.get('scope') or f'exam:{exam.id}'
+    row=s.scalar(select(ExamIPSessionLock).where(ExamIPSessionLock.exam_id==exam.id,ExamIPSessionLock.session_scope==scope,ExamIPSessionLock.ip_hash==ip_hash))
+    if row:
+        if row.student_id!=student.id:
+            audit_event(s,'exam_ip_roll_switch_blocked','exam',exam.id,f'blocked_student={student.roll_no}, scope={scope}')
+            return False,row
+        row.last_seen_at=now_iso()
+        return True,row
+    row=ExamIPSessionLock(exam_id=exam.id,student_id=student.id,session_scope=scope,ip_hash=ip_hash,roll_no_snapshot=student.roll_no,locked_at=now_iso(),last_seen_at=now_iso())
+    try:
+        with s.begin_nested():
+            s.add(row);s.flush()
+    except IntegrityError:
+        # Two login requests from the same IP can race. Re-read the winning
+        # lock instead of returning a server error.
+        existing=s.scalar(select(ExamIPSessionLock).where(ExamIPSessionLock.exam_id==exam.id,ExamIPSessionLock.session_scope==scope,ExamIPSessionLock.ip_hash==ip_hash))
+        if existing and existing.student_id!=student.id:
+            audit_event(s,'exam_ip_roll_switch_blocked','exam',exam.id,f'blocked_student={student.roll_no}, scope={scope}')
+            return False,existing
+        if existing:
+            existing.last_seen_at=now_iso();return True,existing
+        raise
+    audit_event(s,'exam_ip_session_locked','exam',exam.id,f'student={student.roll_no}, scope={scope}')
+    return True,row
+
+
+def current_practical_exam_ip_locks_for_login(s,student):
+    """Bind/check IP locks for practical sessions that are active at login time."""
+    now=now_dt().replace(tzinfo=None)
+    exams_list=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.id.desc())).all()
+    for exam in exams_list:
+        cfg=get_exam_config(s,exam.id,create=False);security=get_exam_security_policy(s,exam.id,create=False)
+        if not cfg or (cfg.exam_type or '').strip().lower()!='practical_exam' or not security or not security.block_ip_roll_switch:
+            continue
+        window=resolved_exam_window_for_student(s,student.id,exam)
+        if not window.get('assigned'):
+            continue
+        start,end=window.get('start'),window.get('end')
+        # Login-level locking is session-aware: only claim an IP while the
+        # configured common exam window is currently open. Exam-entry checks
+        # below still protect practical exams that have no clock configured.
+        if start and now<start-timedelta(minutes=SESSION_TIMEOUT_MINUTES):continue
+        if end and now>end:continue
+        if not start and not end:continue
+        ok,row=ensure_exam_ip_session_lock(s,exam,student,window)
+        if not ok:return False,exam,row
+    return True,None,None
+
+
+def clear_student_session_for_ip_conflict():
+    csrf=web_session.get('_csrf_token');device_token=web_session.get('_student_device_token')
+    web_session.clear()
+    if csrf:web_session['_csrf_token']=csrf
+    if device_token:web_session['_student_device_token']=device_token
+    flash('You have already logged in with a roll number for this session.','error')
+
+# Initialize only after the V2.20 exam/security helper functions above are
+# defined; the startup migration uses them to backfill existing practical exams.
+init_db()
+
+
 def attempt_question_ids(s,attempt):
     rows=s.scalars(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id).order_by(AttemptQuestion.position)).all()
     if rows: return [r.question_id for r in rows]
@@ -1941,8 +2132,16 @@ def recalculate_attempt_score(s,attempt,questions=None,saved=None):
 def finalize_attempt(s,attempt):
     if attempt.status!='submitted':
         recalculate_attempt_score(s,attempt);attempt.status='submitted';attempt.submitted_at=now_iso();s.commit()
-    # Practical-viva sync is deliberately best-effort: a practical mapping issue
-    # must never break the student's normal exam submission/result flow.
+    # Practical attendance and Viva sync are best-effort: a practical mapping
+    # issue must never break the student's normal exam submission/result flow.
+    try:
+        attendance_result=sync_practical_attendance_from_attempt(s,attempt)
+        if attendance_result.get('updated'):
+            s.commit()
+    except Exception:
+        s.rollback()
+        try:app.logger.exception('Practical Exam attendance auto-sync failed for attempt %s',attempt.id)
+        except Exception:pass
     try:
         result=sync_practical_viva_from_attempt(s,attempt)
         if result.get('updated'):
@@ -2052,9 +2251,10 @@ def edge_exam_payload(s,exam):
         'config':({
             'subject':cfg.subject,'course_semester':cfg.course_semester,'question_count':cfg.question_count,'pool_size':cfg.pool_size,
             'easy_pct':cfg.easy_pct,'medium_pct':cfg.medium_pct,'hard_pct':cfg.hard_pct,'unit_weights':cfg.unit_weights,
-            'randomize_questions':bool(cfg.randomize_questions),'shuffle_options':bool(cfg.shuffle_options),'require_fullscreen':bool(cfg.require_fullscreen),'tab_switch_limit':cfg.tab_switch_limit
+            'randomize_questions':bool(cfg.randomize_questions),'shuffle_options':bool(cfg.shuffle_options),'require_fullscreen':bool(cfg.require_fullscreen),'tab_switch_limit':cfg.tab_switch_limit,
+            'exam_type':cfg.exam_type,'practical_experiment_no':cfg.practical_experiment_no,'practical_code_start_at':cfg.practical_code_start_at,'practical_code_end_at':cfg.practical_code_end_at
         } if cfg else {}),
-        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'require_exam_pin':bool(security.require_exam_pin),'heartbeat_seconds':security.heartbeat_seconds} if security else {}),
+        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'require_exam_pin':bool(security.require_exam_pin),'heartbeat_seconds':security.heartbeat_seconds,'strict_start_window':bool(security.strict_start_window),'start_grace_minutes':security.start_grace_minutes,'auto_submit_on_integrity_limit':bool(security.auto_submit_on_integrity_limit),'defer_results_until_end':bool(security.defer_results_until_end),'block_ip_roll_switch':bool(security.block_ip_roll_switch),'practical_defaults_applied':bool(security.practical_defaults_applied)} if security else {}),
         'questions':[{'question':q.question,'question_type':canonical_question_type(q.question_type),'option_a':q.option_a,'option_b':q.option_b,'option_c':q.option_c,'option_d':q.option_d,'correct_answer':q.correct_answer,'answer_key':q.answer_key,'answer_tolerance':q.answer_tolerance,'answer_case_sensitive':bool(q.answer_case_sensitive),'marks':q.marks,'practical_experiment_no':q.practical_experiment_no or ''} for q in questions],
     }
 
@@ -2142,6 +2342,11 @@ def home():
         if valid:
             clear_auth_failures(s,throttle_key)
             if role=='student':
+                ip_ok,ip_exam,_ip_lock=current_practical_exam_ip_locks_for_login(s,row)
+                if not ip_ok:
+                    audit_event(s,'student_login_blocked_ip_roll_switch','user',row.id,f'exam_id={ip_exam.id if ip_exam else 0}')
+                    s.commit();clear_student_session_for_ip_conflict()
+                    return render_template('login.html',login_page=True),409
                 csrf=web_session.get('_csrf_token');device_token=web_session.get('_student_device_token') or secrets.token_urlsafe(24);web_session.clear();web_session['_csrf_token']=csrf;web_session['_student_device_token']=device_token
                 web_session.update(role='student',user_id=row.id,username=row.roll_no,_last_activity=int(time.time()))
                 audit_event(s,'student_login','user',row.id,'student')
@@ -3024,6 +3229,76 @@ def student_practical_code_available(s,student_id):
     student=s.get(Student,student_id) if student_id else None
     return bool(practical_code_exam_rows_for_student(s,student))
 
+def sync_practical_attendance_from_attempt(s,attempt):
+    """Award Practical Exam attendance only for a clean, on-time submission.
+
+    This rule intentionally applies only to exams classified as Practical Exam.
+    A student is auto-marked Present when the attempt was actually started,
+    submitted successfully by its server-side deadline, and has zero recorded
+    integrity violations.  A faculty-entered Absent status is never overwritten.
+    """
+    if not attempt or attempt.status!='submitted':
+        return {'updated':False,'reason':'attempt_not_submitted'}
+    meta=practical_exam_metadata_for_exam(s,attempt.exam_id)
+    if not meta.get('is_practical'):
+        return {'updated':False,'reason':'normal_exam'}
+    if not meta.get('valid'):
+        return {'updated':False,'reason':meta.get('reason') or 'invalid_practical_mapping'}
+    if not (attempt.started_at or '').strip():
+        return {'updated':False,'reason':'attempt_not_started'}
+    if not (attempt.submitted_at or '').strip():
+        return {'updated':False,'reason':'submission_time_missing'}
+    try:
+        submitted_at=parse_dt(attempt.submitted_at)
+        deadline=parse_dt(attempt.end_at) if (attempt.end_at or '').strip() else None
+    except Exception:
+        return {'updated':False,'reason':'invalid_attempt_time'}
+    if deadline is not None and submitted_at>deadline:
+        return {'updated':False,'reason':'submitted_late'}
+    violations=s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0
+    if int(violations)>0:
+        return {'updated':False,'reason':'integrity_violation','violations':int(violations)}
+
+    student=s.get(Student,attempt.student_id)
+    if not student:
+        return {'updated':False,'reason':'student_not_found'}
+    target=resolve_practical_target_for_student(s,student,meta.get('experiment_no',''),meta.get('subject',''))
+    if not target.get('ok'):
+        return {'updated':False,'reason':target.get('reason') or 'practical_target_not_unique','matches':target.get('matches',0)}
+    register=target['register'];practical_student=target['practical_student'];experiment=target['experiment']
+    attendance_max=float(practical_marks_maxima(register)['attendance'])
+    mark=s.scalar(select(PracticalMark).where(
+        PracticalMark.practical_student_id==practical_student.id,
+        PracticalMark.practical_experiment_id==experiment.id
+    ))
+    # Respect an explicit faculty Absent decision. Automatic exam attendance must
+    # fill missing/Present attendance, not silently reverse a manual exception.
+    if mark and (mark.attendance or '').upper()=='A':
+        return {'updated':False,'reason':'faculty_marked_absent','register_id':register.id,'practical_student_id':practical_student.id,'experiment_id':experiment.id}
+    if mark and (mark.attendance or '').upper()=='P' and mark.attendance_marks is not None and abs(float(mark.attendance_marks)-attendance_max)<0.0001:
+        return {'updated':False,'reason':'already_synced','register_id':register.id,'practical_student_id':practical_student.id,'experiment_id':experiment.id,'attendance_marks':attendance_max}
+    if not mark:
+        mark=PracticalMark(
+            register_id=register.id,practical_student_id=practical_student.id,
+            practical_experiment_id=experiment.id,attendance='P',attendance_marks=attendance_max,
+            record_marks=None,performance_marks=None,viva_marks=None,marks=attendance_max,
+            remarks='',updated_by='Practical Exam Attendance',updated_at=now_iso()
+        )
+        s.add(mark);s.flush()
+    else:
+        mark.attendance='P';mark.attendance_marks=attendance_max
+        components=[mark.attendance_marks,mark.record_marks,mark.performance_marks,mark.viva_marks]
+        mark.marks=sum(value or 0 for value in components) if any(value is not None for value in components) else attendance_max
+        mark.updated_by='Practical Exam Attendance';mark.updated_at=now_iso()
+    register.updated_at=now_iso()
+    audit_event(
+        s,'practical_attendance_auto_synced','practical_mark',mark.id or '',
+        f'exam={attempt.exam_id}, attempt={attempt.id}, roll={practical_student.roll_no}, '
+        f'experiment={experiment.experiment_no}, attendance={attendance_max}, violations=0, submitted_on_time=true'
+    )
+    return {'updated':True,'reason':'','register_id':register.id,'practical_student_id':practical_student.id,'experiment_id':experiment.id,'attendance_marks':attendance_max,'match_basis':target.get('match_basis','')}
+
+
 def sync_practical_viva_from_attempt(s,attempt):
     """Copy a submitted Practical Exam score into exactly one Viva column.
 
@@ -3154,14 +3429,15 @@ def resync_submitted_practical_attempts(s,exam_id):
     updated=0;skipped=0;reasons={}
     for attempt in attempts:
         try:
+            attendance_result=sync_practical_attendance_from_attempt(s,attempt)
             result=sync_practical_viva_from_attempt(s,attempt)
-            if result.get('updated'):
+            if attendance_result.get('updated') or result.get('updated'):
                 s.commit();updated+=1
             else:
-                skipped+=1;reason=result.get('reason') or 'not_updated';reasons[reason]=reasons.get(reason,0)+1
+                skipped+=1;reason=result.get('reason') or attendance_result.get('reason') or 'not_updated';reasons[reason]=reasons.get(reason,0)+1
         except Exception:
             s.rollback();skipped+=1;reasons['exception']=reasons.get('exception',0)+1
-            try:app.logger.exception('Practical Exam retroactive viva sync failed for attempt %s',attempt.id)
+            try:app.logger.exception('Practical Exam retroactive viva sync failed during attendance/viva repair for attempt %s',attempt.id)
             except Exception:pass
     return {'attempts':len(attempts),'updated':updated,'skipped':skipped,'reasons':reasons}
 
@@ -4244,6 +4520,7 @@ def edit_exam_metadata(exam_id):
         course_semester=catalog_subject.course_semester or ''
 
     cfg=get_exam_config(s,exam.id,create=True)
+    security=get_exam_security_policy(s,exam.id,create=True)
     old_title=exam.title or ''
     old_subject,_old_unit=student_exam_subject_unit(s,exam,cfg)
     old_exam_type=(getattr(cfg,'exam_type','') or 'regular')
@@ -4258,6 +4535,11 @@ def edit_exam_metadata(exam_id):
     cfg.practical_experiment_no=practical_experiment_no
     cfg.practical_code_start_at=practical_code_start_at if exam_type=='practical_exam' else ''
     cfg.practical_code_end_at=practical_code_end_at if exam_type=='practical_exam' else ''
+    if exam_type=='practical_exam':
+        # Apply the V2.20 secure Practical Exam profile the first time this exam
+        # becomes practical (and once for older practical exams after upgrade).
+        if old_exam_type!='practical_exam':security.practical_defaults_applied=False
+        apply_practical_exam_security_defaults(s,exam.id,cfg,security)
 
     # Exam Question rows are exam-specific snapshots, so keep their practical
     # serial aligned with the explicit exam-level setting.  This makes later
@@ -4336,6 +4618,7 @@ def delete_exam(exam_id):
     s.execute(delete(ExamSecurityPolicy).where(ExamSecurityPolicy.exam_id==exam.id))
     s.execute(delete(ExamStudentAccess).where(ExamStudentAccess.exam_id==exam.id))
     s.execute(delete(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam.id))
+    s.execute(delete(ExamIPSessionLock).where(ExamIPSessionLock.exam_id==exam.id))
     s.execute(delete(ExamCandidateCheckin).where(ExamCandidateCheckin.exam_id==exam.id))
     s.execute(delete(EdgePackageReceipt).where(EdgePackageReceipt.exam_id==exam.id))
     s.execute(delete(ExamConfig).where(ExamConfig.exam_id==exam.id))
@@ -4456,8 +4739,9 @@ def import_edge_exam_package():
         cfg_data=payload.get('config') or {};cfg=get_exam_config(s,exam.id,create=True);cfg.subject=str(cfg_data.get('subject') or '')[:200];cfg.course_semester=str(cfg_data.get('course_semester') or '')[:200];cfg.question_count=max(1,min(len(qrows),int(cfg_data.get('question_count') or len(qrows))));cfg.pool_size=max(cfg.question_count,min(len(qrows),int(cfg_data.get('pool_size') or len(qrows))))
         easy=int(cfg_data.get('easy_pct') or 30);medium=int(cfg_data.get('medium_pct') or 50);hard=int(cfg_data.get('hard_pct') or 20)
         if easy+medium+hard!=100:easy,medium,hard=30,50,20
-        cfg.easy_pct=max(0,easy);cfg.medium_pct=max(0,medium);cfg.hard_pct=max(0,hard);cfg.unit_weights=str(cfg_data.get('unit_weights') or '')[:2000];cfg.randomize_questions=bool(cfg_data.get('randomize_questions',True));cfg.shuffle_options=bool(cfg_data.get('shuffle_options',True));cfg.require_fullscreen=bool(cfg_data.get('require_fullscreen',False));cfg.tab_switch_limit=max(0,min(100,int(cfg_data.get('tab_switch_limit') or 3)));cfg.last_generation_summary=f'Imported from encrypted Edge package {pid}.';cfg.updated_at=now_iso()
-        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(10,min(60,int(security_data.get('heartbeat_seconds') or 15)));security.updated_at=now_iso()
+        cfg.easy_pct=max(0,easy);cfg.medium_pct=max(0,medium);cfg.hard_pct=max(0,hard);cfg.unit_weights=str(cfg_data.get('unit_weights') or '')[:2000];cfg.randomize_questions=bool(cfg_data.get('randomize_questions',True));cfg.shuffle_options=bool(cfg_data.get('shuffle_options',True));cfg.require_fullscreen=bool(cfg_data.get('require_fullscreen',False));cfg.tab_switch_limit=max(0,min(100,int(cfg_data.get('tab_switch_limit') or 3)));cfg.exam_type=str(cfg_data.get('exam_type') or 'regular')[:30];cfg.practical_experiment_no=normalize_practical_exam_no(cfg_data.get('practical_experiment_no'));cfg.practical_code_start_at=str(cfg_data.get('practical_code_start_at') or '')[:40];cfg.practical_code_end_at=str(cfg_data.get('practical_code_end_at') or '')[:40];cfg.last_generation_summary=f'Imported from encrypted Edge package {pid}.';cfg.updated_at=now_iso()
+        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(10,min(60,int(security_data.get('heartbeat_seconds') or 15)));security.strict_start_window=bool(security_data.get('strict_start_window',False));security.start_grace_minutes=max(0,min(60,int(security_data.get('start_grace_minutes') or 5)));security.auto_submit_on_integrity_limit=bool(security_data.get('auto_submit_on_integrity_limit',False));security.defer_results_until_end=bool(security_data.get('defer_results_until_end',False));security.block_ip_roll_switch=bool(security_data.get('block_ip_roll_switch',False));security.practical_defaults_applied=bool(security_data.get('practical_defaults_applied',False));security.updated_at=now_iso()
+        if cfg.exam_type=='practical_exam' and not security.practical_defaults_applied:apply_practical_exam_security_defaults(s,exam.id,cfg,security)
         for idx,item in enumerate(qrows,1):
             if not isinstance(item,dict):raise ValueError(f'Question {idx} is malformed.')
             qtype=canonical_question_type(item.get('question_type'));question_text=str(item.get('question') or '').strip();options={key:str(item.get(f'option_{key.lower()}') or '').strip() for key in 'ABCD'};answer_key=str(item.get('answer_key') or item.get('correct_answer') or '').strip() if qtype!='essay' else '';tolerance=str(item.get('answer_tolerance') or '').strip();error=validate_question_definition(qtype,question_text,options,answer_key,tolerance)
@@ -4542,16 +4826,19 @@ def exam_builder(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
     cfg=get_exam_config(s,exam_id,create=True);security=get_exam_security_policy(s,exam_id,create=True)
+    if apply_practical_exam_security_defaults(s,exam_id,cfg,security):
+        audit_event(s,'practical_exam_secure_defaults_applied','exam',exam_id,'fullscreen=1, rotating_pin=1, strict_start=1, auto_submit=1, defer_results=1, ip_roll_lock=1')
+        s.commit()
     if request.method=='POST':
         action=request.form.get('action','save')
         try:
             qcount=max(1,int(request.form.get('question_count','20')));pool_size=max(qcount,int(request.form.get('pool_size',str(qcount))))
-            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(10,min(60,int(request.form.get('heartbeat_seconds','15') or 15)))
+            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(10,min(60,int(request.form.get('heartbeat_seconds','15') or 15)));start_grace_minutes=max(0,min(60,int(request.form.get('start_grace_minutes','5') or 5)))
         except ValueError:flash('Blueprint numeric values are invalid.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         if easy+medium+hard!=100:flash('Difficulty distribution must total 100%.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         try:unit_weights=parse_unit_weights(request.form.get('unit_weights',''))
         except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
-        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.updated_at=now_iso();s.flush()
+        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.strict_start_window=request.form.get('strict_start_window')=='on';security.start_grace_minutes=start_grace_minutes;security.auto_submit_on_integrity_limit=request.form.get('auto_submit_on_integrity_limit')=='on';security.defer_results_until_end=request.form.get('defer_results_until_end')=='on';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.practical_defaults_applied=True if (cfg.exam_type or '').strip().lower()=='practical_exam' else security.practical_defaults_applied;security.updated_at=now_iso();s.flush()
         if action=='generate':
             if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)>0:flash('This exam already has attempts. The question pool is locked to protect result integrity.','error');s.rollback();return redirect(url_for('exam_builder',exam_id=exam_id))
             stmt=select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
@@ -4591,7 +4878,8 @@ def exam_student_access_admin(exam_id):
     for st in students:
         lock=lock_map.get(st.id)
         rows.append(type('StudentAccessView',(),{'student':st,'locked':bool(lock),'last_seen_at':lock.last_seen_at if lock else ''})())
-    s.commit();return render_template('exam_student_access.html',exam=exam,security=security,rows=rows)
+    ip_lock_count=int(s.scalar(select(func.count()).select_from(ExamIPSessionLock).where(ExamIPSessionLock.exam_id==exam_id)) or 0)
+    s.commit();return render_template('exam_student_access.html',exam=exam,security=security,rows=rows,ip_lock_count=ip_lock_count)
 
 
 @app.route('/admin/exam/<int:exam_id>/student-access/security',methods=['POST'])
@@ -4599,8 +4887,10 @@ def exam_student_access_admin(exam_id):
 def update_exam_student_access_security(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
-    security=get_exam_security_policy(s,exam_id,create=True);security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.updated_at=now_iso()
-    audit_event(s,'exam_rotating_pin_security_updated','exam',exam_id,f'enabled={security.require_exam_pin}');s.commit();flash('Rotating Exam PIN security enabled.' if security.require_exam_pin else 'Rotating Exam PIN security disabled.')
+    security=get_exam_security_policy(s,exam_id,create=True);security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.updated_at=now_iso()
+    cfg=get_exam_config(s,exam_id,create=False)
+    if cfg and (cfg.exam_type or '').strip().lower()=='practical_exam':security.practical_defaults_applied=True
+    audit_event(s,'exam_student_access_security_updated','exam',exam_id,f'rotating_pin={security.require_exam_pin}, ip_roll_lock={security.block_ip_roll_switch}');s.commit();flash('Student access security updated.')
     return redirect(url_for('exam_student_access_admin',exam_id=exam_id))
 
 
@@ -4633,6 +4923,17 @@ def reset_exam_student_device(exam_id,student_id):
     row=s.scalar(select(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam_id,ExamDeviceLock.student_id==student_id))
     if row:s.delete(row)
     audit_event(s,'exam_device_lock_reset','exam',exam_id,f'student={student.roll_no}, by={actor_label(s)}');s.commit();flash(f'Device lock reset for {student.roll_no}.')
+    return redirect(url_for('exam_student_access_admin',exam_id=exam_id))
+
+
+@app.route('/admin/exam/<int:exam_id>/student-access/reset-ip-locks',methods=['POST'])
+@staff_required
+def reset_exam_ip_session_locks(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    count=int(s.scalar(select(func.count()).select_from(ExamIPSessionLock).where(ExamIPSessionLock.exam_id==exam_id)) or 0)
+    s.execute(delete(ExamIPSessionLock).where(ExamIPSessionLock.exam_id==exam_id))
+    audit_event(s,'exam_ip_session_locks_reset','exam',exam_id,f'count={count}, by={actor_label(s)}');s.commit();flash(f'Reset {count} IP/session lock(s).')
     return redirect(url_for('exam_student_access_admin',exam_id=exam_id))
 
 
@@ -5486,6 +5787,21 @@ def student_dashboard():
 def student_practical_code():
     s=DB();student=s.get(Student,web_session['user_id'])
     if not student:abort(404)
+    # Repair legacy/submitted Practical Exam attendance before rendering marks.
+    # This makes a clean, on-time submission visible even if the attempt was
+    # completed before automatic attendance sync was introduced.
+    submitted_attempts=s.scalars(select(Attempt).where(
+        Attempt.student_id==student.id,Attempt.status=='submitted'
+    ).order_by(Attempt.id.desc())).all()
+    for submitted_attempt in submitted_attempts:
+        try:
+            attendance_result=sync_practical_attendance_from_attempt(s,submitted_attempt)
+            if attendance_result.get('updated'):
+                s.commit()
+        except Exception:
+            s.rollback()
+            try:app.logger.exception('Practical attendance repair failed for student %s attempt %s',student.id,submitted_attempt.id)
+            except Exception:pass
     rows=practical_code_exam_rows_for_student(s,student)
     if not rows:
         flash('Practical Marks are available only when a Practical Exam is assigned.','error')
@@ -5658,6 +5974,10 @@ def current_student_exam_pin(exam_id):
     if not security or not security.require_exam_pin:abort(404)
     allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
     if not allowed:return jsonify({'error':access_label}),403
+    ip_ok,_ip_lock=ensure_exam_ip_session_lock(s,exam,student,resolved_exam_window_for_student(s,student.id,exam,_session))
+    if not ip_ok:
+        s.commit();return jsonify({'error':'You have already logged in with a roll number for this session.','ip_roll_locked':True}),409
+    s.commit()
     response=jsonify({'pin':rotating_exam_pin(exam_id,student.id),'seconds_remaining':rotating_exam_pin_seconds_remaining()})
     response.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0'
     return response
@@ -5672,6 +5992,10 @@ def verify_student_exam_pin(exam_id):
     if not security or not security.require_exam_pin:return redirect(url_for('take_exam',exam_id=exam_id))
     allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
     if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
+    ip_ok,_ip_lock=ensure_exam_ip_session_lock(s,exam,student,resolved_exam_window_for_student(s,student.id,exam,_session))
+    if not ip_ok:
+        s.commit();clear_student_session_for_ip_conflict();return redirect(url_for('home'))
+    s.commit()
     ajax=request.headers.get('X-Requested-With')=='XMLHttpRequest' or request.accept_mimetypes.best=='application/json'
     if request.method=='POST':
         pin=(request.form.get('exam_pin') or '').strip()
@@ -5694,11 +6018,15 @@ def verify_student_exam_pin(exam_id):
 @app.route('/student/exam/<int:exam_id>')
 @student_required
 def take_exam(exam_id):
-    s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True))
-    if not exam:flash('Exam is not active.','error');return redirect(url_for('student_dashboard'))
+    s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True));student=s.get(Student,web_session['user_id'])
+    if not exam or not student:flash('Exam is not active.','error');return redirect(url_for('student_dashboard'))
     allowed,access_label,_session=exam_access_for_student(s,web_session['user_id'],exam)
     if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
     security=get_exam_security_policy(s,exam_id,create=False)
+    ip_ok,_ip_lock=ensure_exam_ip_session_lock(s,exam,student,resolved_exam_window_for_student(s,student.id,exam,_session))
+    if not ip_ok:
+        s.commit();clear_student_session_for_ip_conflict();return redirect(url_for('home'))
+    s.commit()
     if security and security.require_exam_pin:
         # PIN-secured exams must never be resumed directly from the dashboard.
         # Only the same-session URL issued after a successful PIN check may
@@ -5719,9 +6047,11 @@ def take_exam(exam_id):
         if cfg is None or cfg.randomize_questions:qids=random.sample(qids,target)
         else:qids=qids[:target]
         started=now_dt();end=started+timedelta(minutes=exam.duration_minutes)
-        if _session and _session.scheduled_end:
-            session_end=datetime.fromisoformat(_session.scheduled_end).astimezone() if datetime.fromisoformat(_session.scheduled_end).tzinfo else datetime.fromisoformat(_session.scheduled_end).replace(tzinfo=started.tzinfo)
-            if session_end<end:end=session_end
+        common_window=resolved_exam_window_for_student(s,web_session['user_id'],exam,_session)
+        common_end=common_window.get('end')
+        if common_end:
+            common_end=common_end.astimezone(started.tzinfo) if common_end.tzinfo else common_end.replace(tzinfo=started.tzinfo)
+            if common_end<end:end=common_end
         attempt=Attempt(student_id=web_session['user_id'],exam_id=exam_id,started_at=started.isoformat(timespec='seconds'),end_at=end.isoformat(timespec='seconds'),status='in_progress',question_order=','.join(map(str,qids)));s.add(attempt);s.flush();s.add(AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=0,client_state='active',client_fingerprint=''))
         for pos,qid in enumerate(qids,1):
             keys=list('ABCD')
@@ -5773,9 +6103,35 @@ def integrity_event():
     event_type=str(data.get('event_type',''))[:50]
     if event_type not in {'tab_hidden','fullscreen_exit','copy_attempt','paste_attempt','context_menu'}:return jsonify(saved=False),400
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
-    if not attempt or attempt.status=='submitted':return jsonify(saved=False),404
+    if not attempt or attempt.status=='submitted':return jsonify(saved=False,submitted=bool(attempt and attempt.status=='submitted')),404
     if not secure_exam_device_allowed(s,attempt):return jsonify(saved=False,device_locked=True),409
-    s.add(IntegrityEvent(attempt_id=attempt.id,event_type=event_type,details=str(data.get('details',''))[:250],created_at=now_iso()));s.commit();count=s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0;return jsonify(saved=True,count=count)
+
+    # A normal Alt-Tab from browser full-screen can fire both visibilitychange
+    # and fullscreenchange nearly together. Count that as one student incident.
+    latest=s.scalar(select(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id).order_by(IntegrityEvent.id.desc()).limit(1))
+    screen_events={'tab_hidden','fullscreen_exit'};duplicate=False
+    if latest and event_type in screen_events and latest.event_type in screen_events:
+        try:duplicate=(now_dt()-parse_dt(latest.created_at)).total_seconds()<=2
+        except Exception:duplicate=False
+    if not duplicate:
+        s.add(IntegrityEvent(attempt_id=attempt.id,event_type=event_type,details=str(data.get('details',''))[:250],created_at=now_iso()));s.flush()
+
+    count=int(s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0)
+    cfg=get_exam_config(s,exam_id,create=False);security=get_exam_security_policy(s,exam_id,create=False);limit=max(0,int(cfg.tab_switch_limit or 0)) if cfg else 0
+    auto_enforce=bool(security and security.auto_submit_on_integrity_limit and limit>0)
+    message='Integrity event recorded.'
+    level='recorded'
+    if auto_enforce and count>=limit:
+        audit_event(s,'exam_auto_submitted_integrity','exam',exam_id,f'student_id={attempt.student_id}, violations={count}, limit={limit}')
+        finalize_attempt(s,attempt)
+        return jsonify(saved=True,count=count,limit=limit,submitted=True,level='terminated',message='Exam automatically submitted because the integrity violation limit was reached.')
+    if auto_enforce:
+        remaining=max(0,limit-count)
+        if remaining==1:
+            level='final_warning';message='Final warning: one more integrity violation will automatically submit your examination.'
+        else:
+            level='warning';message=f'Warning {count}: integrity violation recorded. {remaining} more violation(s) will automatically submit your examination.'
+    s.commit();return jsonify(saved=True,count=count,limit=limit,submitted=False,level=level,message=message,duplicate=duplicate)
 
 @app.route('/student/heartbeat',methods=['POST'])
 @student_required
@@ -5823,6 +6179,13 @@ def submitted(exam_id):
     if attempt.status!='submitted' and now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt)
     if attempt.status=='submitted':
         try:
+            attendance_result=sync_practical_attendance_from_attempt(s,attempt)
+            if attendance_result.get('updated'):s.commit()
+        except Exception:
+            s.rollback()
+            try:app.logger.exception('Practical Exam attendance repair failed while showing result for attempt %s',attempt.id)
+            except Exception:pass
+        try:
             sync_result=sync_practical_viva_from_attempt(s,attempt)
             if sync_result.get('updated'):s.commit()
         except Exception:
@@ -5830,14 +6193,20 @@ def submitted(exam_id):
             try:app.logger.exception('Practical Exam viva repair failed while showing result for attempt %s',attempt.id)
             except Exception:pass
     violations=s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0
+    release_at=exam_result_release_at(s,attempt.student_id,exam)
+    results_released=not release_at or now_dt().replace(tzinfo=None)>=release_at.replace(tzinfo=None)
     percentage,grade,grade_class=result_performance(attempt.score,attempt.total_marks)
-    return render_template('submitted.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,violations=violations,percentage=percentage,grade=grade,grade_class=grade_class,answer_review_exam_id=exam.id if attempt.status=='submitted' else None)
+    return render_template('submitted.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,violations=violations,percentage=percentage,grade=grade,grade_class=grade_class,results_released=results_released,result_release_at=release_at,answer_review_exam_id=exam.id if attempt.status=='submitted' and results_released else None)
 
 @app.route('/student/submitted/<int:exam_id>/answers')
 @student_required
 def submitted_answers(exam_id):
     s=DB();exam=s.get(Exam,exam_id);attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not exam or not attempt or attempt.status!='submitted':abort(404)
+    release_at=exam_result_release_at(s,attempt.student_id,exam)
+    if release_at and now_dt().replace(tzinfo=None)<release_at.replace(tzinfo=None):
+        flash(f'Answer review will be available after {release_at.strftime("%d %b %Y, %I:%M %p")}.','error')
+        return redirect(url_for('submitted',exam_id=exam_id))
     aq_rows=s.scalars(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id).order_by(AttemptQuestion.position)).all()
     ordered=[(row.position,row.question_id,row.option_order or 'ABCD') for row in aq_rows] if aq_rows else [(pos,qid,'ABCD') for pos,qid in enumerate(attempt_question_ids(s,attempt),1)]
     qids=[qid for _pos,qid,_order in ordered];qrows=s.scalars(select(Question).where(Question.id.in_(qids))).all() if qids else [];qmap={q.id:q for q in qrows}

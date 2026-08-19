@@ -45,8 +45,18 @@ async function logIntegrity(examId,eventType,details=''){
       headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},
       body:JSON.stringify({exam_id:examId,event_type:eventType,details:details})
     });
-    if(!res.ok) return null;
-    return await res.json();
+    const data=await res.json().catch(()=>null);
+    if(!res.ok || !data) return data;
+    if(data.submitted){
+      window.alert(data.message || 'Your exam has been automatically submitted because the integrity limit was reached.');
+      const resultUrl=`/student/submitted/${examId}`;
+      if(window.top!==window.self) window.top.location.href=resultUrl; else window.location.href=resultUrl;
+      return data;
+    }
+    if(!data.duplicate && ['warning','final_warning'].includes(data.level)){
+      window.alert(data.message || 'Integrity warning recorded.');
+    }
+    return data;
   }catch(_err){return null;}
 }
 function startIntegrity(examId,requireFullscreen,tabLimit){
@@ -63,7 +73,7 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
     }
   };
   document.addEventListener('visibilitychange',async()=>{
-    if(document.hidden){tabEvents+=1;await logIntegrity(examId,'tab_hidden','Exam tab became hidden');updateBanner();}
+    if(document.hidden){const data=await logIntegrity(examId,'tab_hidden','Exam tab became hidden');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();}
   });
   if(requireFullscreen){
     if(fullscreenBtn){fullscreenBtn.addEventListener('click',async()=>{
@@ -72,7 +82,7 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
     });}
     document.addEventListener('fullscreenchange',async()=>{
       if(document.fullscreenElement){enteredFullscreen=true;if(fullscreenBtn)fullscreenBtn.textContent='Full Screen Active';return;}
-      if(enteredFullscreen){tabEvents+=1;await logIntegrity(examId,'fullscreen_exit','Full-screen mode exited');updateBanner();if(fullscreenBtn)fullscreenBtn.textContent='Re-enter Full Screen';}
+      if(enteredFullscreen){const data=await logIntegrity(examId,'fullscreen_exit','Full-screen mode exited');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();if(fullscreenBtn)fullscreenBtn.textContent='Re-enter Full Screen';}
     });
   }
 }

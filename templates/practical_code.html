@@ -18,7 +18,17 @@
         </thead>
         <tbody>
           <tr>
-            <td><strong>{{ '%g'|format(mark.attendance_marks) if mark and mark.attendance_marks is not none else '—' }}</strong></td>
+            <td>
+              {% if mark and mark.attendance=='P' %}
+                <strong>Present · {{ '%g'|format(mark.attendance_marks if mark.attendance_marks is not none else maxima.attendance) }}</strong>
+              {% elif mark and mark.attendance=='A' %}
+                <strong>Absent · 0</strong>
+              {% elif mark and mark.attendance_marks is not none %}
+                <strong>{{ '%g'|format(mark.attendance_marks) }}</strong>
+              {% else %}
+                <strong>—</strong>
+              {% endif %}
+            </td>
             <td><strong>{{ '%g'|format(mark.record_marks) if mark and mark.record_marks is not none else '—' }}</strong></td>
             <td><strong>{{ '%g'|format(mark.performance_marks) if mark and mark.performance_marks is not none else '—' }}</strong></td>
             <td><strong>{{ '%g'|format(mark.viva_marks) if mark and mark.viva_marks is not none else '—' }}</strong></td>
