@@ -417,6 +417,7 @@ function initPracticalMarks(){
       const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify(payload)});
       const data=await res.json();if(!res.ok||!data.ok)throw new Error(data.error||'Save failed');
       const total=row.querySelector('[data-practical-total]');if(total)total.value=(data.total===null||data.total===undefined)?'':data.total;
+      const recordInput=row.querySelector('[data-practical-component-key="record_marks"]');if(recordInput&&data.record_marks_auto!==undefined)recordInput.setAttribute('data-record-auto',data.record_marks_auto?'1':'0');
       state.textContent='Saved';state.className='practical-save-state saved';
     }catch(err){state.textContent='Retry';state.title=err.message||'Save failed';state.className='practical-save-state error';}
   };
@@ -433,7 +434,8 @@ function initPracticalMarks(){
       }else{
         gradedInputs.forEach(input=>{input.disabled=false;});
         if(attendanceInput)attendanceInput.disabled=false;
-        if(!attendance.value&&gradedInputs.some(input=>input.value!==''))attendance.value='P';
+        const attendanceEvidence=gradedInputs.filter(input=>input.getAttribute('data-record-auto')!=='1');
+        if(!attendance.value&&attendanceEvidence.some(input=>input.value!==''))attendance.value='P';
         if(attendance.value==='P'&&attendanceInput)attendanceInput.value=String(attendanceMax);
         else if(!attendance.value&&attendanceInput)attendanceInput.value='';
         updateTotal(row);

@@ -8,7 +8,7 @@
   <div class="stat-card"><strong>{{ students|length }}</strong><span>Students</span></div>
   <div class="stat-card"><strong>{{ experiments|length }}</strong><span>Experiments</span></div>
   <div class="stat-card"><strong>{{ summary|selectattr('evaluated','gt',0)|list|length }}</strong><span>Students Started</span></div>
-  <div class="stat-card practical-file-stat"><strong id="practical-files-received-count">{{ received_count }}</strong><span>Files Received · <span id="practical-files-missing-count">{{ missing_count }}</span> Missing</span></div>
+  <div class="stat-card practical-file-stat"><strong><span id="practical-records-received-count">{{ received_receipt_count }}</span> / {{ total_receipt_slots }}</strong><span>Experiment Records · <span id="practical-records-missing-count">{{ missing_receipt_count }}</span> Missing</span></div>
 </div>
 
 <div class="card practical-marks-settings">
@@ -39,13 +39,22 @@
   <div class="import-header">
     <div>
       <h2>Practical File Scanner</h2>
-      <span class="muted">Photograph or upload the first page. The image stays in your browser; only detected text, match details and receipt status are stored.</span>
+      <span class="muted">First select the experiment, then scan the student's first page. Each receipt is stored against that specific experiment.</span>
     </div>
-    <span class="practical-file-received-badge"><strong>{{ received_count }}</strong> / {{ students|length }} received</span>
+    <span class="practical-file-received-badge"><strong data-scan-received-count>—</strong> / {{ students|length }} <span data-scan-received-label>for selected experiment</span></span>
   </div>
-  {% if students %}
+  {% if students and experiments %}
+  <div class="practical-scan-experiment-step">
+    <label for="practical-scan-experiment"><span>1</span> Select Experiment for this Record</label>
+    <select id="practical-scan-experiment" data-scan-experiment-select>
+      <option value="">Choose experiment before scanning</option>
+      {% for e in experiments %}<option value="{{ e.id }}" data-experiment-no="{{ e.experiment_no }}" data-received-count="{{ receipt_count_by_experiment.get(e.id,0) }}">Experiment {{ e.experiment_no }} — {{ e.title }}</option>{% endfor %}
+    </select>
+    <small>The selected experiment stays active while you scan multiple students, so you can process one complete stack quickly.</small>
+  </div>
   <div class="practical-scanner-grid">
     <div>
+      <div class="practical-scan-step-title"><span>2</span> Scan or upload the first page</div>
       <div class="practical-scan-actions">
         <label class="btn" for="practical-file-camera">📷 Take First-Page Photo</label>
         <label class="btn secondary" for="practical-file-upload">Upload Image / PDF</label>
@@ -63,7 +72,7 @@
         <div class="practical-scan-manual-row">
           <select id="practical-scan-student" data-scan-student-select>
             <option value="">Choose a student if OCR is unclear</option>
-            {% for st in students if not submission_by_student.get(st.id) %}<option value="{{ st.id }}">{{ st.roll_no }} — {{ st.name }}</option>{% endfor %}
+            {% for st in students %}<option value="{{ st.id }}">{{ st.roll_no }} — {{ st.name }}</option>{% endfor %}
           </select>
           <button type="button" class="btn secondary" data-scan-manual-save>Confirm &amp; Save</button>
         </div>
@@ -74,8 +83,10 @@
       <img class="practical-scan-preview" data-scan-preview alt="Selected practical file first page" hidden>
     </div>
   </div>
-  {% else %}
+  {% elif not students %}
   <p class="muted">Upload the student list first. The scanner matches each first page against students in this practical register.</p>
+  {% else %}
+  <p class="muted">Upload the experiment list first. A record cannot be scanned until an experiment is available to assign it to.</p>
   {% endif %}
 </div>
 
@@ -86,10 +97,21 @@
   </table></div>
 </div>
 
+<div class="card practical-record-tracker-card" id="record-submission-tracker">
+  <div class="import-header">
+    <div><h2>Record Submission Tracker</h2><span class="muted">See exactly which experiment record each student has submitted.</span></div>
+    <span class="badge practical-file-received">{{ received_receipt_count }} / {{ total_receipt_slots }} received</span>
+  </div>
+  {% if legacy_receipt_count %}<div class="practical-legacy-notice"><strong>{{ legacy_receipt_count }} earlier scan{% if legacy_receipt_count != 1 %}s{% endif %} are unassigned.</strong> These were saved before experiment tracking was added. Rescan each one under the correct experiment; the new experiment-specific receipt will replace its unassigned status.</div>{% endif %}
+  <div class="table-wrap"><table class="practical-record-tracker"><tr><th>#</th><th>Roll No</th><th>Student</th>{% for e in experiments %}<th title="{{ e.title }}">Exp {{ e.experiment_no }}</th>{% endfor %}</tr>
+  {% for st in students %}<tr><td>{{ loop.index }}</td><td><strong>{{ st.roll_no }}</strong></td><td>{{ st.name }}</td>{% for e in experiments %}{% set item=receipt_map.get((st.id,e.id)) %}<td data-record-cell data-student-id="{{ st.id }}" data-experiment-id="{{ e.id }}" data-received="{{ 1 if item else 0 }}">{% if item %}<div class="practical-file-cell"><span class="badge practical-file-received">Received</span><small>{{ item.receipt.get('received_at','')|dt }}</small><form method="post" action="{{ url_for('practical_file_submission_delete',register_id=register.id,submission_id=item.submission.id) }}" onsubmit="return confirm('Remove the Experiment {{ e.experiment_no }} record receipt for {{ st.roll_no }}?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="experiment_id" value="{{ e.id }}"><button type="submit" class="practical-file-remove" title="Remove Experiment {{ e.experiment_no }} receipt" aria-label="Remove Experiment {{ e.experiment_no }} receipt">×</button></form></div>{% else %}<span class="badge practical-file-missing">Missing</span>{% endif %}</td>{% endfor %}</tr>{% else %}<tr><td colspan="{{ 3 + experiments|length }}">No students uploaded yet.</td></tr>{% endfor %}
+  </table></div>
+</div>
+
 <div class="card">
   <div class="import-header"><div><h2>Student Progress</h2></div><div class="actions"><a class="btn secondary small" href="{{ url_for('practical_export',register_id=register.id,fmt='csv') }}">Export CSV</a></div></div>
-  <div class="table-wrap"><table><tr><th>#</th><th>Roll No</th><th>Name</th><th>File</th><th>Evaluated</th><th>Total</th><th>Percentage</th></tr>
-  {% for row in summary %}<tr data-practical-student-row="{{ row.student.id }}"><td>{{ loop.index }}</td><td><strong>{{ row.student.roll_no }}</strong></td><td>{{ row.student.name }}</td><td data-practical-file-cell>{% if row.file_submission %}<div class="practical-file-cell"><span class="badge practical-file-received">Received</span><small>{{ row.file_submission.received_at|dt }}</small><form method="post" action="{{ url_for('practical_file_submission_delete',register_id=register.id,submission_id=row.file_submission.id) }}" onsubmit="return confirm('Remove this practical-file receipt?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="practical-file-remove" title="Remove receipt" aria-label="Remove file receipt">×</button></form></div>{% else %}<span class="badge practical-file-missing">Missing</span>{% endif %}</td><td>{{ row.evaluated }} / {{ experiments|length }}</td><td>{{ row.scored }} / {{ row.possible }}</td><td>{{ row.percent }}%</td></tr>{% else %}<tr><td colspan="7">No students uploaded yet.</td></tr>{% endfor %}
+  <div class="table-wrap"><table><tr><th>#</th><th>Roll No</th><th>Name</th><th>Records Submitted</th><th>Evaluated</th><th>Total</th><th>Percentage</th></tr>
+  {% for row in summary %}<tr data-practical-student-row="{{ row.student.id }}"><td>{{ loop.index }}</td><td><strong>{{ row.student.roll_no }}</strong></td><td>{{ row.student.name }}</td><td data-record-summary-cell data-student-id="{{ row.student.id }}"><strong>{{ row.record_received }}</strong> / {{ experiments|length }}</td><td>{{ row.evaluated }} / {{ experiments|length }}</td><td>{{ row.scored }} / {{ row.possible }}</td><td>{{ row.percent }}%</td></tr>{% else %}<tr><td colspan="7">No students uploaded yet.</td></tr>{% endfor %}
   </table></div>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" defer></script>

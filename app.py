@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.22.0'
+APP_VERSION='2.24.2'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -576,6 +576,10 @@ class PracticalStudent(Base):
 
 class PracticalFileSubmission(Base):
     __tablename__='practical_file_submissions'
+    # One row is retained per student for backward compatibility with V81.1.
+    # Per-experiment receipts are stored in experiment_receipts_json so existing
+    # SQLite/PostgreSQL deployments do not need a destructive UNIQUE-constraint
+    # migration to support more than one record file per student.
     __table_args__=(UniqueConstraint('register_id','practical_student_id'),)
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
     register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
@@ -588,6 +592,7 @@ class PracticalFileSubmission(Base):
     match_method:Mapped[str]=mapped_column(String,nullable=False,default='automatic')
     received_by:Mapped[str]=mapped_column(String,nullable=False,default='')
     received_at:Mapped[str]=mapped_column(String,nullable=False)
+    experiment_receipts_json:Mapped[str]=mapped_column(Text,nullable=False,default='{}')
 
 
 class PracticalExperiment(Base):
@@ -618,6 +623,10 @@ class PracticalMark(Base):
     attendance:Mapped[str]=mapped_column(String,nullable=False,default='')  # P | A | blank
     attendance_marks:Mapped[float|None]=mapped_column(Float,nullable=True)
     record_marks:Mapped[float|None]=mapped_column(Float,nullable=True)
+    # True only while the Record marks are being supplied automatically by an
+    # experiment-specific practical-file receipt. A later faculty override is
+    # preserved even if the receipt is removed.
+    record_marks_auto:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     performance_marks:Mapped[float|None]=mapped_column(Float,nullable=True)
     viva_marks:Mapped[float|None]=mapped_column(Float,nullable=True)
     marks:Mapped[float|None]=mapped_column(Float,nullable=True)  # calculated total / legacy total
@@ -713,8 +722,10 @@ def run_schema_upgrades():
         ('practical_registers','viva_max_marks','INTEGER NOT NULL DEFAULT 10'),
         ('practical_experiments','reference_code',"TEXT NOT NULL DEFAULT ''"),
         ('practical_experiments','penalty_rules',"TEXT NOT NULL DEFAULT ''"),
+        ('practical_file_submissions','experiment_receipts_json',"TEXT NOT NULL DEFAULT '{}'"),
         ('practical_marks','attendance_marks','FLOAT'),
         ('practical_marks','record_marks','FLOAT'),
+        ('practical_marks','record_marks_auto','BOOLEAN NOT NULL DEFAULT FALSE'),
         ('practical_marks','performance_marks','FLOAT'),
         ('practical_marks','viva_marks','FLOAT'),
         ('students','registration_no',"VARCHAR NOT NULL DEFAULT ''"),
@@ -2595,32 +2606,146 @@ def practical_register_detail(register_id):
     for mark in marks:by_student.setdefault(mark.practical_student_id,[]).append(mark)
     file_submissions=s.scalars(select(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id).order_by(PracticalFileSubmission.received_at.desc())).all()
     submission_by_student={row.practical_student_id:row for row in file_submissions}
+    receipt_map={};receipt_count_by_student={};receipt_count_by_experiment={e.id:0 for e in experiments};legacy_receipts=[]
+    for row in file_submissions:
+        receipts=_practical_file_receipts(row)
+        if not receipts and row.received_at:
+            legacy_receipts.append(row)
+        for key,receipt in receipts.items():
+            try:experiment_id=int(key)
+            except (TypeError,ValueError):continue
+            if experiment_id not in receipt_count_by_experiment:continue
+            receipt_map[(row.practical_student_id,experiment_id)]={'submission':row,'receipt':receipt}
+            receipt_count_by_student[row.practical_student_id]=receipt_count_by_student.get(row.practical_student_id,0)+1
+            receipt_count_by_experiment[experiment_id]=receipt_count_by_experiment.get(experiment_id,0)+1
     possible=sum(e.max_marks for e in experiments);summary=[]
     for st in students:
         student_marks=by_student.get(st.id,[]);scored=sum(float(m.marks or 0) for m in student_marks if m.marks is not None);evaluated=sum(1 for m in student_marks if m.marks is not None or m.attendance=='A')
-        summary.append({'student':st,'scored':round(scored,2),'possible':possible,'evaluated':evaluated,'percent':round(scored*100/possible,1) if possible else 0,'file_submission':submission_by_student.get(st.id)})
-    return render_template('practical_register_detail.html',register=register,students=students,experiments=experiments,summary=summary,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register),file_submissions=file_submissions,submission_by_student=submission_by_student,received_count=len(file_submissions),missing_count=max(0,len(students)-len(file_submissions)))
+        summary.append({'student':st,'scored':round(scored,2),'possible':possible,'evaluated':evaluated,'percent':round(scored*100/possible,1) if possible else 0,'record_received':receipt_count_by_student.get(st.id,0)})
+    total_receipt_slots=len(students)*len(experiments);received_receipt_count=sum(receipt_count_by_experiment.values())
+    return render_template('practical_register_detail.html',register=register,students=students,experiments=experiments,summary=summary,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register),file_submissions=file_submissions,submission_by_student=submission_by_student,receipt_map=receipt_map,receipt_count_by_student=receipt_count_by_student,receipt_count_by_experiment=receipt_count_by_experiment,received_receipt_count=received_receipt_count,total_receipt_slots=total_receipt_slots,missing_receipt_count=max(0,total_receipt_slots-received_receipt_count),legacy_receipt_count=len({x.id for x in legacy_receipts}))
 
 
-def _save_practical_file_submission(s,register,student,ocr_text='',ocr_confidence=0.0,source_filename='',match_method='automatic'):
+def _practical_file_receipts(row):
+    if not row:return {}
+    try:
+        data=json.loads(row.experiment_receipts_json or '{}')
+    except (TypeError,ValueError,json.JSONDecodeError):
+        return {}
+    return data if isinstance(data,dict) else {}
+
+
+def _recalculate_practical_mark_total(row):
+    if row.attendance=='A':
+        row.marks=0.0
+        return
+    components=(row.attendance_marks,row.record_marks,row.performance_marks,row.viva_marks)
+    row.marks=(sum(value or 0 for value in components) if any(value is not None for value in components) else None)
+
+
+def _award_record_marks_for_receipt(s,register,student,experiment):
+    """Award the configured Record maximum for an experiment receipt.
+
+    A faculty-entered Record value is never overwritten. Rows created by this
+    helper are tagged with record_marks_auto so receipt deletion can safely
+    remove only marks that were created by the scanner.
+    """
+    row=s.scalar(select(PracticalMark).where(
+        PracticalMark.practical_student_id==student.id,
+        PracticalMark.practical_experiment_id==experiment.id,
+    ))
+    # An explicit faculty mark wins over scanner automation.
+    if row and row.record_marks is not None and not bool(row.record_marks_auto):
+        return row,False
+    # Do not turn an explicitly absent student into a scored/present student.
+    if row and row.attendance=='A':
+        return row,False
+    awarded=float(practical_marks_maxima(register)['record'])
+    if not row:
+        row=PracticalMark(
+            register_id=register.id,practical_student_id=student.id,practical_experiment_id=experiment.id,
+            attendance='',attendance_marks=None,record_marks=awarded,record_marks_auto=True,
+            performance_marks=None,viva_marks=None,marks=awarded,remarks='',
+            updated_by='Practical File Scanner',updated_at=now_iso(),
+        )
+        s.add(row)
+        experiment.max_marks=practical_total_max(register)
+        return row,True
+    changed=(row.record_marks!=awarded or not bool(row.record_marks_auto))
+    row.record_marks=awarded;row.record_marks_auto=True
+    if changed:
+        row.updated_by='Practical File Scanner';row.updated_at=now_iso()
+        _recalculate_practical_mark_total(row)
+    experiment.max_marks=practical_total_max(register)
+    return row,changed
+
+
+def _remove_auto_record_marks_for_receipt(s,register,student_id,experiment):
+    row=s.scalar(select(PracticalMark).where(
+        PracticalMark.practical_student_id==student_id,
+        PracticalMark.practical_experiment_id==experiment.id,
+    ))
+    if not row or not bool(row.record_marks_auto):
+        return False
+    row.record_marks=None;row.record_marks_auto=False
+    # If this row existed only because the scanner awarded Record marks, remove
+    # it completely so it does not count as an evaluated practical row.
+    if (not row.attendance and row.attendance_marks is None and row.performance_marks is None
+            and row.viva_marks is None and not (row.remarks or '').strip()):
+        s.delete(row)
+    else:
+        _recalculate_practical_mark_total(row);row.updated_by='Practical File Scanner';row.updated_at=now_iso()
+    return True
+
+
+def _save_practical_file_submission(s,register,student,experiment,ocr_text='',ocr_confidence=0.0,source_filename='',match_method='automatic'):
     existing=s.scalar(select(PracticalFileSubmission).where(
         PracticalFileSubmission.register_id==register.id,
         PracticalFileSubmission.practical_student_id==student.id,
     ))
+    receipts=_practical_file_receipts(existing)
+    # A V81.1 row with no experiment mapping is treated as unassigned. The
+    # first new experiment-specific scan for that student replaces that legacy
+    # status with an explicit experiment receipt.
+    experiment_key=str(experiment.id)
+    if experiment_key in receipts:
+        _,changed=_award_record_marks_for_receipt(s,register,student,experiment)
+        if changed:
+            register.updated_at=now_iso();s.commit()
+        return existing,True,receipts[experiment_key]
+    fields=extract_practical_scan_fields(ocr_text);received_at=now_iso()
+    receipt={
+        'experiment_id':experiment.id,'experiment_no':experiment.experiment_no,'experiment_title':experiment.title,
+        'detected_roll_no':(fields.get('roll_no') or '')[:120],
+        'detected_name':(fields.get('name') or '')[:180],
+        'ocr_confidence':max(0.0,min(100.0,float(ocr_confidence or 0.0))),
+        'source_filename':(source_filename or '')[:255],
+        'match_method':(match_method or 'automatic')[:32],
+        'received_by':current_staff_name(s)[:180],'received_at':received_at,
+    }
+    receipts[experiment_key]=receipt
     if existing:
-        return existing,True
-    fields=extract_practical_scan_fields(ocr_text)
-    row=PracticalFileSubmission(
-        register_id=register.id,practical_student_id=student.id,
-        detected_roll_no=(fields.get('roll_no') or '')[:120],
-        detected_name=(fields.get('name') or '')[:180],
-        ocr_confidence=max(0.0,min(100.0,float(ocr_confidence or 0.0))),
-        ocr_text=(ocr_text or '')[:6000],source_filename=(source_filename or '')[:255],
-        match_method=(match_method or 'automatic')[:32],received_by=current_staff_name(s)[:180],received_at=now_iso(),
-    )
-    s.add(row);s.flush();register.updated_at=now_iso()
-    audit_event(s,'practical_file_received','practical_register',register.id,f'student={student.roll_no}, method={row.match_method}')
-    s.commit();return row,False
+        row=existing
+        row.detected_roll_no=receipt['detected_roll_no'];row.detected_name=receipt['detected_name'];row.ocr_confidence=receipt['ocr_confidence']
+        row.ocr_text=(ocr_text or '')[:6000];row.source_filename=receipt['source_filename'];row.match_method=receipt['match_method'];row.received_by=receipt['received_by'];row.received_at=received_at
+        row.experiment_receipts_json=json.dumps(receipts,separators=(',',':'))
+    else:
+        row=PracticalFileSubmission(
+            register_id=register.id,practical_student_id=student.id,
+            detected_roll_no=receipt['detected_roll_no'],detected_name=receipt['detected_name'],ocr_confidence=receipt['ocr_confidence'],
+            ocr_text=(ocr_text or '')[:6000],source_filename=receipt['source_filename'],match_method=receipt['match_method'],
+            received_by=receipt['received_by'],received_at=received_at,experiment_receipts_json=json.dumps(receipts,separators=(',',':')),
+        )
+        s.add(row);s.flush()
+    _award_record_marks_for_receipt(s,register,student,experiment)
+    register.updated_at=now_iso()
+    audit_event(s,'practical_record_received','practical_register',register.id,f'student={student.roll_no}, experiment={experiment.experiment_no}, method={receipt["match_method"]}, record_marks={practical_marks_maxima(register)["record"]}')
+    s.commit();return row,False,receipt
+
+
+def _practical_experiment_receipt_count(s,register_id,experiment_id):
+    rows=s.scalars(select(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register_id)).all();key=str(experiment_id)
+    return sum(1 for row in rows if key in _practical_file_receipts(row))
 
 
 @app.route('/admin/practicals/<int:register_id>/file-submissions/scan',methods=['POST'])
@@ -2628,8 +2753,12 @@ def _save_practical_file_submission(s,register,student,ocr_text='',ocr_confidenc
 def practical_file_submission_scan(register_id):
     s=DB();register=practical_register_access(s,register_id)
     payload=request.get_json(silent=True) or {}
-    ocr_text=str(payload.get('ocr_text') or '').strip()
-    filename=str(payload.get('filename') or '').strip()
+    try:experiment_id=int(payload.get('experiment_id') or 0)
+    except (TypeError,ValueError):experiment_id=0
+    experiment=s.get(PracticalExperiment,experiment_id) if experiment_id else None
+    if not experiment or experiment.register_id!=register.id:
+        return jsonify({'ok':False,'error':'Select the experiment whose practical record is being submitted.'}),400
+    ocr_text=str(payload.get('ocr_text') or '').strip();filename=str(payload.get('filename') or '').strip()
     try:confidence=float(payload.get('confidence') or 0.0)
     except (TypeError,ValueError):confidence=0.0
     students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all()
@@ -2640,15 +2769,17 @@ def practical_file_submission_scan(register_id):
         except (TypeError,ValueError):return jsonify({'ok':False,'error':'Choose a valid student.'}),400
         student=s.get(PracticalStudent,confirmed_id)
         if not student or student.register_id!=register.id:return jsonify({'ok':False,'error':'The selected student does not belong to this practical register.'}),400
-        row,duplicate=_save_practical_file_submission(s,register,student,ocr_text,confidence,filename,'confirmed')
-        return jsonify({'ok':True,'status':'duplicate' if duplicate else 'saved','duplicate':duplicate,'student':{'id':student.id,'roll_no':student.roll_no,'name':student.name},'received_at':row.received_at,'submission_id':row.id})
+        row,duplicate,receipt=_save_practical_file_submission(s,register,student,experiment,ocr_text,confidence,filename,'confirmed')
+        count=_practical_experiment_receipt_count(s,register.id,experiment.id)
+        return jsonify({'ok':True,'status':'duplicate' if duplicate else 'saved','duplicate':duplicate,'student':{'id':student.id,'roll_no':student.roll_no,'name':student.name},'experiment':{'id':experiment.id,'no':experiment.experiment_no,'title':experiment.title},'received_at':receipt.get('received_at',''),'submission_id':row.id,'experiment_received_count':count,'record_marks_awarded':practical_marks_maxima(register)['record']})
     if not ocr_text:return jsonify({'ok':False,'error':'No readable text was detected. Retake the photo in good light or choose the student manually.'}),400
     result=practical_scan_auto_match(ocr_text,students)
     if result.get('match'):
         match=result['match'];student=s.get(PracticalStudent,int(match['student_id']))
-        row,duplicate=_save_practical_file_submission(s,register,student,ocr_text,confidence,filename,'automatic')
-        return jsonify({'ok':True,'status':'duplicate' if duplicate else 'saved','duplicate':duplicate,'student':{'id':student.id,'roll_no':student.roll_no,'name':student.name},'score':match['score'],'reason':match['reason'],'detected':result['fields'],'received_at':row.received_at,'submission_id':row.id})
-    return jsonify({'ok':True,'status':'needs_confirmation','detected':result['fields'],'candidates':result['candidates']})
+        row,duplicate,receipt=_save_practical_file_submission(s,register,student,experiment,ocr_text,confidence,filename,'automatic')
+        count=_practical_experiment_receipt_count(s,register.id,experiment.id)
+        return jsonify({'ok':True,'status':'duplicate' if duplicate else 'saved','duplicate':duplicate,'student':{'id':student.id,'roll_no':student.roll_no,'name':student.name},'experiment':{'id':experiment.id,'no':experiment.experiment_no,'title':experiment.title},'score':match['score'],'reason':match['reason'],'detected':result['fields'],'received_at':receipt.get('received_at',''),'submission_id':row.id,'experiment_received_count':count,'record_marks_awarded':practical_marks_maxima(register)['record']})
+    return jsonify({'ok':True,'status':'needs_confirmation','detected':result['fields'],'candidates':result['candidates'],'experiment':{'id':experiment.id,'no':experiment.experiment_no,'title':experiment.title}})
 
 
 @app.route('/admin/practicals/<int:register_id>/file-submissions/<int:submission_id>/delete',methods=['POST'])
@@ -2657,8 +2788,23 @@ def practical_file_submission_delete(register_id,submission_id):
     s=DB();register=practical_register_access(s,register_id);row=s.get(PracticalFileSubmission,submission_id)
     if not row or row.register_id!=register.id:abort(404)
     student=s.get(PracticalStudent,row.practical_student_id);label=student.roll_no if student else str(row.practical_student_id)
-    s.delete(row);register.updated_at=now_iso();audit_event(s,'practical_file_receipt_removed','practical_register',register.id,f'student={label}');s.commit()
-    flash(f'Practical file receipt removed for {label}.')
+    experiment_id=request.form.get('experiment_id',type=int)
+    if experiment_id:
+        experiment=s.get(PracticalExperiment,experiment_id)
+        if not experiment or experiment.register_id!=register.id:abort(404)
+        receipts=_practical_file_receipts(row);removed=receipts.pop(str(experiment.id),None)
+        if not removed:abort(404)
+        if receipts:
+            row.experiment_receipts_json=json.dumps(receipts,separators=(',',':'))
+        else:
+            s.delete(row)
+        _remove_auto_record_marks_for_receipt(s,register,row.practical_student_id,experiment)
+        register.updated_at=now_iso();audit_event(s,'practical_record_receipt_removed','practical_register',register.id,f'student={label}, experiment={experiment.experiment_no}');s.commit()
+        flash(f'Experiment {experiment.experiment_no} record receipt removed for {label}.')
+    else:
+        # Backward-compatible removal for a V81.1 unassigned receipt.
+        s.delete(row);register.updated_at=now_iso();audit_event(s,'practical_file_receipt_removed','practical_register',register.id,f'student={label}, unassigned=true');s.commit()
+        flash(f'Unassigned practical-file receipt removed for {label}.')
     return redirect(url_for('practical_register_detail',register_id=register.id))
 
 
@@ -2782,8 +2928,20 @@ def practical_mark_entry(register_id):
     s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register);experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all()
     if not experiments:
         flash('Upload the experiment list before entering marks.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
-    experiment_id=request.args.get('experiment_id',type=int) or experiments[0].id;experiment=next((x for x in experiments if x.id==experiment_id),experiments[0]);marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id,PracticalMark.practical_experiment_id==experiment.id)).all();mark_map={m.practical_student_id:m for m in marks};evaluated=sum(1 for m in marks if m.marks is not None or m.attendance=='A')
-    return render_template('practical_mark_entry.html',register=register,students=students,experiments=experiments,experiment=experiment,mark_map=mark_map,evaluated=evaluated,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register))
+    experiment_id=request.args.get('experiment_id',type=int) or experiments[0].id;experiment=next((x for x in experiments if x.id==experiment_id),experiments[0])
+    file_rows=s.scalars(select(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id)).all();receipt_key=str(experiment.id);record_receipt_by_student={row.practical_student_id:_practical_file_receipts(row).get(receipt_key) for row in file_rows if _practical_file_receipts(row).get(receipt_key)}
+    # Backfill V82 receipts: opening this experiment's mark-entry page upgrades
+    # previously saved receipts to automatic Record marks without rescanning.
+    student_by_id={st.id:st for st in students};backfilled=False
+    for student_id in record_receipt_by_student:
+        student=student_by_id.get(student_id)
+        if student:
+            _,changed=_award_record_marks_for_receipt(s,register,student,experiment);backfilled=backfilled or changed
+    if backfilled:s.commit()
+    marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id,PracticalMark.practical_experiment_id==experiment.id)).all();mark_map={m.practical_student_id:m for m in marks}
+    # A scanner-only Record award is not a completed evaluation by itself.
+    evaluated=sum(1 for m in marks if m.attendance=='A' or m.performance_marks is not None or m.viva_marks is not None or (m.attendance and m.attendance_marks is not None) or (m.record_marks is not None and not bool(m.record_marks_auto)))
+    return render_template('practical_mark_entry.html',register=register,students=students,experiments=experiments,experiment=experiment,mark_map=mark_map,evaluated=evaluated,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register),record_receipt_by_student=record_receipt_by_student)
 
 
 def _save_practical_mark(s,register,student_id,experiment_id,attendance,attendance_marks_value='',record_marks_value='',performance_marks_value='',viva_marks_value='',remarks=''):
@@ -2810,6 +2968,11 @@ def _save_practical_mark(s,register,student_id,experiment_id,attendance,attendan
         component_values={'attendance':0.0,'record':None,'performance':None,'viva':None}
     has_component=any(value is not None for value in component_values.values())
     row=s.scalar(select(PracticalMark).where(PracticalMark.practical_student_id==student.id,PracticalMark.practical_experiment_id==experiment.id))
+    record_marks_auto=(bool(row.record_marks_auto) if row else False)
+    if record_marks_auto:
+        incoming_record=component_values['record'];auto_record=float(maxima['record'])
+        if incoming_record is None or abs(float(incoming_record)-auto_record)>1e-9:
+            record_marks_auto=False
     legacy_total=(row.marks if row and row.marks is not None and all(getattr(row,name,None) is None for name in ('attendance_marks','record_marks','performance_marks','viva_marks')) else None)
     total=(sum(value or 0 for value in component_values.values()) if has_component else legacy_total)
     if attendance=='A':total=0.0
@@ -2819,9 +2982,9 @@ def _save_practical_mark(s,register,student_id,experiment_id,attendance,attendan
     if component_values['performance'] is not None and '[CODE REVIEW]' in remarks_value:
         remarks_value=remarks_value.split('[CODE REVIEW]',1)[0].rstrip()[:500]
     if not row:
-        row=PracticalMark(register_id=register.id,practical_student_id=student.id,practical_experiment_id=experiment.id,attendance=attendance,attendance_marks=component_values['attendance'],record_marks=component_values['record'],performance_marks=component_values['performance'],viva_marks=component_values['viva'],marks=total,remarks=remarks_value,updated_by=actor_label(s),updated_at=now_iso());s.add(row)
+        row=PracticalMark(register_id=register.id,practical_student_id=student.id,practical_experiment_id=experiment.id,attendance=attendance,attendance_marks=component_values['attendance'],record_marks=component_values['record'],record_marks_auto=record_marks_auto,performance_marks=component_values['performance'],viva_marks=component_values['viva'],marks=total,remarks=remarks_value,updated_by=actor_label(s),updated_at=now_iso());s.add(row)
     else:
-        row.attendance=attendance;row.attendance_marks=component_values['attendance'];row.record_marks=component_values['record'];row.performance_marks=component_values['performance'];row.viva_marks=component_values['viva'];row.marks=total;row.remarks=remarks_value;row.updated_by=actor_label(s);row.updated_at=now_iso()
+        row.attendance=attendance;row.attendance_marks=component_values['attendance'];row.record_marks=component_values['record'];row.record_marks_auto=record_marks_auto;row.performance_marks=component_values['performance'];row.viva_marks=component_values['viva'];row.marks=total;row.remarks=remarks_value;row.updated_by=actor_label(s);row.updated_at=now_iso()
     experiment.max_marks=practical_total_max(register)
     return row
 
@@ -2833,7 +2996,7 @@ def practical_mark_save(register_id):
     try:
         student_id=int(payload.get('student_id') or 0);experiment_id=int(payload.get('experiment_id') or 0)
         row=_save_practical_mark(s,register,student_id,experiment_id,payload.get('attendance',''),payload.get('attendance_marks',''),payload.get('record_marks',''),payload.get('performance_marks',''),payload.get('viva_marks',''),payload.get('remarks',''));register.updated_at=now_iso();s.commit()
-        return jsonify(ok=True,attendance=row.attendance,attendance_marks=row.attendance_marks,record_marks=row.record_marks,performance_marks=row.performance_marks,viva_marks=row.viva_marks,total=row.marks,updated_at=row.updated_at)
+        return jsonify(ok=True,attendance=row.attendance,attendance_marks=row.attendance_marks,record_marks=row.record_marks,record_marks_auto=bool(row.record_marks_auto),performance_marks=row.performance_marks,viva_marks=row.viva_marks,total=row.marks,updated_at=row.updated_at)
     except ValueError as exc:s.rollback();return jsonify(ok=False,error=str(exc)),400
 
 
@@ -3545,16 +3708,23 @@ def practical_template(register_id,kind,fmt):
 @app.route('/admin/practicals/<int:register_id>/export/<fmt>')
 @practical_required
 def practical_export(register_id,fmt):
-    s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register);students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all();experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();mark_map={(m.practical_student_id,m.practical_experiment_id):m for m in marks};file_rows=s.scalars(select(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id)).all();file_map={x.practical_student_id:x for x in file_rows};headers=['S.No','Roll No','Student Name','File Received','Received At']+[e.experiment_no for e in experiments]+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
+    s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register)
+    students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all();experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();mark_map={(m.practical_student_id,m.practical_experiment_id):m for m in marks}
+    file_rows=s.scalars(select(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id)).all();file_map={x.practical_student_id:_practical_file_receipts(x) for x in file_rows}
+    record_headers=[f'Record {e.experiment_no}' for e in experiments];mark_headers=[f'Marks {e.experiment_no}' for e in experiments]
+    headers=['S.No','Roll No','Student Name','Record Count']+record_headers+mark_headers+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
     for idx,st in enumerate(students,start=1):
-        cells=[];total=0.0
+        receipts=file_map.get(st.id,{})
+        record_cells=['Received' if str(e.id) in receipts else 'Missing' for e in experiments]
+        record_count=sum(1 for e in experiments if str(e.id) in receipts)
+        mark_cells=[];total=0.0
         for e in experiments:
             m=mark_map.get((st.id,e.id))
-            if not m:cells.append('')
-            elif m.attendance=='A':cells.append('A')
-            elif m.marks is None:cells.append('P')
-            else:cells.append(m.marks);total+=float(m.marks)
-        receipt=file_map.get(st.id);matrix.append([idx,st.roll_no,st.name,'Yes' if receipt else 'No',receipt.received_at if receipt else '']+cells+[round(total,2),possible,round(total*100/possible,1) if possible else 0])
+            if not m:mark_cells.append('')
+            elif m.attendance=='A':mark_cells.append('A')
+            elif m.marks is None:mark_cells.append('P')
+            else:mark_cells.append(m.marks);total+=float(m.marks)
+        matrix.append([idx,st.roll_no,st.name,f'{record_count}/{len(experiments)}']+record_cells+mark_cells+[round(total,2),possible,round(total*100/possible,1) if possible else 0])
     safe=''.join(ch if ch.isalnum() else '_' for ch in register.title).strip('_')[:60] or 'practical_marks'
     if fmt=='csv':
         out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{safe}.csv')
@@ -3562,8 +3732,9 @@ def practical_export(register_id,fmt):
         wb=Workbook();ws=wb.active;ws.title='Practical Marks';ws.append([register.title]);ws.append([f'Subject: {register.subject}',f'Section: {register.section}',f'Academic Year: {register.academic_year}']);ws.append(headers)
         for row in matrix:ws.append(row)
         for cell in ws[3]:cell.font=Font(bold=True)
-        ws.freeze_panes='F4';ws.column_dimensions['A'].width=8;ws.column_dimensions['B'].width=18;ws.column_dimensions['C'].width=30;ws.column_dimensions['D'].width=14;ws.column_dimensions['E'].width=22
-        for col in range(6,6+len(experiments)):ws.column_dimensions[ws.cell(3,col).column_letter].width=11
+        ws.freeze_panes='E4';ws.column_dimensions['A'].width=8;ws.column_dimensions['B'].width=18;ws.column_dimensions['C'].width=30;ws.column_dimensions['D'].width=14
+        for col in range(5,5+len(record_headers)):ws.column_dimensions[ws.cell(3,col).column_letter].width=15
+        for col in range(5+len(record_headers),5+len(record_headers)+len(mark_headers)):ws.column_dimensions[ws.cell(3,col).column_letter].width=13
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{safe}.xlsx')
     abort(404)
 

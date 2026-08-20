@@ -13,6 +13,7 @@
     const scanUrl=root.dataset.scanUrl;
     const deleteTemplate=root.dataset.deleteUrlTemplate||'';
     const csrf=(document.querySelector('meta[name="csrf-token"]')||{}).content||'';
+    const experimentSelect=root.querySelector('[data-scan-experiment-select]');
     const camera=document.getElementById('practical-file-camera');
     const upload=document.getElementById('practical-file-upload');
     const preview=root.querySelector('[data-scan-preview]');
@@ -23,9 +24,25 @@
     const resultBox=root.querySelector('[data-scan-result]');
     const manualSelect=root.querySelector('[data-scan-student-select]');
     const manualSave=root.querySelector('[data-scan-manual-save]');
+    const selectedCount=root.querySelector('[data-scan-received-count]');
+    const selectedLabel=root.querySelector('[data-scan-received-label]');
     let worker=null;
     let current={ocrText:'',confidence:0,filename:''};
     let previewUrl='';
+
+    function selectedExperiment(){
+      if(!experimentSelect||!experimentSelect.value) return null;
+      const option=experimentSelect.options[experimentSelect.selectedIndex];
+      return {id:experimentSelect.value,no:(option&&option.dataset.experimentNo)||'',label:(option&&option.textContent)||''};
+    }
+
+    function requireExperiment(){
+      const experiment=selectedExperiment();
+      if(experiment) return experiment;
+      showResult('warning','Select experiment first','Choose the experiment whose practical record you are scanning.');
+      if(experimentSelect) experimentSelect.focus();
+      return null;
+    }
 
     function setProgress(label,pct){
       if(!progress) return;
@@ -34,9 +51,7 @@
       progressFill.style.width=Math.max(2,Math.min(100,pct||0))+'%';
     }
 
-    function stopProgress(){
-      if(progress) progress.hidden=true;
-    }
+    function stopProgress(){if(progress) progress.hidden=true;}
 
     function clearResult(){
       if(!resultBox) return;
@@ -76,9 +91,7 @@
         if('filter' in ctx) ctx.filter='grayscale(1) contrast(1.28)';
         ctx.drawImage(img,0,0,canvas.width,canvas.height);
         return canvas;
-      } finally {
-        URL.revokeObjectURL(url);
-      }
+      } finally {URL.revokeObjectURL(url);}
     }
 
     async function pdfFirstPageToCanvas(file){
@@ -123,10 +136,11 @@
     }
 
     async function postScan(extra){
-      const payload=Object.assign({ocr_text:current.ocrText,confidence:current.confidence,filename:current.filename},extra||{});
+      const experiment=requireExperiment();
+      if(!experiment) throw new Error('Select the experiment before saving.');
+      const payload=Object.assign({ocr_text:current.ocrText,confidence:current.confidence,filename:current.filename,experiment_id:experiment.id},extra||{});
       const response=await fetch(scanUrl,{
-        method:'POST',
-        credentials:'same-origin',
+        method:'POST',credentials:'same-origin',
         headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,'Accept':'application/json'},
         body:JSON.stringify(payload)
       });
@@ -136,53 +150,84 @@
       return data;
     }
 
-    function removeManualOption(studentId){
-      if(!manualSelect) return;
-      const option=manualSelect.querySelector('option[value="'+String(studentId)+'"]');
-      if(option) option.remove();
-      manualSelect.value='';
+    function recordCell(studentId,experimentId){
+      return document.querySelector('[data-record-cell][data-student-id="'+String(studentId)+'"][data-experiment-id="'+String(experimentId)+'"]');
     }
 
-    function updateCounts(){
-      const received=document.getElementById('practical-files-received-count');
-      const missing=document.getElementById('practical-files-missing-count');
-      if(received) received.textContent=String((parseInt(received.textContent,10)||0)+1);
-      if(missing) missing.textContent=String(Math.max(0,(parseInt(missing.textContent,10)||0)-1));
-      const header=root.querySelector('.practical-file-received-badge strong');
-      if(header) header.textContent=received?received.textContent:String((parseInt(header.textContent,10)||0)+1);
+    function isReceived(studentId,experimentId){
+      const cell=recordCell(studentId,experimentId);
+      return !!(cell&&cell.dataset.received==='1');
+    }
+
+    function refreshSelectedExperimentUI(){
+      const experiment=selectedExperiment();
+      if(!experiment){
+        if(selectedCount) selectedCount.textContent='—';
+        if(selectedLabel) selectedLabel.textContent='for selected experiment';
+      }else{
+        const option=experimentSelect.options[experimentSelect.selectedIndex];
+        let count=Number(option&&option.dataset.receivedCount||0);
+        const cells=document.querySelectorAll('[data-record-cell][data-experiment-id="'+String(experiment.id)+'"][data-received="1"]');
+        if(cells.length||count===0) count=cells.length;
+        if(selectedCount) selectedCount.textContent=String(count);
+        if(selectedLabel) selectedLabel.textContent='for Exp '+experiment.no;
+      }
+      if(manualSelect){
+        Array.from(manualSelect.options).forEach(function(option,index){
+          if(index===0) return;
+          option.disabled=!!(experiment&&isReceived(option.value,experiment.id));
+        });
+        if(manualSelect.selectedOptions[0]&&manualSelect.selectedOptions[0].disabled) manualSelect.value='';
+      }
+      clearResult();
+    }
+
+    function updateOverallCounts(delta){
+      if(!delta) return;
+      const received=document.getElementById('practical-records-received-count');
+      const missing=document.getElementById('practical-records-missing-count');
+      if(received) received.textContent=String(Math.max(0,(parseInt(received.textContent,10)||0)+delta));
+      if(missing) missing.textContent=String(Math.max(0,(parseInt(missing.textContent,10)||0)-delta));
+    }
+
+    function incrementStudentSummary(studentId){
+      const cell=document.querySelector('[data-record-summary-cell][data-student-id="'+String(studentId)+'"] strong');
+      if(cell) cell.textContent=String((parseInt(cell.textContent,10)||0)+1);
     }
 
     function markReceived(data){
-      if(!data||!data.student) return;
-      const row=document.querySelector('[data-practical-student-row="'+String(data.student.id)+'"]');
-      const cell=row&&row.querySelector('[data-practical-file-cell]');
-      const wasMissing=!!(cell&&cell.querySelector('.practical-file-missing'));
+      if(!data||!data.student||!data.experiment) return;
+      const cell=recordCell(data.student.id,data.experiment.id);
+      const wasMissing=!!(cell&&cell.dataset.received!=='1');
       if(cell){
-        cell.replaceChildren();
+        cell.dataset.received='1';cell.replaceChildren();
         const wrap=document.createElement('div');wrap.className='practical-file-cell';
         const badge=document.createElement('span');badge.className='badge practical-file-received';badge.textContent='Received';
-        const small=document.createElement('small');small.textContent='Just now';
-        wrap.append(badge,small);
+        const small=document.createElement('small');small.textContent='Just now';wrap.append(badge,small);
         if(data.submission_id&&deleteTemplate){
           const form=document.createElement('form');form.method='post';form.action=deleteTemplate.replace(/\/0\/delete$/,'/'+String(data.submission_id)+'/delete');
-          form.addEventListener('submit',function(e){if(!window.confirm('Remove this practical-file receipt?')) e.preventDefault();});
+          form.addEventListener('submit',function(e){if(!window.confirm('Remove the Experiment '+data.experiment.no+' record receipt?')) e.preventDefault();});
           const token=document.createElement('input');token.type='hidden';token.name='csrf_token';token.value=csrf;
-          const btn=document.createElement('button');btn.type='submit';btn.className='practical-file-remove';btn.title='Remove receipt';btn.setAttribute('aria-label','Remove file receipt');btn.textContent='×';
-          form.append(token,btn);wrap.append(form);
+          const exp=document.createElement('input');exp.type='hidden';exp.name='experiment_id';exp.value=String(data.experiment.id);
+          const btn=document.createElement('button');btn.type='submit';btn.className='practical-file-remove';btn.title='Remove receipt';btn.setAttribute('aria-label','Remove record receipt');btn.textContent='×';
+          form.append(token,exp,btn);wrap.append(form);
         }
         cell.append(wrap);
       }
-      removeManualOption(data.student.id);
-      if(wasMissing&&!data.duplicate) updateCounts();
+      if(wasMissing&&!data.duplicate){
+        updateOverallCounts(1);incrementStudentSummary(data.student.id);
+        if(experimentSelect){
+          const option=Array.from(experimentSelect.options).find(o=>o.value===String(data.experiment.id));
+          if(option) option.dataset.receivedCount=String(data.experiment_received_count||((parseInt(option.dataset.receivedCount,10)||0)+1));
+        }
+      }
+      refreshSelectedExperimentUI();
     }
 
     function renderConfirmation(data){
-      resultBox.hidden=false;
-      resultBox.className='practical-scan-result warning';
-      resultBox.replaceChildren();
-      const title=document.createElement('strong');title.textContent='Please confirm the student';
-      const detected=document.createElement('p');
-      const parts=[];
+      resultBox.hidden=false;resultBox.className='practical-scan-result warning';resultBox.replaceChildren();
+      const title=document.createElement('strong');title.textContent='Please confirm the student for Experiment '+(data.experiment&&data.experiment.no||'');
+      const detected=document.createElement('p');const parts=[];
       if(data.detected&&data.detected.roll_no) parts.push('Detected roll: '+data.detected.roll_no);
       if(data.detected&&data.detected.name) parts.push('Detected name: '+data.detected.name);
       detected.textContent=parts.length?parts.join(' · '):'OCR was not confident enough for automatic saving.';
@@ -190,26 +235,30 @@
       const list=document.createElement('div');list.className='practical-scan-candidates';
       (data.candidates||[]).forEach(function(candidate){
         if(!candidate.student_id||candidate.score<20) return;
+        if(data.experiment&&isReceived(candidate.student_id,data.experiment.id)) return;
         const button=document.createElement('button');button.type='button';button.className='btn secondary small';
         button.textContent=candidate.roll_no+' — '+candidate.name+' ('+Math.round(candidate.score)+'%)';
-        button.addEventListener('click',()=>confirmStudent(candidate.student_id));
-        list.append(button);
+        button.addEventListener('click',()=>confirmStudent(candidate.student_id));list.append(button);
       });
       if(list.children.length) resultBox.append(list);
     }
 
     async function confirmStudent(studentId){
+      const experiment=requireExperiment();
+      if(!experiment) return;
       if(!studentId){showResult('error','Choose a student','Select the correct student before saving.');return;}
+      if(isReceived(studentId,experiment.id)){showResult('warning','Already received','This student is already marked as received for Experiment '+experiment.no+'.');return;}
       try{
-        setProgress('Saving practical-file receipt…',92);
-        const data=await postScan({practical_student_id:studentId});
-        stopProgress();markReceived(data);
-        showResult(data.duplicate?'warning':'success',data.duplicate?'Already received':'File received',data.student.roll_no+' — '+data.student.name+(data.duplicate?' is already marked as received.':' was saved successfully.'));
+        setProgress('Saving Experiment '+experiment.no+' record receipt…',92);
+        const data=await postScan({practical_student_id:studentId});stopProgress();markReceived(data);
+        showResult(data.duplicate?'warning':'success',data.duplicate?'Already received':'Record received','Experiment '+data.experiment.no+' · '+data.student.roll_no+' — '+data.student.name+(data.duplicate?' is already recorded.':' was saved successfully.'));
       }catch(err){stopProgress();showResult('error','Could not save',err.message);}
     }
 
     async function processFile(file){
       if(!file) return;
+      const experiment=requireExperiment();
+      if(!experiment){if(camera) camera.value='';if(upload) upload.value='';return;}
       clearResult();
       const isPdf=(file.type==='application/pdf'||/\.pdf$/i.test(file.name||''));
       const isImage=/^image\//i.test(file.type||'');
@@ -219,32 +268,24 @@
       if(isImage) showPreview(file);
       try{
         setProgress(isPdf?'Opening PDF first page…':'Preparing first page…',4);
-        const canvas=isPdf?await pdfFirstPageToCanvas(file):await imageToCanvas(file);
-        if(isPdf) showCanvasPreview(canvas);
-        const ocrWorker=await getWorker();
-        setProgress('Reading name and roll number…',22);
+        const canvas=isPdf?await pdfFirstPageToCanvas(file):await imageToCanvas(file);if(isPdf) showCanvasPreview(canvas);
+        const ocrWorker=await getWorker();setProgress('Reading name and roll number…',22);
         const recognition=await ocrWorker.recognize(canvas,{rotateAuto:true});
-        current.ocrText=(recognition&&recognition.data&&recognition.data.text)||'';
-        current.confidence=Number((recognition&&recognition.data&&recognition.data.confidence)||0);
-        setProgress('Matching student in this register…',94);
-        const data=await postScan();
-        stopProgress();
+        current.ocrText=(recognition&&recognition.data&&recognition.data.text)||'';current.confidence=Number((recognition&&recognition.data&&recognition.data.confidence)||0);
+        setProgress('Matching student for Experiment '+experiment.no+'…',94);
+        const data=await postScan();stopProgress();
         if(data.status==='saved'||data.status==='duplicate'){
-          markReceived(data);
-          const details=data.student.roll_no+' — '+data.student.name;
+          markReceived(data);const details='Experiment '+data.experiment.no+' · '+data.student.roll_no+' — '+data.student.name;
           showResult(data.duplicate?'warning':'success',data.duplicate?'Already received':'Matched & saved',details+(data.score?' · Match '+Math.round(data.score)+'%':''));
         }else if(data.status==='needs_confirmation') renderConfirmation(data);
-      }catch(err){
-        stopProgress();
-        showResult('error','Scan not completed',err&&err.message?err.message:'The image could not be read.');
-      }finally{
-        if(camera) camera.value='';
-        if(upload) upload.value='';
-      }
+      }catch(err){stopProgress();showResult('error','Scan not completed',err&&err.message?err.message:'The image could not be read.');}
+      finally{if(camera) camera.value='';if(upload) upload.value='';}
     }
 
     [camera,upload].forEach(function(input){if(input) input.addEventListener('change',function(){processFile(input.files&&input.files[0]);});});
     if(manualSave) manualSave.addEventListener('click',function(){confirmStudent(manualSelect&&manualSelect.value);});
+    if(experimentSelect) experimentSelect.addEventListener('change',refreshSelectedExperimentUI);
+    refreshSelectedExperimentUI();
     window.addEventListener('beforeunload',function(){if(worker&&worker.terminate) worker.terminate().catch(function(){});},{once:true});
   });
 })();
