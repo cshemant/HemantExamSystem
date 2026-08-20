@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 from urllib.parse import urlparse
 
-from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, has_request_context
+from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -22,14 +22,14 @@ from enterprise_core import QUESTION_TYPE_LABELS, canonical_question_type, norma
 from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
-from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code
+from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.21.0'
+APP_VERSION='2.22.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -574,6 +574,22 @@ class PracticalStudent(Base):
     created_at:Mapped[str]=mapped_column(String,nullable=False)
 
 
+class PracticalFileSubmission(Base):
+    __tablename__='practical_file_submissions'
+    __table_args__=(UniqueConstraint('register_id','practical_student_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
+    practical_student_id:Mapped[int]=mapped_column(ForeignKey('practical_students.id'),nullable=False)
+    detected_roll_no:Mapped[str]=mapped_column(String,nullable=False,default='')
+    detected_name:Mapped[str]=mapped_column(String,nullable=False,default='')
+    ocr_confidence:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
+    ocr_text:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    source_filename:Mapped[str]=mapped_column(String,nullable=False,default='')
+    match_method:Mapped[str]=mapped_column(String,nullable=False,default='automatic')
+    received_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    received_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
 class PracticalExperiment(Base):
     __tablename__='practical_experiments'
     __table_args__=(UniqueConstraint('register_id','experiment_no'),)
@@ -1060,13 +1076,6 @@ def display_dt(value):
     return parse_dt(value).astimezone(DISPLAY_TZ)
 
 def actor_label(s=None):
-    # Startup migrations (for example init_db() during Gunicorn import) run
-    # outside an HTTP request. Flask's session proxy is unavailable there,
-    # so record those audit events as a system action instead of touching
-    # web_session and crashing the deployment.
-    if not has_request_context():
-        return 'system'
-
     role=web_session.get('role','system')
     uid=web_session.get('user_id')
     if role=='admin':
@@ -1830,8 +1839,11 @@ def security_headers(response):
     secure_exam_frame=bool(request.endpoint=='take_exam' and request.args.get('secure_shell')=='1')
     response.headers['X-Frame-Options']='SAMEORIGIN' if secure_exam_frame else 'DENY'
     response.headers.setdefault('Referrer-Policy','same-origin')
-    response.headers.setdefault('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=(), usb=()')
-    if secure_exam_frame:
+    scanner_page=request.endpoint=='practical_register_detail'
+    response.headers.setdefault('Permissions-Policy',('camera=(self), microphone=(), geolocation=(), payment=(), usb=()' if scanner_page else 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'))
+    if scanner_page:
+        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; worker-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; connect-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    elif secure_exam_frame:
         response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
     else:
         response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
@@ -2564,6 +2576,7 @@ def delete_practical_register(register_id):
     # Delete dependent practical data explicitly so this works consistently on
     # both PostgreSQL production databases and SQLite/LAN deployments.
     s.execute(delete(PracticalCodeSubmission).where(PracticalCodeSubmission.register_id==register.id))
+    s.execute(delete(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id))
     s.execute(delete(PracticalMark).where(PracticalMark.register_id==register.id))
     s.execute(delete(PracticalStudent).where(PracticalStudent.register_id==register.id))
     s.execute(delete(PracticalExperiment).where(PracticalExperiment.register_id==register.id))
@@ -2580,11 +2593,73 @@ def practical_register_detail(register_id):
     experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all()
     marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();by_student={}
     for mark in marks:by_student.setdefault(mark.practical_student_id,[]).append(mark)
+    file_submissions=s.scalars(select(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id).order_by(PracticalFileSubmission.received_at.desc())).all()
+    submission_by_student={row.practical_student_id:row for row in file_submissions}
     possible=sum(e.max_marks for e in experiments);summary=[]
     for st in students:
         student_marks=by_student.get(st.id,[]);scored=sum(float(m.marks or 0) for m in student_marks if m.marks is not None);evaluated=sum(1 for m in student_marks if m.marks is not None or m.attendance=='A')
-        summary.append({'student':st,'scored':round(scored,2),'possible':possible,'evaluated':evaluated,'percent':round(scored*100/possible,1) if possible else 0})
-    return render_template('practical_register_detail.html',register=register,students=students,experiments=experiments,summary=summary,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register))
+        summary.append({'student':st,'scored':round(scored,2),'possible':possible,'evaluated':evaluated,'percent':round(scored*100/possible,1) if possible else 0,'file_submission':submission_by_student.get(st.id)})
+    return render_template('practical_register_detail.html',register=register,students=students,experiments=experiments,summary=summary,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register),file_submissions=file_submissions,submission_by_student=submission_by_student,received_count=len(file_submissions),missing_count=max(0,len(students)-len(file_submissions)))
+
+
+def _save_practical_file_submission(s,register,student,ocr_text='',ocr_confidence=0.0,source_filename='',match_method='automatic'):
+    existing=s.scalar(select(PracticalFileSubmission).where(
+        PracticalFileSubmission.register_id==register.id,
+        PracticalFileSubmission.practical_student_id==student.id,
+    ))
+    if existing:
+        return existing,True
+    fields=extract_practical_scan_fields(ocr_text)
+    row=PracticalFileSubmission(
+        register_id=register.id,practical_student_id=student.id,
+        detected_roll_no=(fields.get('roll_no') or '')[:120],
+        detected_name=(fields.get('name') or '')[:180],
+        ocr_confidence=max(0.0,min(100.0,float(ocr_confidence or 0.0))),
+        ocr_text=(ocr_text or '')[:6000],source_filename=(source_filename or '')[:255],
+        match_method=(match_method or 'automatic')[:32],received_by=current_staff_name(s)[:180],received_at=now_iso(),
+    )
+    s.add(row);s.flush();register.updated_at=now_iso()
+    audit_event(s,'practical_file_received','practical_register',register.id,f'student={student.roll_no}, method={row.match_method}')
+    s.commit();return row,False
+
+
+@app.route('/admin/practicals/<int:register_id>/file-submissions/scan',methods=['POST'])
+@practical_required
+def practical_file_submission_scan(register_id):
+    s=DB();register=practical_register_access(s,register_id)
+    payload=request.get_json(silent=True) or {}
+    ocr_text=str(payload.get('ocr_text') or '').strip()
+    filename=str(payload.get('filename') or '').strip()
+    try:confidence=float(payload.get('confidence') or 0.0)
+    except (TypeError,ValueError):confidence=0.0
+    students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all()
+    if not students:return jsonify({'ok':False,'error':'Upload the student list before scanning practical files.'}),400
+    confirmed_id=payload.get('practical_student_id')
+    if confirmed_id:
+        try:confirmed_id=int(confirmed_id)
+        except (TypeError,ValueError):return jsonify({'ok':False,'error':'Choose a valid student.'}),400
+        student=s.get(PracticalStudent,confirmed_id)
+        if not student or student.register_id!=register.id:return jsonify({'ok':False,'error':'The selected student does not belong to this practical register.'}),400
+        row,duplicate=_save_practical_file_submission(s,register,student,ocr_text,confidence,filename,'confirmed')
+        return jsonify({'ok':True,'status':'duplicate' if duplicate else 'saved','duplicate':duplicate,'student':{'id':student.id,'roll_no':student.roll_no,'name':student.name},'received_at':row.received_at,'submission_id':row.id})
+    if not ocr_text:return jsonify({'ok':False,'error':'No readable text was detected. Retake the photo in good light or choose the student manually.'}),400
+    result=practical_scan_auto_match(ocr_text,students)
+    if result.get('match'):
+        match=result['match'];student=s.get(PracticalStudent,int(match['student_id']))
+        row,duplicate=_save_practical_file_submission(s,register,student,ocr_text,confidence,filename,'automatic')
+        return jsonify({'ok':True,'status':'duplicate' if duplicate else 'saved','duplicate':duplicate,'student':{'id':student.id,'roll_no':student.roll_no,'name':student.name},'score':match['score'],'reason':match['reason'],'detected':result['fields'],'received_at':row.received_at,'submission_id':row.id})
+    return jsonify({'ok':True,'status':'needs_confirmation','detected':result['fields'],'candidates':result['candidates']})
+
+
+@app.route('/admin/practicals/<int:register_id>/file-submissions/<int:submission_id>/delete',methods=['POST'])
+@practical_required
+def practical_file_submission_delete(register_id,submission_id):
+    s=DB();register=practical_register_access(s,register_id);row=s.get(PracticalFileSubmission,submission_id)
+    if not row or row.register_id!=register.id:abort(404)
+    student=s.get(PracticalStudent,row.practical_student_id);label=student.roll_no if student else str(row.practical_student_id)
+    s.delete(row);register.updated_at=now_iso();audit_event(s,'practical_file_receipt_removed','practical_register',register.id,f'student={label}');s.commit()
+    flash(f'Practical file receipt removed for {label}.')
+    return redirect(url_for('practical_register_detail',register_id=register.id))
 
 
 @app.route('/admin/practicals/<int:register_id>/marks-settings',methods=['POST'])
@@ -3470,7 +3545,7 @@ def practical_template(register_id,kind,fmt):
 @app.route('/admin/practicals/<int:register_id>/export/<fmt>')
 @practical_required
 def practical_export(register_id,fmt):
-    s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register);students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all();experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();mark_map={(m.practical_student_id,m.practical_experiment_id):m for m in marks};headers=['S.No','Roll No','Student Name']+[e.experiment_no for e in experiments]+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
+    s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register);students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all();experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();mark_map={(m.practical_student_id,m.practical_experiment_id):m for m in marks};file_rows=s.scalars(select(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id)).all();file_map={x.practical_student_id:x for x in file_rows};headers=['S.No','Roll No','Student Name','File Received','Received At']+[e.experiment_no for e in experiments]+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
     for idx,st in enumerate(students,start=1):
         cells=[];total=0.0
         for e in experiments:
@@ -3479,7 +3554,7 @@ def practical_export(register_id,fmt):
             elif m.attendance=='A':cells.append('A')
             elif m.marks is None:cells.append('P')
             else:cells.append(m.marks);total+=float(m.marks)
-        matrix.append([idx,st.roll_no,st.name]+cells+[round(total,2),possible,round(total*100/possible,1) if possible else 0])
+        receipt=file_map.get(st.id);matrix.append([idx,st.roll_no,st.name,'Yes' if receipt else 'No',receipt.received_at if receipt else '']+cells+[round(total,2),possible,round(total*100/possible,1) if possible else 0])
     safe=''.join(ch if ch.isalnum() else '_' for ch in register.title).strip('_')[:60] or 'practical_marks'
     if fmt=='csv':
         out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{safe}.csv')
@@ -3487,8 +3562,8 @@ def practical_export(register_id,fmt):
         wb=Workbook();ws=wb.active;ws.title='Practical Marks';ws.append([register.title]);ws.append([f'Subject: {register.subject}',f'Section: {register.section}',f'Academic Year: {register.academic_year}']);ws.append(headers)
         for row in matrix:ws.append(row)
         for cell in ws[3]:cell.font=Font(bold=True)
-        ws.freeze_panes='D4';ws.column_dimensions['A'].width=8;ws.column_dimensions['B'].width=18;ws.column_dimensions['C'].width=30
-        for col in range(4,4+len(experiments)):ws.column_dimensions[ws.cell(3,col).column_letter].width=11
+        ws.freeze_panes='F4';ws.column_dimensions['A'].width=8;ws.column_dimensions['B'].width=18;ws.column_dimensions['C'].width=30;ws.column_dimensions['D'].width=14;ws.column_dimensions['E'].width=22
+        for col in range(6,6+len(experiments)):ws.column_dimensions[ws.cell(3,col).column_letter].width=11
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{safe}.xlsx')
     abort(404)
 

@@ -8,6 +8,7 @@
   <div class="stat-card"><strong>{{ students|length }}</strong><span>Students</span></div>
   <div class="stat-card"><strong>{{ experiments|length }}</strong><span>Experiments</span></div>
   <div class="stat-card"><strong>{{ summary|selectattr('evaluated','gt',0)|list|length }}</strong><span>Students Started</span></div>
+  <div class="stat-card practical-file-stat"><strong id="practical-files-received-count">{{ received_count }}</strong><span>Files Received · <span id="practical-files-missing-count">{{ missing_count }}</span> Missing</span></div>
 </div>
 
 <div class="card practical-marks-settings">
@@ -34,6 +35,50 @@
   </div>
 </div>
 
+<div class="card practical-file-scanner" data-practical-file-scanner data-scan-url="{{ url_for('practical_file_submission_scan',register_id=register.id) }}" data-delete-url-template="{{ url_for('practical_file_submission_delete',register_id=register.id,submission_id=0) }}">
+  <div class="import-header">
+    <div>
+      <h2>Practical File Scanner</h2>
+      <span class="muted">Photograph or upload the first page. The image stays in your browser; only detected text, match details and receipt status are stored.</span>
+    </div>
+    <span class="practical-file-received-badge"><strong>{{ received_count }}</strong> / {{ students|length }} received</span>
+  </div>
+  {% if students %}
+  <div class="practical-scanner-grid">
+    <div>
+      <div class="practical-scan-actions">
+        <label class="btn" for="practical-file-camera">📷 Take First-Page Photo</label>
+        <label class="btn secondary" for="practical-file-upload">Upload Image / PDF</label>
+      </div>
+      <input id="practical-file-camera" class="practical-hidden-file" type="file" accept="image/*" capture="environment">
+      <input id="practical-file-upload" class="practical-hidden-file" type="file" accept="image/*,.pdf,application/pdf">
+      <p class="import-hint">Best results: keep the page flat, use good light, and ensure the student's roll/registration number and name are clearly visible.</p>
+      <div class="practical-scan-progress" data-scan-progress hidden>
+        <div class="practical-scan-progress-bar"><span data-scan-progress-fill></span></div>
+        <strong data-scan-progress-text>Preparing image…</strong>
+      </div>
+      <div class="practical-scan-result" data-scan-result hidden></div>
+      <div class="practical-scan-manual" data-scan-manual>
+        <label for="practical-scan-student">Manual confirmation</label>
+        <div class="practical-scan-manual-row">
+          <select id="practical-scan-student" data-scan-student-select>
+            <option value="">Choose a student if OCR is unclear</option>
+            {% for st in students if not submission_by_student.get(st.id) %}<option value="{{ st.id }}">{{ st.roll_no }} — {{ st.name }}</option>{% endfor %}
+          </select>
+          <button type="button" class="btn secondary" data-scan-manual-save>Confirm &amp; Save</button>
+        </div>
+      </div>
+    </div>
+    <div class="practical-scan-preview-wrap">
+      <div class="practical-scan-preview-empty" data-scan-preview-empty>First-page preview</div>
+      <img class="practical-scan-preview" data-scan-preview alt="Selected practical file first page" hidden>
+    </div>
+  </div>
+  {% else %}
+  <p class="muted">Upload the student list first. The scanner matches each first page against students in this practical register.</p>
+  {% endif %}
+</div>
+
 <div class="card">
   <div class="import-header"><div><h2>Experiments</h2></div>{% if experiments and students %}<a class="btn" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=experiments[0].id) }}">Start Live Entry</a>{% endif %}</div>
   <div class="table-wrap"><table><tr><th>No.</th><th>Experiment</th><th>Reference Code</th><th>Total Marks</th><th>Live Entry</th></tr>
@@ -43,8 +88,11 @@
 
 <div class="card">
   <div class="import-header"><div><h2>Student Progress</h2></div><div class="actions"><a class="btn secondary small" href="{{ url_for('practical_export',register_id=register.id,fmt='csv') }}">Export CSV</a></div></div>
-  <div class="table-wrap"><table><tr><th>#</th><th>Roll No</th><th>Name</th><th>Evaluated</th><th>Total</th><th>Percentage</th></tr>
-  {% for row in summary %}<tr><td>{{ loop.index }}</td><td><strong>{{ row.student.roll_no }}</strong></td><td>{{ row.student.name }}</td><td>{{ row.evaluated }} / {{ experiments|length }}</td><td>{{ row.scored }} / {{ row.possible }}</td><td>{{ row.percent }}%</td></tr>{% else %}<tr><td colspan="6">No students uploaded yet.</td></tr>{% endfor %}
+  <div class="table-wrap"><table><tr><th>#</th><th>Roll No</th><th>Name</th><th>File</th><th>Evaluated</th><th>Total</th><th>Percentage</th></tr>
+  {% for row in summary %}<tr data-practical-student-row="{{ row.student.id }}"><td>{{ loop.index }}</td><td><strong>{{ row.student.roll_no }}</strong></td><td>{{ row.student.name }}</td><td data-practical-file-cell>{% if row.file_submission %}<div class="practical-file-cell"><span class="badge practical-file-received">Received</span><small>{{ row.file_submission.received_at|dt }}</small><form method="post" action="{{ url_for('practical_file_submission_delete',register_id=register.id,submission_id=row.file_submission.id) }}" onsubmit="return confirm('Remove this practical-file receipt?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="practical-file-remove" title="Remove receipt" aria-label="Remove file receipt">×</button></form></div>{% else %}<span class="badge practical-file-missing">Missing</span>{% endif %}</td><td>{{ row.evaluated }} / {{ experiments|length }}</td><td>{{ row.scored }} / {{ row.possible }}</td><td>{{ row.percent }}%</td></tr>{% else %}<tr><td colspan="7">No students uploaded yet.</td></tr>{% endfor %}
   </table></div>
 </div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js" defer></script>
+<script src="{{ url_for('static',filename='practical_file_scanner.js') }}" defer></script>
 {% endblock %}

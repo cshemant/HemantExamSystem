@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import io
 import re
+from difflib import SequenceMatcher
 from typing import Iterable
 
 from openpyxl import load_workbook
@@ -271,3 +272,122 @@ def _dedupe_experiments(rows: Iterable[dict]) -> list[dict]:
         except (TypeError,ValueError):marks=10
         out.append({'experiment_no':code,'title':title,'max_marks':marks,'reference_code':cell_text(row.get('reference_code'))})
     return out
+
+# ---------------------------------------------------------------------------
+# Practical file first-page OCR matching
+# ---------------------------------------------------------------------------
+
+def normalize_scan_identifier(value: str) -> str:
+    """Normalize a roll/registration number for OCR-safe comparison."""
+    return re.sub(r'[^A-Z0-9]+','',cell_text(value).upper())
+
+
+def _digit_like_identifier(value: str) -> str:
+    """Repair common OCR substitutions only when an identifier is digit-heavy."""
+    value=normalize_scan_identifier(value)
+    if not value:
+        return ''
+    digit_count=sum(ch.isdigit() for ch in value)
+    if digit_count < max(3,len(value)//2):
+        return value
+    table=str.maketrans({'O':'0','Q':'0','I':'1','L':'1','S':'5','B':'8','Z':'2'})
+    return value.translate(table)
+
+
+def normalize_scan_name(value: str) -> str:
+    text=re.sub(r'[^A-Z ]+',' ',cell_text(value).upper())
+    return re.sub(r'\s+',' ',text).strip()
+
+
+def extract_practical_scan_fields(ocr_text: str) -> dict:
+    """Extract likely labelled roll/registration number and name from OCR text."""
+    text=(ocr_text or '').replace('\r','\n')
+    lines=[re.sub(r'\s+',' ',line).strip() for line in text.split('\n') if line.strip()]
+    roll='';name=''
+    roll_re=re.compile(r'(?i)\b(?:roll|reg(?:istration)?|enrol(?:lment)?|student\s*id)\s*(?:no\.?|number|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9 ./_\-]{3,30})')
+    name_re=re.compile(r'(?i)\b(?:student\s*)?name\s*[:\-]?\s*([A-Z][A-Z .]{2,60})')
+    for line in lines:
+        if not roll:
+            m=roll_re.search(line)
+            if m:
+                candidate=m.group(1).strip(' .:-_')
+                # Avoid swallowing a following label such as "Name".
+                candidate=re.split(r'(?i)\b(?:name|class|section|semester|branch)\b',candidate,maxsplit=1)[0].strip()
+                roll=candidate
+        if not name:
+            m=name_re.search(line)
+            if m:
+                candidate=m.group(1).strip(' .:-_')
+                candidate=re.split(r'(?i)\b(?:roll|reg(?:istration)?|class|section|semester|branch|date)\b',candidate,maxsplit=1)[0].strip()
+                name=candidate
+    return {'roll_no':roll,'name':name}
+
+
+def practical_scan_candidates(ocr_text: str, students: Iterable, limit: int=5) -> list[dict]:
+    """Rank practical-register students against OCR text.
+
+    Roll/registration identifiers drive automatic matching. Name similarity is
+    deliberately only a supporting signal so a common name cannot silently mark
+    the wrong student's file as received.
+    """
+    text=ocr_text or ''
+    fields=extract_practical_scan_fields(text)
+    compact_text=normalize_scan_identifier(text)
+    raw_tokens=re.findall(r'[A-Za-z0-9][A-Za-z0-9./_\-]{3,30}',text)
+    token_ids={normalize_scan_identifier(x) for x in raw_tokens}
+    digit_tokens={_digit_like_identifier(x) for x in raw_tokens}
+    detected_roll=normalize_scan_identifier(fields.get('roll_no',''))
+    detected_roll_digit=_digit_like_identifier(fields.get('roll_no',''))
+    detected_name=normalize_scan_name(fields.get('name',''))
+    lines=[normalize_scan_name(x) for x in text.splitlines() if normalize_scan_name(x)]
+    ranked=[]
+    for st in students:
+        roll=normalize_scan_identifier(getattr(st,'roll_no',''))
+        roll_digit=_digit_like_identifier(getattr(st,'roll_no',''))
+        name=normalize_scan_name(getattr(st,'name',''))
+        roll_strength=0.0;reason=''
+        if roll:
+            if detected_roll and detected_roll==roll:
+                roll_strength=1.0;reason='labelled roll number matched'
+            elif detected_roll_digit and detected_roll_digit==roll_digit:
+                roll_strength=.98;reason='OCR-corrected roll number matched'
+            elif detected_roll and len(roll)>=5 and (detected_roll.endswith(roll) or roll.endswith(detected_roll)):
+                roll_strength=.94;reason='roll number suffix matched'
+            elif roll in token_ids:
+                roll_strength=.96;reason='roll number found on page'
+            elif roll_digit in digit_tokens:
+                roll_strength=.93;reason='OCR-corrected roll number found on page'
+            elif len(roll)>=5 and roll in compact_text:
+                roll_strength=.90;reason='roll number found in OCR text'
+            elif detected_roll:
+                ratio=SequenceMatcher(None,roll_digit,detected_roll_digit).ratio()
+                if ratio>=.86:
+                    roll_strength=.72*ratio;reason='similar roll number detected'
+        name_strength=0.0
+        if name:
+            if detected_name:
+                name_strength=SequenceMatcher(None,name,detected_name).ratio()
+            elif lines:
+                name_strength=max(SequenceMatcher(None,name,line).ratio() for line in lines)
+        # Identifier contributes up to 90 points; name can add at most 10.
+        score=min(100.0,roll_strength*90.0+name_strength*10.0)
+        ranked.append({
+            'student_id':getattr(st,'id',None),'roll_no':getattr(st,'roll_no',''),
+            'name':getattr(st,'name',''),'score':round(score,1),
+            'roll_strength':round(roll_strength,3),'name_strength':round(name_strength,3),
+            'reason':reason or ('name similarity' if name_strength>.6 else 'weak match'),
+        })
+    ranked.sort(key=lambda x:(x['score'],x['roll_strength'],x['name_strength']),reverse=True)
+    return ranked[:max(1,int(limit))]
+
+
+def practical_scan_auto_match(ocr_text: str, students: Iterable) -> dict:
+    """Return fields, candidates and a safe high-confidence automatic match."""
+    fields=extract_practical_scan_fields(ocr_text)
+    ranked=practical_scan_candidates(ocr_text,students,limit=5)
+    top=ranked[0] if ranked else None
+    second=ranked[1] if len(ranked)>1 else None
+    # Require a strong identifier match and a useful separation from runner-up.
+    automatic=bool(top and top['score']>=84 and top['roll_strength']>=.90 and (not second or top['score']-second['score']>=6))
+    return {'fields':fields,'candidates':ranked,'match':top if automatic else None}
+
