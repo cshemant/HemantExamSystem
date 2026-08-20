@@ -96,6 +96,6 @@
   {% for row in summary %}<tr data-practical-student-row="{{ row.student.id }}"><td>{{ loop.index }}</td><td><strong>{{ row.student.roll_no }}</strong></td><td>{{ row.student.name }}</td><td data-record-summary-cell data-student-id="{{ row.student.id }}"><strong>{{ row.record_received }}</strong> / {{ experiments|length }}</td><td>{{ row.evaluated }} / {{ experiments|length }}</td><td>{{ row.scored }} / {{ row.possible }}</td><td>{{ row.percent }}%</td></tr>{% else %}<tr><td colspan="7">No students uploaded yet.</td></tr>{% endfor %}
   </table></div>
 </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js" defer onerror="this.onerror=null;this.src='https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js';"></script>
 <script src="{{ url_for('static',filename='practical_file_scanner.js') }}" defer></script>
 {% endblock %}
