@@ -15,11 +15,7 @@
     const csrf=(document.querySelector('meta[name="csrf-token"]')||{}).content||'';
     const experimentSelect=root.querySelector('[data-scan-experiment-select]');
     const camera=document.getElementById('practical-file-camera');
-    const upload=document.getElementById('practical-file-upload');
-    const preview=root.querySelector('[data-scan-preview]');
-    const previewEmpty=root.querySelector('[data-scan-preview-empty]');
     const progress=root.querySelector('[data-scan-progress]');
-    const progressFill=root.querySelector('[data-scan-progress-fill]');
     const progressText=root.querySelector('[data-scan-progress-text]');
     const resultBox=root.querySelector('[data-scan-result]');
     const manualSelect=root.querySelector('[data-scan-student-select]');
@@ -27,8 +23,7 @@
     const selectedCount=root.querySelector('[data-scan-received-count]');
     const selectedLabel=root.querySelector('[data-scan-received-label]');
     let worker=null;
-    let current={ocrText:'',confidence:0,filename:''};
-    let previewUrl='';
+    let current={ocrText:'',confidence:0};
 
     function selectedExperiment(){
       if(!experimentSelect||!experimentSelect.value) return null;
@@ -48,7 +43,6 @@
       if(!progress) return;
       progress.hidden=false;
       progressText.textContent=label;
-      progressFill.style.width=Math.max(2,Math.min(100,pct||0))+'%';
     }
 
     function stopProgress(){if(progress) progress.hidden=true;}
@@ -70,13 +64,6 @@
       resultBox.append(strong,p);
     }
 
-    function showPreview(file){
-      if(previewUrl) URL.revokeObjectURL(previewUrl);
-      previewUrl=URL.createObjectURL(file);
-      preview.src=previewUrl;preview.hidden=false;
-      if(previewEmpty) previewEmpty.hidden=true;
-    }
-
     async function imageToCanvas(file){
       const img=new Image();
       const url=URL.createObjectURL(file);
@@ -94,28 +81,6 @@
       } finally {URL.revokeObjectURL(url);}
     }
 
-    async function pdfFirstPageToCanvas(file){
-      if(!window.pdfjsLib) throw new Error('PDF reader could not load. Check the internet connection and refresh this page.');
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-      const bytes=new Uint8Array(await file.arrayBuffer());
-      const pdf=await window.pdfjsLib.getDocument({data:bytes}).promise;
-      const page=await pdf.getPage(1);
-      const base=page.getViewport({scale:1});
-      const maxSide=1900;
-      const scale=Math.min(2.2,maxSide/Math.max(base.width,base.height));
-      const viewport=page.getViewport({scale:Math.max(1.25,scale)});
-      const canvas=document.createElement('canvas');
-      canvas.width=Math.max(1,Math.round(viewport.width));canvas.height=Math.max(1,Math.round(viewport.height));
-      const ctx=canvas.getContext('2d',{alpha:false});
-      await page.render({canvasContext:ctx,viewport:viewport}).promise;
-      return canvas;
-    }
-
-    function showCanvasPreview(canvas){
-      if(previewUrl){URL.revokeObjectURL(previewUrl);previewUrl='';}
-      preview.src=canvas.toDataURL('image/jpeg',.86);preview.hidden=false;
-      if(previewEmpty) previewEmpty.hidden=true;
-    }
 
     async function getWorker(){
       if(worker) return worker;
@@ -138,7 +103,7 @@
     async function postScan(extra){
       const experiment=requireExperiment();
       if(!experiment) throw new Error('Select the experiment before saving.');
-      const payload=Object.assign({ocr_text:current.ocrText,confidence:current.confidence,filename:current.filename,experiment_id:experiment.id},extra||{});
+      const payload=Object.assign({ocr_text:current.ocrText,confidence:current.confidence,experiment_id:experiment.id},extra||{});
       const response=await fetch(scanUrl,{
         method:'POST',credentials:'same-origin',
         headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,'Accept':'application/json'},
@@ -251,38 +216,36 @@
       try{
         setProgress('Saving Experiment '+experiment.no+' record receipt…',92);
         const data=await postScan({practical_student_id:studentId});stopProgress();markReceived(data);
-        showResult(data.duplicate?'warning':'success',data.duplicate?'Already received':'Record received','Experiment '+data.experiment.no+' · '+data.student.roll_no+' — '+data.student.name+(data.duplicate?' is already recorded.':' was saved successfully.'));
+        showResult(data.duplicate?'warning':'success',data.duplicate?'Already received':'✓ Record received',data.student.roll_no+' — '+data.student.name);
       }catch(err){stopProgress();showResult('error','Could not save',err.message);}
     }
 
     async function processFile(file){
       if(!file) return;
       const experiment=requireExperiment();
-      if(!experiment){if(camera) camera.value='';if(upload) upload.value='';return;}
+      if(!experiment){if(camera) camera.value='';return;}
       clearResult();
-      const isPdf=(file.type==='application/pdf'||/\.pdf$/i.test(file.name||''));
       const isImage=/^image\//i.test(file.type||'');
-      if(!isPdf&&!isImage){showResult('error','Unsupported file','Please photograph the first page or upload an image/PDF file.');return;}
-      if(file.size>20*1024*1024){showResult('error','File too large','Use an image or PDF smaller than 20 MB.');return;}
-      current={ocrText:'',confidence:0,filename:file.name||'camera-photo'};
-      if(isImage) showPreview(file);
+      if(!isImage){showResult('error','Unsupported scan','Please scan the first page as an image.');return;}
+      if(file.size>20*1024*1024){showResult('error','Scan too large','Use an image smaller than 20 MB.');return;}
+      current={ocrText:'',confidence:0};
       try{
-        setProgress(isPdf?'Opening PDF first page…':'Preparing first page…',4);
-        const canvas=isPdf?await pdfFirstPageToCanvas(file):await imageToCanvas(file);if(isPdf) showCanvasPreview(canvas);
+        setProgress('Preparing scan…',4);
+        const canvas=await imageToCanvas(file);
         const ocrWorker=await getWorker();setProgress('Reading name and roll number…',22);
         const recognition=await ocrWorker.recognize(canvas,{rotateAuto:true});
         current.ocrText=(recognition&&recognition.data&&recognition.data.text)||'';current.confidence=Number((recognition&&recognition.data&&recognition.data.confidence)||0);
-        setProgress('Matching student for Experiment '+experiment.no+'…',94);
+        setProgress('Matching student…',94);
         const data=await postScan();stopProgress();
         if(data.status==='saved'||data.status==='duplicate'){
-          markReceived(data);const details='Experiment '+data.experiment.no+' · '+data.student.roll_no+' — '+data.student.name;
-          showResult(data.duplicate?'warning':'success',data.duplicate?'Already received':'Matched & saved',details+(data.score?' · Match '+Math.round(data.score)+'%':''));
+          markReceived(data);
+          showResult(data.duplicate?'warning':'success',data.duplicate?'Already received':'✓ Record received',data.student.roll_no+' — '+data.student.name);
         }else if(data.status==='needs_confirmation') renderConfirmation(data);
-      }catch(err){stopProgress();showResult('error','Scan not completed',err&&err.message?err.message:'The image could not be read.');}
-      finally{if(camera) camera.value='';if(upload) upload.value='';}
+      }catch(err){stopProgress();showResult('error','Scan not completed',err&&err.message?err.message:'The page could not be read.');}
+      finally{if(camera) camera.value='';}
     }
 
-    [camera,upload].forEach(function(input){if(input) input.addEventListener('change',function(){processFile(input.files&&input.files[0]);});});
+    [camera].forEach(function(input){if(input) input.addEventListener('change',function(){processFile(input.files&&input.files[0]);});});
     if(manualSave) manualSave.addEventListener('click',function(){confirmStudent(manualSelect&&manualSelect.value);});
     if(experimentSelect) experimentSelect.addEventListener('change',refreshSelectedExperimentUI);
     refreshSelectedExperimentUI();

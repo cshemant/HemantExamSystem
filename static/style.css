@@ -565,3 +565,17 @@ body.secure-exam-running .secure-exam-shell{visibility:visible!important}
 
 /* V83.1: Record marks awarded automatically from scanned experiment receipts. */
 .practical-auto-record-mark{font-weight:800;background:#f0fdf4;border-color:#86efac}
+
+/* V88.1 privacy-first compact practical record scanner */
+.practical-file-scanner-compact{padding-top:18px;padding-bottom:18px}
+.practical-scanner-compact-header{margin-bottom:12px}
+.practical-scanner-compact-row{display:grid;grid-template-columns:minmax(420px,1fr) auto;gap:12px;align-items:end}
+.practical-scanner-compact-field label{display:block;margin-bottom:7px;font-size:12px;font-weight:850;color:#344054}
+.practical-scanner-compact-field select{margin:0;width:100%;max-width:none}
+.practical-scanner-compact-action{display:flex;align-items:end}
+.practical-scan-button{white-space:nowrap;min-height:46px;display:inline-flex;align-items:center;justify-content:center}
+.practical-scan-progress-inline{margin-top:10px;color:var(--muted);font-size:12px}
+.practical-scan-result-compact{margin-top:10px;padding:10px 12px}
+.practical-scan-result-compact p{margin-top:2px}
+.practical-file-scanner-compact .practical-scan-manual{margin-top:12px;padding-top:12px}
+@media(max-width:760px){.practical-scanner-compact-row{grid-template-columns:1fr}.practical-scanner-compact-action,.practical-scan-button{width:100%}}
