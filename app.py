@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.24.2'
+APP_VERSION='2.26.1'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -635,6 +635,55 @@ class PracticalMark(Base):
     updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 
+class TheoryRegister(Base):
+    __tablename__='theory_registers'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    owner_type:Mapped[str]=mapped_column(String,nullable=False)  # admin | faculty
+    owner_id:Mapped[int]=mapped_column(Integer,nullable=False)
+    owner_name:Mapped[str]=mapped_column(String,nullable=False,default='')
+    title:Mapped[str]=mapped_column(String,nullable=False)
+    subject:Mapped[str]=mapped_column(String,nullable=False,default='')
+    course_code:Mapped[str]=mapped_column(String,nullable=False,default='')
+    section:Mapped[str]=mapped_column(String,nullable=False,default='')
+    academic_year:Mapped[str]=mapped_column(String,nullable=False,default='')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+    updated_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class TheoryStudent(Base):
+    __tablename__='theory_students'
+    __table_args__=(UniqueConstraint('register_id','roll_no'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    register_id:Mapped[int]=mapped_column(ForeignKey('theory_registers.id'),nullable=False)
+    sequence:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    roll_no:Mapped[str]=mapped_column(String,nullable=False)
+    name:Mapped[str]=mapped_column(String,nullable=False)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class TheoryExperiment(Base):
+    __tablename__='theory_experiments'
+    __table_args__=(UniqueConstraint('register_id','experiment_no'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    register_id:Mapped[int]=mapped_column(ForeignKey('theory_registers.id'),nullable=False)
+    experiment_no:Mapped[str]=mapped_column(String,nullable=False)
+    title:Mapped[str]=mapped_column(Text,nullable=False)
+    sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class TheoryPerformance(Base):
+    __tablename__='theory_performances'
+    __table_args__=(UniqueConstraint('theory_student_id','theory_experiment_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    register_id:Mapped[int]=mapped_column(ForeignKey('theory_registers.id'),nullable=False)
+    theory_student_id:Mapped[int]=mapped_column(ForeignKey('theory_students.id'),nullable=False)
+    theory_experiment_id:Mapped[int]=mapped_column(ForeignKey('theory_experiments.id'),nullable=False)
+    performed_date:Mapped[str]=mapped_column(String,nullable=False,default='')  # YYYY-MM-DD
+    updated_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+
 class PracticalCodeSubmission(Base):
     __tablename__='practical_code_submissions'
     __table_args__=(UniqueConstraint('student_id','exam_id'),)
@@ -1216,6 +1265,33 @@ def practical_register_stmt(s):
         owner_type,owner_id,_=current_practical_owner(s)
         stmt=stmt.where(PracticalRegister.owner_type==owner_type,PracticalRegister.owner_id==owner_id)
     return stmt
+
+def theory_register_access(s,register_id):
+    row=s.get(TheoryRegister,register_id)
+    if not row:abort(404)
+    if current_staff_role(s)=='super_admin':
+        return row
+    owner_type,owner_id,_=current_practical_owner(s)
+    if row.owner_type!=owner_type or row.owner_id!=owner_id:
+        abort(403)
+    return row
+
+
+def theory_register_stmt(s):
+    stmt=select(TheoryRegister).order_by(TheoryRegister.updated_at.desc(),TheoryRegister.id.desc())
+    if current_staff_role(s)!='super_admin':
+        owner_type,owner_id,_=current_practical_owner(s)
+        stmt=stmt.where(TheoryRegister.owner_type==owner_type,TheoryRegister.owner_id==owner_id)
+    return stmt
+
+
+def _valid_theory_date(value):
+    value=(value or '').strip()
+    if not value:return ''
+    try:datetime.strptime(value,'%Y-%m-%d')
+    except ValueError:raise ValueError('Performed Date must be a valid date.')
+    return value
+
 
 def exam_owner_actor(s,exam_id):
     """Return the staff actor that originally created an exam.
@@ -1853,7 +1929,7 @@ def security_headers(response):
     scanner_page=request.endpoint=='practical_register_detail'
     response.headers.setdefault('Permissions-Policy',('camera=(self), microphone=(), geolocation=(), payment=(), usb=()' if scanner_page else 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'))
     if scanner_page:
-        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; worker-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; connect-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; worker-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; connect-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     elif secure_exam_frame:
         response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
     else:
@@ -2541,6 +2617,214 @@ def _component_mark(value, label, maximum):
     return mark
 
 
+@app.route('/admin/theory-classes',methods=['GET','POST'])
+@practical_required
+def theory_classes():
+    s=DB();owner_type,owner_id,owner_name=current_practical_owner(s)
+    if request.method=='POST':
+        title=(request.form.get('title') or '').strip();subject=(request.form.get('subject') or '').strip();section=(request.form.get('section') or '').strip();academic_year=(request.form.get('academic_year') or '').strip();course_code=(request.form.get('course_code') or '').strip()
+        if not title:title=subject or 'Theory Class'
+        if not subject:
+            flash('Subject name is required.','error');return redirect(url_for('theory_classes'))
+        row=TheoryRegister(owner_type=owner_type,owner_id=owner_id,owner_name=owner_name,title=title,subject=subject,course_code=course_code,section=section,academic_year=academic_year,created_at=now_iso(),updated_at=now_iso());s.add(row);s.flush()
+        roster=request.files.get('roster_file');added=0
+        if roster and roster.filename:
+            try:
+                imported=parse_roster_bytes(roster.filename,roster.read())
+                for seq,item in enumerate(imported,start=1):
+                    s.add(TheoryStudent(register_id=row.id,sequence=seq,roll_no=item['roll_no'],name=item['name'],created_at=now_iso()));added+=1
+            except ValueError as exc:
+                s.rollback();flash(str(exc),'error');return redirect(url_for('theory_classes'))
+        audit_event(s,'theory_class_created','theory_register',row.id,f'subject={subject}, students={added}');s.commit();flash(f'Theory class created'+(f' with {added} students.' if added else '.'))
+        return redirect(url_for('theory_class_detail',register_id=row.id))
+    rows=s.scalars(theory_register_stmt(s)).all();counts={}
+    for row in rows:
+        counts[row.id]={
+            'students':s.scalar(select(func.count()).select_from(TheoryStudent).where(TheoryStudent.register_id==row.id)) or 0,
+            'experiments':s.scalar(select(func.count()).select_from(TheoryExperiment).where(TheoryExperiment.register_id==row.id)) or 0,
+            'performed':s.scalar(select(func.count()).select_from(TheoryPerformance).where(TheoryPerformance.register_id==row.id,TheoryPerformance.performed_date!='')) or 0,
+        }
+    return render_template('theory_classes.html',registers=rows,counts=counts,viewer_role=current_staff_role(s))
+
+
+@app.route('/admin/theory-classes/<int:register_id>/delete',methods=['POST'])
+@practical_required
+def delete_theory_class(register_id):
+    s=DB();register=theory_register_access(s,register_id);label=register.title or register.subject or f'Theory Class {register.id}'
+    student_count=s.scalar(select(func.count()).select_from(TheoryStudent).where(TheoryStudent.register_id==register.id)) or 0
+    experiment_count=s.scalar(select(func.count()).select_from(TheoryExperiment).where(TheoryExperiment.register_id==register.id)) or 0
+    performance_count=s.scalar(select(func.count()).select_from(TheoryPerformance).where(TheoryPerformance.register_id==register.id)) or 0
+    audit_event(s,'theory_class_deleted','theory_register',register.id,f'title={label}, students={student_count}, experiments={experiment_count}, performed_rows={performance_count}')
+    s.execute(delete(TheoryPerformance).where(TheoryPerformance.register_id==register.id));s.execute(delete(TheoryStudent).where(TheoryStudent.register_id==register.id));s.execute(delete(TheoryExperiment).where(TheoryExperiment.register_id==register.id));s.delete(register);s.commit()
+    flash(f'{label} and its theory activity data were deleted.');return redirect(url_for('theory_classes'))
+
+
+@app.route('/admin/theory-classes/<int:register_id>')
+@practical_required
+def theory_class_detail(register_id):
+    s=DB();register=theory_register_access(s,register_id)
+    students=s.scalars(select(TheoryStudent).where(TheoryStudent.register_id==register.id).order_by(TheoryStudent.sequence,TheoryStudent.roll_no)).all()
+    experiments=s.scalars(select(TheoryExperiment).where(TheoryExperiment.register_id==register.id).order_by(TheoryExperiment.sort_order,TheoryExperiment.id)).all()
+    rows=s.scalars(select(TheoryPerformance).where(TheoryPerformance.register_id==register.id,TheoryPerformance.performed_date!='')).all()
+    by_student={}
+    by_experiment={}
+    for item in rows:
+        by_student.setdefault(item.theory_student_id,[]).append(item)
+        by_experiment[item.theory_experiment_id]=by_experiment.get(item.theory_experiment_id,0)+1
+    summary=[]
+    for st in students:
+        entries=by_student.get(st.id,[]);dates=sorted((x.performed_date for x in entries if x.performed_date),reverse=True)
+        summary.append({'student':st,'completed':len(entries),'last_date':dates[0] if dates else ''})
+    started=sum(1 for row in summary if row['completed']>0)
+    return render_template('theory_class_detail.html',register=register,students=students,experiments=experiments,performed_rows=rows,performed_by_experiment=by_experiment,summary=summary,started=started)
+
+
+@app.route('/admin/theory-classes/<int:register_id>/students/import',methods=['POST'])
+@practical_required
+def theory_students_import(register_id):
+    s=DB();register=theory_register_access(s,register_id);upload=request.files.get('roster_file')
+    if not upload or not upload.filename:flash('Choose a CSV or Excel student sheet.','error');return redirect(url_for('theory_class_detail',register_id=register.id))
+    try:imported=parse_roster_bytes(upload.filename,upload.read())
+    except ValueError as exc:flash(str(exc),'error');return redirect(url_for('theory_class_detail',register_id=register.id))
+    existing=s.scalars(select(TheoryStudent).where(TheoryStudent.register_id==register.id)).all();by_roll={x.roll_no.casefold():x for x in existing};added=updated=0;order=max([x.sequence for x in existing] or [0])
+    for item in imported:
+        key=item['roll_no'].casefold();current=by_roll.get(key)
+        if current:
+            if current.name!=item['name']:current.name=item['name'];updated+=1
+        else:
+            order+=1;current=TheoryStudent(register_id=register.id,sequence=order,roll_no=item['roll_no'],name=item['name'],created_at=now_iso());s.add(current);by_roll[key]=current;added+=1
+    register.updated_at=now_iso();audit_event(s,'theory_students_imported','theory_register',register.id,f'added={added}, updated={updated}');s.commit();flash(f'Student sheet processed: {added} added, {updated} updated.');return redirect(url_for('theory_class_detail',register_id=register.id))
+
+
+@app.route('/admin/theory-classes/<int:register_id>/experiments/import',methods=['POST'])
+@practical_required
+def theory_experiments_import(register_id):
+    s=DB();register=theory_register_access(s,register_id);upload=request.files.get('experiment_file');pasted=(request.form.get('experiment_text') or '').strip()
+    try:
+        if upload and upload.filename:imported=parse_experiment_bytes(upload.filename,upload.read())
+        elif pasted:imported=parse_experiment_text(pasted)
+        else:raise ValueError('Choose an experiment CSV/Excel file or paste the experiment list.')
+    except ValueError as exc:flash(str(exc),'error');return redirect(url_for('theory_class_detail',register_id=register.id))
+    existing=s.scalars(select(TheoryExperiment).where(TheoryExperiment.register_id==register.id).order_by(TheoryExperiment.sort_order,TheoryExperiment.id)).all();by_code={normalize_experiment_code(x.experiment_no, x.sort_order or x.id or 1):x for x in existing};added=updated=0
+    for order,item in enumerate(imported,start=1):
+        code=(item.get('experiment_no') or str(order)).strip();key=normalize_experiment_code(code, order);title=(item.get('title') or '').strip()
+        current=by_code.get(key)
+        if current:
+            changed=False
+            if current.experiment_no!=code:current.experiment_no=code;changed=True
+            if current.title!=title:current.title=title;changed=True
+            if current.sort_order!=order:current.sort_order=order;changed=True
+            if changed:updated+=1
+        else:
+            current=TheoryExperiment(register_id=register.id,experiment_no=code,title=title,sort_order=order,created_at=now_iso());s.add(current);s.flush();by_code[key]=current;added+=1
+    register.updated_at=now_iso();audit_event(s,'theory_experiments_imported','theory_register',register.id,f'added={added}, updated={updated}');s.commit();flash(f'Experiment list processed: {added} added, {updated} updated.');return redirect(url_for('theory_class_detail',register_id=register.id))
+
+
+@app.route('/admin/theory-classes/<int:register_id>/live-entry')
+@practical_required
+def theory_live_entry(register_id):
+    s=DB();register=theory_register_access(s,register_id);experiments=s.scalars(select(TheoryExperiment).where(TheoryExperiment.register_id==register.id).order_by(TheoryExperiment.sort_order,TheoryExperiment.id)).all();students=s.scalars(select(TheoryStudent).where(TheoryStudent.register_id==register.id).order_by(TheoryStudent.sequence,TheoryStudent.roll_no)).all()
+    if not experiments:flash('Upload the experiment list before opening Theory Class entry.','error');return redirect(url_for('theory_class_detail',register_id=register.id))
+    experiment_id=request.args.get('experiment_id',type=int) or experiments[0].id;experiment=next((x for x in experiments if x.id==experiment_id),experiments[0])
+    rows=s.scalars(select(TheoryPerformance).where(TheoryPerformance.register_id==register.id,TheoryPerformance.theory_experiment_id==experiment.id)).all();completion_map={x.theory_student_id:x for x in rows};performed=sum(1 for x in rows if x.performed_date)
+    return render_template('theory_live_entry.html',register=register,students=students,experiments=experiments,experiment=experiment,completion_map=completion_map,performed=performed,today=now_dt().date().isoformat())
+
+
+def _save_theory_performance(s,register,student_id,experiment_id,performed_date):
+    student=s.get(TheoryStudent,student_id);experiment=s.get(TheoryExperiment,experiment_id)
+    if not student or not experiment or student.register_id!=register.id or experiment.register_id!=register.id:raise ValueError('Student/experiment does not belong to this Theory Class.')
+    performed_date=_valid_theory_date(performed_date)
+    row=s.scalar(select(TheoryPerformance).where(TheoryPerformance.theory_student_id==student.id,TheoryPerformance.theory_experiment_id==experiment.id))
+    if not performed_date:
+        if row:s.delete(row)
+        return None
+    if not row:
+        row=TheoryPerformance(register_id=register.id,theory_student_id=student.id,theory_experiment_id=experiment.id,performed_date=performed_date,updated_by=actor_label(s),updated_at=now_iso());s.add(row)
+    else:
+        row.performed_date=performed_date;row.updated_by=actor_label(s);row.updated_at=now_iso()
+    return row
+
+
+@app.route('/admin/theory-classes/<int:register_id>/performed/save',methods=['POST'])
+@practical_required
+def theory_performed_save(register_id):
+    s=DB();register=theory_register_access(s,register_id);payload=request.get_json(silent=True) or request.form
+    try:
+        student_id=int(payload.get('student_id') or 0);experiment_id=int(payload.get('experiment_id') or 0);row=_save_theory_performance(s,register,student_id,experiment_id,payload.get('performed_date',''));register.updated_at=now_iso();s.commit();return jsonify(ok=True,performed_date=row.performed_date if row else '')
+    except ValueError as exc:s.rollback();return jsonify(ok=False,error=str(exc)),400
+
+
+@app.route('/admin/theory-classes/<int:register_id>/performed/bulk',methods=['POST'])
+@practical_required
+def theory_performed_bulk(register_id):
+    s=DB();register=theory_register_access(s,register_id)
+    try:experiment_id=int(request.form.get('experiment_id') or 0)
+    except ValueError:experiment_id=0
+    experiment=s.get(TheoryExperiment,experiment_id)
+    if not experiment or experiment.register_id!=register.id:abort(404)
+    students=s.scalars(select(TheoryStudent).where(TheoryStudent.register_id==register.id)).all();errors=[];saved=0
+    for st in students:
+        try:_save_theory_performance(s,register,st.id,experiment.id,request.form.get(f'performed_date_{st.id}',''));saved+=1
+        except ValueError as exc:errors.append(f'{st.roll_no}: {exc}')
+    if errors:s.rollback();flash(' '.join(errors[:5]),'error')
+    else:register.updated_at=now_iso();audit_event(s,'theory_performed_bulk_saved','theory_register',register.id,f'experiment={experiment.id}, rows={saved}');s.commit();flash('Theory Class dates saved.')
+    return redirect(url_for('theory_live_entry',register_id=register.id,experiment_id=experiment.id))
+
+
+@app.route('/admin/theory-classes/<int:register_id>/performed/all-today',methods=['POST'])
+@practical_required
+def theory_performed_all_today(register_id):
+    s=DB();register=theory_register_access(s,register_id)
+    try:experiment_id=int(request.form.get('experiment_id') or 0)
+    except ValueError:experiment_id=0
+    experiment=s.get(TheoryExperiment,experiment_id)
+    if not experiment or experiment.register_id!=register.id:abort(404)
+    students=s.scalars(select(TheoryStudent).where(TheoryStudent.register_id==register.id)).all();existing=s.scalars(select(TheoryPerformance).where(TheoryPerformance.register_id==register.id,TheoryPerformance.theory_experiment_id==experiment.id)).all();by_student={x.theory_student_id:x for x in existing};today=now_dt().date().isoformat();changed=0
+    for st in students:
+        row=by_student.get(st.id)
+        if not row:
+            s.add(TheoryPerformance(register_id=register.id,theory_student_id=st.id,theory_experiment_id=experiment.id,performed_date=today,updated_by=actor_label(s),updated_at=now_iso()));changed+=1
+        elif not row.performed_date:
+            row.performed_date=today;row.updated_by=actor_label(s);row.updated_at=now_iso();changed+=1
+    register.updated_at=now_iso();audit_event(s,'theory_all_performed_today','theory_register',register.id,f'experiment={experiment.id}, rows={changed}');s.commit();flash(f'{changed} blank date(s) set to today.');return redirect(url_for('theory_live_entry',register_id=register.id,experiment_id=experiment.id))
+
+
+@app.route('/admin/theory-classes/<int:register_id>/template/<kind>/<fmt>')
+@practical_required
+def theory_template(register_id,kind,fmt):
+    s=DB();theory_register_access(s,register_id)
+    if kind=='students':headers=['roll_no','name'];example=['2024/17008','Student Name'];base='theory_student_roster'
+    elif kind=='experiments':headers=['experiment_no','title'];example=['1','Button click demonstration'];base='theory_experiment_list'
+    else:abort(404)
+    if fmt=='csv':
+        out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerow(example);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{base}.csv')
+    if fmt=='xlsx':
+        wb=Workbook();ws=wb.active;ws.title='Students' if kind=='students' else 'Experiments';ws.append(headers);ws.append(example)
+        for cell in ws[1]:cell.font=Font(bold=True)
+        ws.column_dimensions['A'].width=20;ws.column_dimensions['B'].width=70 if kind=='experiments' else 34;data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{base}.xlsx')
+    abort(404)
+
+
+@app.route('/admin/theory-classes/<int:register_id>/export/<fmt>')
+@practical_required
+def theory_export(register_id,fmt):
+    s=DB();register=theory_register_access(s,register_id);students=s.scalars(select(TheoryStudent).where(TheoryStudent.register_id==register.id).order_by(TheoryStudent.sequence,TheoryStudent.roll_no)).all();experiments=s.scalars(select(TheoryExperiment).where(TheoryExperiment.register_id==register.id).order_by(TheoryExperiment.sort_order,TheoryExperiment.id)).all();rows=s.scalars(select(TheoryPerformance).where(TheoryPerformance.register_id==register.id)).all();completion_map={(x.theory_student_id,x.theory_experiment_id):x for x in rows}
+    headers=['S.No','Roll No','Student Name','Completed']+[f'Date {e.experiment_no}' for e in experiments];matrix=[]
+    for idx,st in enumerate(students,start=1):
+        dates=[(completion_map.get((st.id,e.id)).performed_date if completion_map.get((st.id,e.id)) else '') for e in experiments];matrix.append([idx,st.roll_no,st.name,f'{sum(1 for x in dates if x)}/{len(experiments)}']+dates)
+    safe=''.join(ch if ch.isalnum() else '_' for ch in register.title).strip('_')[:60] or 'theory_class'
+    if fmt=='csv':
+        out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{safe}.csv')
+    if fmt=='xlsx':
+        wb=Workbook();ws=wb.active;ws.title='Theory Class';ws.append([register.title]);ws.append([f'Subject: {register.subject}',f'Section: {register.section}',f'Academic Year: {register.academic_year}']);ws.append(headers)
+        for row in matrix:ws.append(row)
+        for cell in ws[3]:cell.font=Font(bold=True)
+        ws.freeze_panes='E4';ws.column_dimensions['A'].width=8;ws.column_dimensions['B'].width=18;ws.column_dimensions['C'].width=30;ws.column_dimensions['D'].width=14
+        for col in range(5,5+len(experiments)):ws.column_dimensions[ws.cell(3,col).column_letter].width=16
+        data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{safe}.xlsx')
+    abort(404)
+
+
 @app.route('/admin/practicals',methods=['GET','POST'])
 @practical_required
 def practical_registers():
@@ -2713,27 +2997,26 @@ def _save_practical_file_submission(s,register,student,experiment,ocr_text='',oc
         if changed:
             register.updated_at=now_iso();s.commit()
         return existing,True,receipts[experiment_key]
-    fields=extract_practical_scan_fields(ocr_text);received_at=now_iso()
+    # Privacy-first scanner storage: the image never reaches Flask, and OCR
+    # text / source filename are used only transiently for matching. Persist
+    # only the student/experiment receipt needed to award Record marks.
+    received_at=now_iso()
     receipt={
         'experiment_id':experiment.id,'experiment_no':experiment.experiment_no,'experiment_title':experiment.title,
-        'detected_roll_no':(fields.get('roll_no') or '')[:120],
-        'detected_name':(fields.get('name') or '')[:180],
-        'ocr_confidence':max(0.0,min(100.0,float(ocr_confidence or 0.0))),
-        'source_filename':(source_filename or '')[:255],
         'match_method':(match_method or 'automatic')[:32],
         'received_by':current_staff_name(s)[:180],'received_at':received_at,
     }
     receipts[experiment_key]=receipt
     if existing:
         row=existing
-        row.detected_roll_no=receipt['detected_roll_no'];row.detected_name=receipt['detected_name'];row.ocr_confidence=receipt['ocr_confidence']
-        row.ocr_text=(ocr_text or '')[:6000];row.source_filename=receipt['source_filename'];row.match_method=receipt['match_method'];row.received_by=receipt['received_by'];row.received_at=received_at
+        row.detected_roll_no='';row.detected_name='';row.ocr_confidence=0.0
+        row.ocr_text='';row.source_filename='';row.match_method=receipt['match_method'];row.received_by=receipt['received_by'];row.received_at=received_at
         row.experiment_receipts_json=json.dumps(receipts,separators=(',',':'))
     else:
         row=PracticalFileSubmission(
             register_id=register.id,practical_student_id=student.id,
-            detected_roll_no=receipt['detected_roll_no'],detected_name=receipt['detected_name'],ocr_confidence=receipt['ocr_confidence'],
-            ocr_text=(ocr_text or '')[:6000],source_filename=receipt['source_filename'],match_method=receipt['match_method'],
+            detected_roll_no='',detected_name='',ocr_confidence=0.0,
+            ocr_text='',source_filename='',match_method=receipt['match_method'],
             received_by=receipt['received_by'],received_at=received_at,experiment_receipts_json=json.dumps(receipts,separators=(',',':')),
         )
         s.add(row);s.flush()

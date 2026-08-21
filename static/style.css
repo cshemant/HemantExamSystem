@@ -579,3 +579,13 @@ body.secure-exam-running .secure-exam-shell{visibility:visible!important}
 .practical-scan-result-compact p{margin-top:2px}
 .practical-file-scanner-compact .practical-scan-manual{margin-top:12px;padding-top:12px}
 @media(max-width:760px){.practical-scanner-compact-row{grid-template-columns:1fr}.practical-scanner-compact-action,.practical-scan-button{width:100%}}
+
+/* V90 Theory Class experiment/date tracking */
+.theory-register-stats{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:20px}
+.theory-live-toolbar{grid-template-columns:minmax(520px,1fr) auto}
+.theory-live-table{min-width:760px!important}
+.theory-live-table td:nth-child(3){min-width:260px}
+.theory-live-table td:nth-child(4){min-width:190px}
+.theory-date-input{min-width:165px!important;margin:0}
+@media(max-width:1000px){.theory-register-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.theory-live-toolbar{grid-template-columns:1fr}}
+@media(max-width:650px){.theory-register-stats{grid-template-columns:1fr 1fr}}

@@ -1,0 +1,22 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head practical-live-head">
+  <div><a class="back-link" href="{{ url_for('theory_class_detail',register_id=register.id) }}">← {{ register.title }}</a><h1>{{ register.subject }}</h1>{% if register.section or register.course_code %}<p class="muted">{% if register.course_code %}{{ register.course_code }}{% endif %}{% if register.course_code and register.section %} · {% endif %}{% if register.section %}{{ register.section }}{% endif %}</p>{% endif %}</div>
+  <div class="practical-live-progress"><strong>{{ performed }}/{{ students|length }}</strong><span>performed for this experiment</span></div>
+</div>
+
+<div class="card practical-live-toolbar theory-live-toolbar">
+  <div class="practical-experiment-picker"><label>Current Experiment</label><select id="theory-experiment-select" data-register-url="{{ url_for('theory_live_entry',register_id=register.id) }}">{% for e in experiments %}<option value="{{ e.id }}" {% if e.id==experiment.id %}selected{% endif %}>{{ e.experiment_no }} · {{ e.title }}</option>{% endfor %}</select></div>
+  <div class="actions practical-live-actions"><input id="theory-student-search" type="search" placeholder="Search roll no / name"><form method="post" action="{{ url_for('theory_performed_all_today',register_id=register.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="experiment_id" value="{{ experiment.id }}"><button class="btn secondary" type="submit">Set All Today</button></form></div>
+</div>
+
+<form method="post" action="{{ url_for('theory_performed_bulk',register_id=register.id) }}" data-theory-entry data-save-url="{{ url_for('theory_performed_save',register_id=register.id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="experiment_id" value="{{ experiment.id }}">
+  <div class="card practical-live-table-card"><div class="table-wrap"><table class="practical-live-table theory-live-table"><thead><tr><th>#</th><th>Roll No</th><th>Student</th><th>Performed Date</th><th>Save</th></tr></thead><tbody>
+  {% for st in students %}{% set item=completion_map.get(st.id) %}<tr data-theory-row data-student-search="{{ (st.roll_no ~ ' ' ~ st.name)|lower }}" data-student-id="{{ st.id }}" data-experiment-id="{{ experiment.id }}">
+    <td>{{ loop.index }}</td><td><strong>{{ st.roll_no }}</strong></td><td>{{ st.name }}</td><td><input class="theory-date-input" type="date" name="performed_date_{{ st.id }}" data-theory-date value="{{ item.performed_date if item else '' }}"></td><td><span class="practical-save-state {% if item and item.performed_date %}saved{% endif %}" data-theory-status>{% if item and item.performed_date %}Saved{% else %}—{% endif %}</span></td>
+  </tr>{% else %}<tr><td colspan="5">No students are available in this Theory Class.</td></tr>{% endfor %}
+  </tbody></table></div></div>
+  <div class="practical-sticky-save"><span>Dates autosave when changed. Use Save All as a final checkpoint.</span><button type="submit">Save All</button></div>
+</form>
+<script src="{{ url_for('static',filename='theory_class.js') }}" defer></script>
+{% endblock %}

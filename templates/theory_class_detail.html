@@ -1,0 +1,39 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head practical-register-head">
+  <div><a class="back-link" href="{{ url_for('theory_classes') }}">← Theory Class</a><h1>{{ register.subject }}</h1>{% if register.course_code or register.section %}<p class="muted">{% if register.course_code %}{{ register.course_code }}{% endif %}{% if register.course_code and register.section %} · {% endif %}{% if register.section %}{{ register.section }}{% endif %}</p>{% endif %}</div>
+  <div class="actions"><a class="btn secondary" href="{{ url_for('theory_export',register_id=register.id,fmt='xlsx') }}">Export Excel</a>{% if experiments and students %}<a class="btn" href="{{ url_for('theory_live_entry',register_id=register.id) }}">Live Entry</a>{% endif %}</div>
+</div>
+
+<div class="grid theory-register-stats">
+  <div class="stat-card"><strong>{{ students|length }}</strong><span>Students</span></div>
+  <div class="stat-card"><strong>{{ experiments|length }}</strong><span>Experiments</span></div>
+  <div class="stat-card"><strong>{{ started }}</strong><span>Students Started</span></div>
+  <div class="stat-card"><strong>{{ performed_rows|length }}</strong><span>Performed Entries</span></div>
+</div>
+
+<div class="grid practical-setup-grid">
+  <div class="card practical-setup-card">
+    <div class="import-header"><div><h2>Student List</h2></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('theory_template',register_id=register.id,kind='students',fmt='xlsx') }}">Template</a></div></div>
+    <form method="post" action="{{ url_for('theory_students_import',register_id=register.id) }}" enctype="multipart/form-data" class="import-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="file" name="roster_file" accept=".xlsx,.csv" required><button>Upload Students</button></form>
+    <p class="import-hint">Uses the same student-sheet format as Practical Marks.</p>
+  </div>
+  <div class="card practical-setup-card">
+    <div class="import-header"><div><h2>Experiment List</h2><span class="muted">Excel/CSV or paste one experiment per line.</span></div><div class="actions template-actions"><a class="btn secondary small" href="{{ url_for('theory_template',register_id=register.id,kind='experiments',fmt='xlsx') }}">Template</a></div></div>
+    <form method="post" action="{{ url_for('theory_experiments_import',register_id=register.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="file" name="experiment_file" accept=".xlsx,.csv"><label class="practical-or">or paste list</label><textarea name="experiment_text" rows="4" placeholder="1 | Button&#10;2 | EditText and TextView&#10;3 | Activity lifecycle demonstration"></textarea><button>Update Experiments</button></form>
+  </div>
+</div>
+
+<div class="card">
+  <div class="import-header"><div><h2>Experiments</h2></div>{% if experiments and students %}<a class="btn" href="{{ url_for('theory_live_entry',register_id=register.id,experiment_id=experiments[0].id) }}">Start Live Entry</a>{% endif %}</div>
+  <div class="table-wrap"><table><tr><th>No.</th><th>Experiment</th><th>Performed</th><th>Live Entry</th></tr>
+  {% for e in experiments %}<tr><td><strong>{{ e.experiment_no }}</strong></td><td>{{ e.title }}</td><td>{{ performed_by_experiment.get(e.id,0) }} / {{ students|length }}</td><td>{% if students %}<a class="btn secondary small" href="{{ url_for('theory_live_entry',register_id=register.id,experiment_id=e.id) }}">Enter Date</a>{% else %}<span class="muted">Upload students first</span>{% endif %}</td></tr>{% else %}<tr><td colspan="4">No experiments uploaded yet.</td></tr>{% endfor %}
+  </table></div>
+</div>
+
+<div class="card">
+  <div class="import-header"><div><h2>Student Progress</h2><span class="muted">No attendance or marks are maintained here.</span></div><a class="btn secondary small" href="{{ url_for('theory_export',register_id=register.id,fmt='csv') }}">Export CSV</a></div>
+  <div class="table-wrap"><table><tr><th>#</th><th>Roll No</th><th>Name</th><th>Experiments Performed</th><th>Last Performed Date</th></tr>
+  {% for row in summary %}<tr><td>{{ loop.index }}</td><td><strong>{{ row.student.roll_no }}</strong></td><td>{{ row.student.name }}</td><td>{{ row.completed }} / {{ experiments|length }}</td><td>{{ row.last_date or '—' }}</td></tr>{% else %}<tr><td colspan="5">No students uploaded yet.</td></tr>{% endfor %}
+  </table></div>
+</div>
+{% endblock %}
