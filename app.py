@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.27.2'
+APP_VERSION='2.27.3'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -5170,6 +5170,10 @@ def delete_exam(exam_id):
             select(func.count()).select_from(Answer).where(Answer.attempt_id.in_(attempt_ids))
         ) or 0
 
+        # Delete every child row that references an attempt before deleting
+        # the attempt itself. V91+ diagnostic tables also carry FK references.
+        s.execute(delete(AttemptDiagnosticEvent).where(AttemptDiagnosticEvent.attempt_id.in_(attempt_ids)))
+        s.execute(delete(AttemptDiagnostic).where(AttemptDiagnostic.attempt_id.in_(attempt_ids)))
         s.execute(delete(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id.in_(attempt_ids)))
         s.execute(delete(IntegrityEvent).where(IntegrityEvent.attempt_id.in_(attempt_ids)))
         s.execute(delete(Answer).where(Answer.attempt_id.in_(attempt_ids)))
