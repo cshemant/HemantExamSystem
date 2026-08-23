@@ -29,6 +29,7 @@
   let examFinished=false;
   let shellActive=false;
   let fullscreenEstablished=false;
+  let submissionInProgress=false;
   let guard=null;
 
   async function refreshPin(){
@@ -70,7 +71,7 @@
   }
 
   async function tryRestoreFullscreen(){
-    if(examFinished || !shellActive || !fullscreenEstablished)return;
+    if(examFinished || submissionInProgress || !shellActive || !fullscreenEstablished)return;
     try{
       if(document.documentElement.requestFullscreen && !document.fullscreenElement){
         await document.documentElement.requestFullscreen({navigationUI:'hide'});
@@ -81,7 +82,7 @@
   }
 
   document.addEventListener('fullscreenchange',async()=>{
-    if(examFinished || !shellActive)return;
+    if(examFinished || !shellActive || submissionInProgress)return;
     if(document.fullscreenElement){
       fullscreenEstablished=true;
       if(guard)guard.hidden=true;
@@ -137,7 +138,13 @@
   window.addEventListener('message',event=>{
     if(event.origin!==window.location.origin)return;
     const data=event.data || {};
+    if(data.type==='secure-exam-submitting' && Number(data.exam_id)==={{ exam.id }}){
+      submissionInProgress=true;
+      if(guard)guard.hidden=true;
+      return;
+    }
     if(data.type==='secure-exam-submitted' && Number(data.exam_id)==={{ exam.id }}){
+      submissionInProgress=true;
       finishShell(data.url || '{{ url_for("submitted",exam_id=exam.id) }}');
     }
   });

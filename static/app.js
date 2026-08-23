@@ -2,6 +2,17 @@ function csrfToken(){
   const el=document.querySelector('meta[name="csrf-token"]');
   return el ? el.getAttribute('content') : '';
 }
+let examSubmissionInProgress=false;
+function beginExamSubmission(examId,reason='MANUAL'){
+  examSubmissionInProgress=true;
+  try{
+    if(window.parent!==window){
+      window.parent.postMessage({type:'secure-exam-submitting',exam_id:Number(examId),reason:String(reason||'MANUAL')},window.location.origin);
+    }
+  }catch(_err){}
+}
+function isExamSubmissionInProgress(){return examSubmissionInProgress===true;}
+
 async function saveAnswer(examId, questionId, answer, retryCount=0){
   const status=document.getElementById('save-status');
   if(status) status.textContent='Saving…';
@@ -34,7 +45,7 @@ function startTimer(endEpoch){
     const left=Math.max(0,Math.floor(endEpoch-Date.now()/1000));
     const h=Math.floor(left/3600),m=Math.floor((left%3600)/60),s=left%60;
     if(timer) timer.textContent=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-    if(left<=0){if(handle)clearInterval(handle);if(form)form.submit();}
+    if(left<=0){if(handle)clearInterval(handle);if(form){let r=form.querySelector('input[name="submission_reason"]');if(!r){r=document.createElement('input');r.type='hidden';r.name='submission_reason';form.appendChild(r);}r.value='TIME_EXPIRED';beginExamSubmission(Number(form.getAttribute('data-exam-integrity')||0),'TIME_EXPIRED');form.submit();}}
   };
   tick();handle=setInterval(tick,1000);
 }
@@ -82,6 +93,7 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
     }
   };
   document.addEventListener('visibilitychange',async()=>{
+    if(examSubmissionInProgress)return;
     if(document.hidden){const data=await logIntegrity(examId,'tab_hidden','Exam tab became hidden');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();}
   });
   if(requireFullscreen){
@@ -90,11 +102,37 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
       catch(_err){fullscreenBtn.textContent='Full Screen Unavailable';}
     });}
     document.addEventListener('fullscreenchange',async()=>{
+      if(examSubmissionInProgress)return;
       if(document.fullscreenElement){enteredFullscreen=true;if(fullscreenBtn)fullscreenBtn.textContent='Full Screen Active';return;}
       if(enteredFullscreen){const data=await logIntegrity(examId,'fullscreen_exit','Full-screen mode exited');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();if(fullscreenBtn)fullscreenBtn.textContent='Re-enter Full Screen';}
     });
   }
 }
+
+function initExamSubmitConfirmation(){
+  const form=document.getElementById('exam-form');
+  const openBtn=document.getElementById('exam-submit-open');
+  const dialog=document.getElementById('exam-submit-confirm');
+  const yesBtn=document.getElementById('exam-submit-confirm-yes');
+  const noBtn=document.getElementById('exam-submit-confirm-no');
+  if(!form || !openBtn || !dialog || !yesBtn || !noBtn)return;
+  const examId=Number(form.getAttribute('data-exam-integrity')||0);
+  const close=()=>{dialog.hidden=true;};
+  openBtn.addEventListener('click',()=>{dialog.hidden=false;yesBtn.focus();});
+  noBtn.addEventListener('click',close);
+  dialog.addEventListener('click',event=>{if(event.target===dialog)close();});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape' && !dialog.hidden){event.preventDefault();close();}});
+  yesBtn.addEventListener('click',()=>{
+    if(examSubmissionInProgress)return;
+    let reason=form.querySelector('input[name="submission_reason"]');
+    if(!reason){reason=document.createElement('input');reason.type='hidden';reason.name='submission_reason';form.appendChild(reason);}
+    reason.value='MANUAL';
+    yesBtn.disabled=true;noBtn.disabled=true;
+    beginExamSubmission(examId,'MANUAL');
+    form.submit();
+  });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initExamSubmitConfirmation);else initExamSubmitConfirmation();
 
 function initMobileMenu(){
   const toggle=document.querySelector('.mobile-menu-toggle');
@@ -251,6 +289,7 @@ function initFreeAnswerAutosave(){
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initFreeAnswerAutosave); else initFreeAnswerAutosave();
 
 function startExamHeartbeat(examId,seconds=15){
+  try{fetch('/student/exam-page-loaded',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify({exam_id:examId,state:document.hidden?'hidden':'active'})});}catch(_err){}
   const interval=Math.max(10,Math.min(60,Number(seconds)||15))*1000;
   const ping=async(state='active')=>{
     try{await fetch('/student/heartbeat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify({exam_id:examId,state})});}catch(_err){}

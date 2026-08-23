@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.26.1'
+APP_VERSION='2.27.2'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -492,6 +492,27 @@ class AttemptHeartbeat(Base):
     answer_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     client_state:Mapped[str]=mapped_column(String,nullable=False,default='active')
     client_fingerprint:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class AttemptDiagnostic(Base):
+    __tablename__='attempt_diagnostics'
+    __table_args__=(UniqueConstraint('attempt_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False)
+    page_loaded_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    submission_reason:Mapped[str]=mapped_column(String,nullable=False,default='')
+    client_ip:Mapped[str]=mapped_column(String,nullable=False,default='')
+    user_agent:Mapped[str]=mapped_column(String,nullable=False,default='')
+    client_fingerprint:Mapped[str]=mapped_column(String,nullable=False,default='')
+    last_client_state:Mapped[str]=mapped_column(String,nullable=False,default='')
+    updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class AttemptDiagnosticEvent(Base):
+    __tablename__='attempt_diagnostic_events'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False)
+    event_type:Mapped[str]=mapped_column(String,nullable=False)
+    details:Mapped[str]=mapped_column(String,nullable=False,default='')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class AuthThrottle(Base):
     __tablename__='auth_throttles'
@@ -2235,8 +2256,29 @@ def recalculate_attempt_score(s,attempt,questions=None,saved=None):
     return attempt
 
 
-def finalize_attempt(s,attempt):
+def _diagnostic_client_ip():
+    # Diagnostic only: preserve both the edge-forwarded client IP and direct peer.
+    forwarded=(request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+    return (forwarded or request.remote_addr or '')[:120]
+
+def _attempt_diagnostic(s,attempt,create=True):
+    row=s.scalar(select(AttemptDiagnostic).where(AttemptDiagnostic.attempt_id==attempt.id))
+    if not row and create:
+        ua=(request.headers.get('User-Agent') or '')[:500]
+        ip=_diagnostic_client_ip()
+        fp=hashlib.sha256((ua+'|'+ip).encode('utf-8')).hexdigest()[:24]
+        row=AttemptDiagnostic(attempt_id=attempt.id,client_ip=ip,user_agent=ua,client_fingerprint=fp,updated_at=now_iso())
+        s.add(row);s.flush()
+    return row
+
+def _diagnostic_event(s,attempt,event_type,details=''):
+    s.add(AttemptDiagnosticEvent(attempt_id=attempt.id,event_type=str(event_type)[:60],details=str(details)[:1000],created_at=now_iso()))
+
+def finalize_attempt(s,attempt,reason='SYSTEM_FINALIZE'):
     if attempt.status!='submitted':
+        diag=_attempt_diagnostic(s,attempt,True)
+        diag.submission_reason=(reason or 'SYSTEM_FINALIZE')[:60];diag.updated_at=now_iso()
+        _diagnostic_event(s,attempt,'submission',diag.submission_reason)
         recalculate_attempt_score(s,attempt);attempt.status='submitted';attempt.submitted_at=now_iso();s.commit()
     # Practical attendance and Viva sync are best-effort: a practical mapping
     # issue must never break the student's normal exam submission/result flow.
@@ -5536,6 +5578,7 @@ def result_rows(s,exam_id=None):
     integrity_by_attempt={}
     for ev in s.scalars(select(IntegrityEvent).order_by(IntegrityEvent.created_at,IntegrityEvent.id)).all():
         integrity_by_attempt.setdefault(ev.attempt_id,[]).append(ev)
+    diagnostic_by_attempt={d.attempt_id:d for d in s.scalars(select(AttemptDiagnostic)).all()}
 
     for a,st,e in raw:
         events=integrity_by_attempt.get(a.id,[])
@@ -5545,6 +5588,11 @@ def result_rows(s,exam_id=None):
         grading_status=getattr(a,'grading_status','complete') or 'complete'
         if a.status=='submitted' and grading_status=='pending':grade='Pending grading'
         grp=student_group(s,st.id)
+        diag=diagnostic_by_attempt.get(a.id)
+        duration_seconds=None
+        if a.submitted_at:
+            try:duration_seconds=max(0,int((parse_dt(a.submitted_at)-parse_dt(a.started_at)).total_seconds()))
+            except Exception:pass
         rows.append(type('ResultRow',(),{
             'attempt_id':a.id,
             'roll_no':st.roll_no,
@@ -5564,6 +5612,8 @@ def result_rows(s,exam_id=None):
             'tab_switches':tab_switches,
             'fullscreen_exits':fullscreen_exits,
             'integrity_events':events,
+            'submission_reason':(diag.submission_reason if diag and diag.submission_reason else ''),
+            'duration_seconds':duration_seconds,
         })())
     return rows
 
@@ -5571,6 +5621,81 @@ def result_rows(s,exam_id=None):
 @staff_required
 def results():
     s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);exams_list=s.scalars(select(Exam).order_by(Exam.title)).all();return render_template('results.html',rows=rows,exams=exams_list,selected_exam_id=exam_id)
+
+
+def parse_client_user_agent(user_agent):
+    """Return a concise browser, operating system and device type for admin diagnostics."""
+    ua=(user_agent or '').strip()
+    if not ua:
+        return {'browser':'Unknown','os':'Unknown','device':'Unknown'}
+
+    # Browser: check Chromium-family variants before generic Chrome/Safari tokens.
+    browser='Unknown'
+    browser_patterns=[
+        ('Microsoft Edge', r'(?:EdgA|EdgiOS|Edg)/([\d.]+)'),
+        ('Opera', r'(?:OPR|Opera)/([\d.]+)'),
+        ('Samsung Internet', r'SamsungBrowser/([\d.]+)'),
+        ('Chrome', r'(?:Chrome|CriOS)/([\d.]+)'),
+        ('Firefox', r'(?:Firefox|FxiOS)/([\d.]+)'),
+        ('Safari', r'Version/([\d.]+).*Safari/'),
+    ]
+    for name,pattern in browser_patterns:
+        match=re.search(pattern,ua,re.I)
+        if match:
+            major=(match.group(1).split('.')[0] if match.group(1) else '')
+            browser=f'{name} {major}'.strip()
+            break
+
+    # Operating system.
+    os_name='Unknown'
+    match=re.search(r'Android\s+([\d.]+)',ua,re.I)
+    if match:
+        os_name=f'Android {match.group(1)}'
+    else:
+        match=re.search(r'(?:iPhone|CPU(?: iPhone)? OS)\s+([\d_]+)',ua,re.I)
+        if match:
+            os_name=f'iOS {match.group(1).replace("_",".")}'
+        elif 'Windows NT 10.0' in ua:
+            os_name='Windows 10/11'
+        elif 'Windows NT 6.3' in ua:
+            os_name='Windows 8.1'
+        elif 'Windows NT 6.1' in ua:
+            os_name='Windows 7'
+        else:
+            match=re.search(r'Mac OS X\s+([\d_]+)',ua,re.I)
+            if match:
+                os_name=f'macOS {match.group(1).replace("_",".")}'
+            elif re.search(r'Linux',ua,re.I):
+                os_name='Linux'
+
+    # Device category. Tablet checks come first because many tablets also contain "Mobile".
+    if re.search(r'iPad|Tablet|SM-T|Nexus 7|Nexus 9|Nexus 10',ua,re.I):
+        device='Tablet'
+    elif re.search(r'Mobile|iPhone|Android.*Mobile',ua,re.I):
+        device='Mobile'
+    else:
+        device='Desktop'
+
+    return {'browser':browser,'os':os_name,'device':device}
+
+@app.route('/admin/attempt/<int:attempt_id>/audit')
+@staff_required
+def attempt_audit(attempt_id):
+    s=DB();attempt=s.get(Attempt,attempt_id)
+    if not attempt:abort(404)
+    student=s.get(Student,attempt.student_id);exam=s.get(Exam,attempt.exam_id)
+    diag=s.scalar(select(AttemptDiagnostic).where(AttemptDiagnostic.attempt_id==attempt.id))
+    heart=s.scalar(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id==attempt.id))
+    events=s.scalars(select(AttemptDiagnosticEvent).where(AttemptDiagnosticEvent.attempt_id==attempt.id).order_by(AttemptDiagnosticEvent.created_at,AttemptDiagnosticEvent.id)).all()
+    integrity=s.scalars(select(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id).order_by(IntegrityEvent.created_at,IntegrityEvent.id)).all()
+    answers=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id).order_by(Answer.saved_at)).all()
+    seconds_spent=None
+    if attempt.submitted_at:
+        try:seconds_spent=max(0,int((parse_dt(attempt.submitted_at)-parse_dt(attempt.started_at)).total_seconds()))
+        except Exception:pass
+    last_answer=answers[-1] if answers else None
+    client_info=parse_client_user_agent(diag.user_agent if diag else '')
+    return render_template('attempt_audit.html',attempt=attempt,student=student,exam=exam,diag=diag,heartbeat=heart,events=events,integrity=integrity,answer_count=len(answers),last_answer=last_answer,seconds_spent=seconds_spent,client_info=client_info)
 
 @app.route('/admin/attempt/<int:attempt_id>/grade',methods=['GET','POST'])
 @staff_required
@@ -5609,8 +5734,8 @@ def manual_grade_attempt(attempt_id):
 @app.route('/admin/results/export/<fmt>')
 @staff_required
 def export_results(fmt):
-    s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);headers=['roll_no','name','batch_section','exam','status','grading_status','score','total_marks','percentage','grade','tab_switches','fullscreen_exits','total_integrity_events','started','submitted']
-    matrix=[[r.roll_no,r.name,r.group_label,r.title,r.status,r.grading_status,r.score if r.score is not None else '',r.total_marks if r.total_marks is not None else '',r.percentage if r.status=='submitted' else '',r.grade if r.status=='submitted' else '',r.tab_switches,r.fullscreen_exits,r.violations,r.started_at,r.submitted_at or ''] for r in rows]
+    s=DB();exam_id=request.args.get('exam_id',type=int);rows=result_rows(s,exam_id);headers=['roll_no','name','batch_section','exam','status','grading_status','score','total_marks','percentage','grade','tab_switches','fullscreen_exits','total_integrity_events','started','submitted','duration_seconds','submission_reason']
+    matrix=[[r.roll_no,r.name,r.group_label,r.title,r.status,r.grading_status,r.score if r.score is not None else '',r.total_marks if r.total_marks is not None else '',r.percentage if r.status=='submitted' else '',r.grade if r.status=='submitted' else '',r.tab_switches,r.fullscreen_exits,r.violations,r.started_at,r.submitted_at or '',r.duration_seconds if r.duration_seconds is not None else '',r.submission_reason or ''] for r in rows]
     suffix=f'_exam_{exam_id}' if exam_id else '_all'
     if fmt=='csv':
         out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'exam_results{suffix}.csv')
@@ -5618,7 +5743,7 @@ def export_results(fmt):
         wb=Workbook();ws=wb.active;ws.title='Results';ws.append(headers)
         for row in matrix:ws.append(row)
         for cell in ws[1]:cell.font=Font(bold=True)
-        widths=[16,28,34,30,14,18,10,12,12,16,14,16,20,24,24]
+        widths=[16,28,34,30,14,18,10,12,12,16,14,16,20,24,24,18,22]
         for idx,width in enumerate(widths,1):ws.column_dimensions[chr(64+idx)].width=width
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'exam_results{suffix}.xlsx')
     abort(404)
@@ -6610,7 +6735,7 @@ def take_exam(exam_id):
             s.add(AttemptQuestion(attempt_id=attempt.id,question_id=qid,position=pos,option_order=''.join(keys)))
         s.commit()
     end_dt=parse_dt(attempt.end_at)
-    if now_dt()>=end_dt:finalize_attempt(s,attempt);return redirect(url_for('submitted',exam_id=exam_id))
+    if now_dt()>=end_dt:finalize_attempt(s,attempt,'TIME_EXPIRED');return redirect(url_for('submitted',exam_id=exam_id))
     aq_rows=s.scalars(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id).order_by(AttemptQuestion.position)).all()
     if not aq_rows:
         qids=[int(x) for x in attempt.question_order.split(',') if x]
@@ -6638,7 +6763,7 @@ def save_answer():
     if not attempt:return jsonify(error='Attempt not found'),404
     if attempt.status=='submitted':return jsonify(saved=False,submitted=True)
     if not secure_exam_device_allowed(s,attempt):return jsonify(error='Exam is locked to another device.',device_locked=True),409
-    if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt);return jsonify(saved=False,submitted=True)
+    if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return jsonify(saved=False,submitted=True)
     if qid not in attempt_question_ids(s,attempt):return jsonify(error='Question not part of this attempt'),400
     question=s.get(Question,qid)
     try:save_answer_record(s,attempt.id,qid,ans,question)
@@ -6674,7 +6799,7 @@ def integrity_event():
     level='recorded'
     if auto_enforce and count>=limit:
         audit_event(s,'exam_auto_submitted_integrity','exam',exam_id,f'student_id={attempt.student_id}, violations={count}, limit={limit}')
-        finalize_attempt(s,attempt)
+        finalize_attempt(s,attempt,'INTEGRITY_LIMIT')
         return jsonify(saved=True,count=count,limit=limit,submitted=True,level='terminated',message='Exam automatically submitted because the integrity violation limit was reached.')
     if auto_enforce:
         remaining=max(0,limit-count)
@@ -6683,6 +6808,20 @@ def integrity_event():
         else:
             level='warning';message=f'Warning {count}: integrity violation recorded. {remaining} more violation(s) will automatically submit your examination.'
     s.commit();return jsonify(saved=True,count=count,limit=limit,submitted=False,level=level,message=message,duplicate=duplicate)
+
+@app.route('/student/exam-page-loaded',methods=['POST'])
+@student_required
+def student_exam_page_loaded():
+    data=request.get_json(silent=True) or {}
+    try:exam_id=int(data.get('exam_id'))
+    except Exception:return jsonify(saved=False),400
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
+    if not attempt:return jsonify(saved=False),404
+    diag=_attempt_diagnostic(s,attempt,True)
+    if not diag.page_loaded_at:diag.page_loaded_at=now_iso()
+    diag.updated_at=now_iso()
+    _diagnostic_event(s,attempt,'page_loaded',f'state={str(data.get("state") or "active")[:30]}')
+    s.commit();return jsonify(saved=True,server_time=now_iso())
 
 @app.route('/student/heartbeat',methods=['POST'])
 @student_required
@@ -6697,8 +6836,11 @@ def student_heartbeat():
     if device_lock:device_lock.last_seen_at=now_iso()
     count=s.scalar(select(func.count()).select_from(Answer).where(Answer.attempt_id==attempt.id)) or 0
     row=s.scalar(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id==attempt.id));fingerprint=hashlib.sha256(((request.headers.get('User-Agent') or '')+'|'+(request.remote_addr or '')).encode('utf-8')).hexdigest()[:24]
-    if not row:row=AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=int(count),client_state=str(data.get('state') or 'active')[:30],client_fingerprint=fingerprint);s.add(row)
-    else:row.last_seen_at=now_iso();row.answer_count=int(count);row.client_state=str(data.get('state') or 'active')[:30];row.client_fingerprint=fingerprint
+    state=str(data.get('state') or 'active')[:30]
+    if not row:row=AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=int(count),client_state=state,client_fingerprint=fingerprint);s.add(row)
+    else:row.last_seen_at=now_iso();row.answer_count=int(count);row.client_state=state;row.client_fingerprint=fingerprint
+    diag=_attempt_diagnostic(s,attempt,True);diag.last_client_state=state;diag.updated_at=now_iso()
+    _diagnostic_event(s,attempt,'heartbeat',f'state={state}; answers={int(count)}')
     s.commit();return jsonify(saved=True,server_time=now_iso())
 
 @app.route('/student/exam/<int:exam_id>/submit',methods=['POST'])
@@ -6716,7 +6858,10 @@ def submit_exam(exam_id):
             value=','.join(values) if canonical_question_type(question.question_type)=='multiple_select' else values[0]
             try:save_answer_record(s,attempt.id,qid,value[:MAX_ANSWER_LENGTH],question)
             except ValueError:continue
-        s.commit();finalize_attempt(s,attempt)
+        s.commit()
+        client_reason=(request.form.get('submission_reason') or 'MANUAL').strip().upper()
+        if client_reason not in {'MANUAL','TIME_EXPIRED'}:client_reason='MANUAL'
+        finalize_attempt(s,attempt,client_reason)
     # The secure iframe launch token is single-session exam state. Once the
     # paper is submitted, discard it before showing the result page.
     clear_secure_exam_launch_token(exam_id)
@@ -6727,7 +6872,7 @@ def submit_exam(exam_id):
 def submitted(exam_id):
     s=DB();exam=s.get(Exam,exam_id);attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not exam or not attempt:abort(404)
-    if attempt.status!='submitted' and now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt)
+    if attempt.status!='submitted' and now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED')
     if attempt.status=='submitted':
         try:
             attendance_result=sync_practical_attendance_from_attempt(s,attempt)

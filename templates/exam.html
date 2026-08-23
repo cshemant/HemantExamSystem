@@ -20,6 +20,16 @@
     <div class="mini-meta">This response will be manually graded by faculty after submission.</div>
   {% endif %}
 </div>{% endfor %}
-<button onclick="return confirm('Submit exam now?')">Submit Exam</button></form>
+<button type="button" id="exam-submit-open">Submit Exam</button>
+<div id="exam-submit-confirm" class="exam-submit-confirm" hidden role="dialog" aria-modal="true" aria-labelledby="exam-submit-confirm-title">
+  <div class="exam-submit-confirm-card">
+    <h2 id="exam-submit-confirm-title">Submit exam?</h2>
+    <p>Your saved answers will be submitted and the exam will end.</p>
+    <div class="actions">
+      <button type="button" id="exam-submit-confirm-no" class="btn secondary">Cancel</button>
+      <button type="button" id="exam-submit-confirm-yes" class="btn">Confirm & Submit</button>
+    </div>
+  </div>
+</div></form>
 <script>startTimer({{ end_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});</script>
 {% endblock %}

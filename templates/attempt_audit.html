@@ -1,0 +1,28 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><a href="{{ url_for('results',exam_id=exam.id) }}">← Results</a><h1>Exam Submission Audit</h1><div class="mini-meta">{{ student.roll_no }} · {{ student.name }} · {{ exam.title }}</div></div></div>
+<div class="card">
+  <h2>Attempt summary</h2>
+  <div class="audit-grid">
+    <div><span>Started</span><strong>{{ attempt.started_at|dt }}</strong></div>
+    <div><span>Exam page loaded</span><strong>{{ diag.page_loaded_at|dt if diag and diag.page_loaded_at else '-' }}</strong></div>
+    <div><span>Submitted</span><strong>{{ attempt.submitted_at|dt if attempt.submitted_at else '-' }}</strong></div>
+    <div><span>Time spent</span><strong>{% if seconds_spent is not none %}{{ seconds_spent }} seconds ({{ (seconds_spent // 60) }}m {{ seconds_spent % 60 }}s){% else %}-{% endif %}</strong></div>
+    <div><span>Submission reason</span><strong>{{ diag.submission_reason if diag and diag.submission_reason else 'Legacy / unknown' }}</strong></div>
+    <div><span>Answers saved</span><strong>{{ answer_count }}</strong></div>
+    <div><span>Last answer save</span><strong>{{ last_answer.saved_at|dt if last_answer else '-' }}</strong></div>
+    <div><span>Last heartbeat</span><strong>{{ heartbeat.last_seen_at|dt if heartbeat else '-' }}</strong></div>
+    <div><span>Last client state</span><strong>{{ diag.last_client_state if diag and diag.last_client_state else (heartbeat.client_state if heartbeat else '-') }}</strong></div>
+    <div><span>Client IP</span><strong>{{ diag.client_ip if diag and diag.client_ip else '-' }}</strong></div>
+    <div><span>Device fingerprint</span><strong>{{ diag.client_fingerprint if diag and diag.client_fingerprint else '-' }}</strong></div>
+    <div><span>Browser</span><strong>{{ client_info.browser }}</strong></div>
+    <div><span>Operating System</span><strong>{{ client_info.os }}</strong></div>
+    <div><span>Device Type</span><strong>{{ client_info.device }}</strong></div>
+  </div>
+</div>
+<div class="card"><h2>Integrity events</h2>
+{% if integrity %}<div class="table-wrap"><table><tr><th>Time</th><th>Event</th><th>Details</th></tr>{% for ev in integrity %}<tr><td>{{ ev.created_at|dt }}</td><td>{{ ev.event_type }}</td><td>{{ ev.details or '-' }}</td></tr>{% endfor %}</table></div>{% else %}<p class="mini-meta">No integrity events recorded.</p>{% endif %}
+</div>
+<div class="card"><h2>Diagnostic timeline</h2>
+{% if events %}<div class="table-wrap"><table><tr><th>Time</th><th>Event</th><th>Details</th></tr>{% for ev in events %}<tr><td>{{ ev.created_at|dt }}</td><td>{{ ev.event_type }}</td><td>{{ ev.details or '-' }}</td></tr>{% endfor %}</table></div>{% else %}<p class="mini-meta">No diagnostic events are available for this legacy attempt.</p>{% endif %}
+</div>
+{% endblock %}

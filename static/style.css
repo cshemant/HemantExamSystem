@@ -589,3 +589,10 @@ body.secure-exam-running .secure-exam-shell{visibility:visible!important}
 .theory-date-input{min-width:165px!important;margin:0}
 @media(max-width:1000px){.theory-register-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.theory-live-toolbar{grid-template-columns:1fr}}
 @media(max-width:650px){.theory-register-stats{grid-template-columns:1fr 1fr}}
+
+.audit-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.audit-grid>div{padding:12px;border:1px solid #e2e8f0;border-radius:12px}.audit-grid span{display:block;font-size:12px;color:#64748b;margin-bottom:5px}.audit-grid strong{word-break:break-word}.audit-grid .wide{grid-column:1/-1}@media(max-width:800px){.audit-grid{grid-template-columns:1fr}}
+
+.exam-submit-confirm{position:fixed;inset:0;z-index:10000;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:20px}
+.exam-submit-confirm[hidden]{display:none}
+.exam-submit-confirm-card{width:min(460px,100%);background:#fff;border-radius:18px;padding:24px;box-shadow:0 24px 70px rgba(15,23,42,.3)}
+.exam-submit-confirm-card h2{margin:0 0 8px}.exam-submit-confirm-card p{margin:0 0 20px;color:#475569}.exam-submit-confirm-card .actions{display:flex;justify-content:flex-end;gap:10px}
