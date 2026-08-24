@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.28.0'
+APP_VERSION='2.29.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -3417,12 +3417,14 @@ def practical_exam_metadata_for_exam(s,exam_id):
 
 
 
-def resolve_practical_target_for_student(s,student,experiment_no,subject=''):
-    """Resolve one practical row using full roll identity + exact experiment serial.
+def resolve_practical_target_for_student(s,student,experiment_no,subject='',auto_sync=False):
+    """Resolve exactly one practical register/experiment for a student.
 
-    This intentionally mirrors the safe Viva mapping rules.  Section/year and
-    subject are only disambiguators; if more than one target remains, nothing is
-    graded automatically.
+    Resolution intentionally prefers institutional assignment (section/year +
+    subject + experiment) before falling back to roll matching.  This avoids a
+    false "mapping could not be resolved" when the login Student exists but the
+    corresponding PracticalStudent row has not yet been copied into the practical
+    register.  Auto-sync is allowed only when one register is uniquely identified.
     """
     if not student:
         return {'ok':False,'reason':'student_not_found','matches':0}
@@ -3434,26 +3436,17 @@ def resolve_practical_target_for_student(s,student,experiment_no,subject=''):
     if not target_experiment:
         return {'ok':False,'reason':'missing_practical_experiment_no','matches':0}
 
-    stmt=select(PracticalStudent)
-    roll_filters=[]
-    if student.registration_no:
-        roll_filters.append(func.lower(PracticalStudent.roll_no)==student.registration_no.strip().casefold())
-    if student.roll_no:
-        roll_filters.append(PracticalStudent.roll_no.endswith(student.roll_no))
-    if roll_filters:
-        stmt=stmt.where(or_(*roll_filters))
-    student_rows=s.scalars(stmt).all()
-    candidates=[]
-    for practical_student in student_rows:
-        practical_roll_key=_roll_identity_key(practical_student.roll_no)
-        if registration_key:
-            if practical_roll_key!=registration_key:
-                continue
-        elif not (login_key and practical_roll_key.endswith(login_key)):
-            continue
-        register=s.get(PracticalRegister,practical_student.register_id)
-        if not register:
-            continue
+    group=student_group(s,student.id)
+    group_section=(getattr(group,'section','') or '').strip().upper() if group else ''
+    group_year=(getattr(group,'academic_year','') or '').strip().casefold() if group else ''
+    target_subject=_practical_subject_key(subject)
+
+    # First identify registers that really contain this experiment.  Section and
+    # academic year are the strongest disambiguators because the same practical
+    # subject can legitimately exist for several classes at once.
+    register_rows=s.scalars(select(PracticalRegister).order_by(PracticalRegister.id)).all()
+    register_candidates=[]
+    for register in register_rows:
         experiment=s.scalar(select(PracticalExperiment).where(
             PracticalExperiment.register_id==register.id,
             PracticalExperiment.experiment_no==target_experiment
@@ -3461,36 +3454,114 @@ def resolve_practical_target_for_student(s,student,experiment_no,subject=''):
         if not experiment:
             experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()
             experiment=next((row for row in experiments if normalize_practical_exam_no(row.experiment_no)==target_experiment),None)
-        if experiment:
-            candidates.append((register,practical_student,experiment))
+        if not experiment:
+            continue
+        if group_section and _practical_register_section_code(register)!=group_section:
+            continue
+        if group_year and (register.academic_year or '').strip() and (register.academic_year or '').strip().casefold()!=group_year:
+            continue
+        if target_subject and _practical_subject_key(register.subject)!=target_subject:
+            continue
+        register_candidates.append((register,experiment))
 
-    match_basis='roll+experiment'
-    if len(candidates)>1:
-        group=student_group(s,student.id)
-        group_section=(getattr(group,'section','') or '').strip().upper() if group else ''
-        group_year=(getattr(group,'academic_year','') or '').strip().casefold() if group else ''
-        if group_section:
-            section_matches=[item for item in candidates if _practical_register_section_code(item[0])==group_section]
-            if group_year and len(section_matches)>1:
-                year_matches=[item for item in section_matches if (item[0].academic_year or '').strip().casefold()==group_year]
-                if year_matches:
-                    section_matches=year_matches
-            if len(section_matches)==1:
-                candidates=section_matches;match_basis='roll+experiment+section'
-            elif section_matches:
-                candidates=section_matches
-    if len(candidates)>1:
-        target_subject=_practical_subject_key(subject)
-        if target_subject:
-            subject_matches=[item for item in candidates if _practical_subject_key(item[0].subject)==target_subject]
-            if len(subject_matches)==1:
-                candidates=subject_matches;match_basis+=' + subject'
-            elif subject_matches:
-                candidates=subject_matches
-    if len(candidates)!=1:
-        return {'ok':False,'reason':'practical_target_not_unique','matches':len(candidates)}
-    register,practical_student,experiment=candidates[0]
-    return {'ok':True,'reason':'','register':register,'practical_student':practical_student,'experiment':experiment,'match_basis':match_basis}
+    # If strict subject matching found nothing, keep the safe section/year match.
+    # This supports older registers whose Subject field was blank or abbreviated.
+    if not register_candidates and group_section:
+        for register in register_rows:
+            if _practical_register_section_code(register)!=group_section:
+                continue
+            if group_year and (register.academic_year or '').strip() and (register.academic_year or '').strip().casefold()!=group_year:
+                continue
+            experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()
+            experiment=next((row for row in experiments if normalize_practical_exam_no(row.experiment_no)==target_experiment),None)
+            if experiment:
+                register_candidates.append((register,experiment))
+
+    # Locate this student inside the candidate register(s).  Compare normalized
+    # full registration numbers first, then the login roll as a suffix.  This
+    # safely handles values such as 20108 vs 2024/20108 or 2024-BCE-20108.
+    matches=[]
+    for register,experiment in register_candidates:
+        practical_students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id)).all()
+        matched_student=None
+        for row in practical_students:
+            row_key=_roll_identity_key(row.roll_no)
+            if registration_key and row_key==registration_key:
+                matched_student=row;break
+            if login_key and (row_key==login_key or row_key.endswith(login_key)):
+                matched_student=row;break
+        if not matched_student:
+            # Name fallback is intentionally allowed only inside a uniquely
+            # assigned class register and only for one exact normalized name.
+            wanted_name=re.sub(r'[^a-z0-9]+','',(student.name or '').casefold())
+            if wanted_name:
+                name_rows=[row for row in practical_students if re.sub(r'[^a-z0-9]+','',(row.name or '').casefold())==wanted_name]
+                if len(name_rows)==1:
+                    matched_student=name_rows[0]
+        if matched_student:
+            matches.append((register,matched_student,experiment))
+
+    if len(matches)==1:
+        register,practical_student,experiment=matches[0]
+        return {'ok':True,'reason':'','register':register,'practical_student':practical_student,'experiment':experiment,'match_basis':'section+subject+experiment+student'}
+
+    # Legacy fallback: search all PracticalStudent rows by roll, then disambiguate
+    # using the student's current academic assignment and exam subject.
+    if not matches:
+        stmt=select(PracticalStudent)
+        roll_filters=[]
+        if student.registration_no:
+            roll_filters.append(func.lower(PracticalStudent.roll_no)==student.registration_no.strip().casefold())
+        if student.roll_no:
+            roll_filters.append(PracticalStudent.roll_no.endswith(student.roll_no))
+        if roll_filters:
+            stmt=stmt.where(or_(*roll_filters))
+        student_rows=s.scalars(stmt).all()
+        for practical_student in student_rows:
+            practical_roll_key=_roll_identity_key(practical_student.roll_no)
+            if registration_key:
+                if practical_roll_key!=registration_key and not (login_key and practical_roll_key.endswith(login_key)):
+                    continue
+            elif not (login_key and practical_roll_key.endswith(login_key)):
+                continue
+            register=s.get(PracticalRegister,practical_student.register_id)
+            if not register:
+                continue
+            experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()
+            experiment=next((row for row in experiments if normalize_practical_exam_no(row.experiment_no)==target_experiment),None)
+            if not experiment:
+                continue
+            if group_section and _practical_register_section_code(register)!=group_section:
+                continue
+            if group_year and (register.academic_year or '').strip() and (register.academic_year or '').strip().casefold()!=group_year:
+                continue
+            if target_subject and _practical_subject_key(register.subject) and _practical_subject_key(register.subject)!=target_subject:
+                continue
+            matches.append((register,practical_student,experiment))
+
+    if len(matches)==1:
+        register,practical_student,experiment=matches[0]
+        return {'ok':True,'reason':'','register':register,'practical_student':practical_student,'experiment':experiment,'match_basis':'roll+experiment+assignment'}
+
+    # If the correct register is unique but the roster row is missing, safely
+    # create it from the authenticated Student record.  Never auto-create when
+    # more than one register remains possible.
+    if not matches and auto_sync and len(register_candidates)==1:
+        register,experiment=register_candidates[0]
+        preferred_roll=(student.registration_no or student.roll_no or '').strip()
+        if preferred_roll:
+            max_sequence=s.scalar(select(func.max(PracticalStudent.sequence)).where(PracticalStudent.register_id==register.id)) or 0
+            practical_student=PracticalStudent(
+                register_id=register.id,
+                sequence=int(max_sequence)+1,
+                roll_no=preferred_roll,
+                name=(student.name or '').strip(),
+                created_at=now_iso()
+            )
+            s.add(practical_student);s.flush()
+            return {'ok':True,'reason':'','register':register,'practical_student':practical_student,'experiment':experiment,'match_basis':'assignment-auto-sync','auto_synced':True}
+
+    return {'ok':False,'reason':'practical_target_not_unique' if len(matches)>1 else 'practical_student_not_mapped','matches':len(matches),'register_matches':len(register_candidates)}
 
 
 def _strip_code_comments(value):
@@ -3760,8 +3831,10 @@ def practical_code_exam_rows_for_student(s,student):
             continue
 
         target=resolve_practical_target_for_student(
-            s,student,meta.get('experiment_no',''),meta.get('subject','')
+            s,student,meta.get('experiment_no',''),meta.get('subject',''),auto_sync=True
         )
+        if target.get('auto_synced'):
+            s.commit()
         practical_mark=None;mark_maxima=None;mark_total_max=None
         if target.get('ok'):
             practical_mark=s.scalar(select(PracticalMark).where(
