@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.27.3'
+APP_VERSION='2.28.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -841,7 +841,7 @@ def apply_practical_exam_security_defaults(s,exam_id,cfg=None,security=None,forc
     security.start_grace_minutes=max(1,int(security.start_grace_minutes or 5))
     security.auto_submit_on_integrity_limit=True
     security.defer_results_until_end=True
-    security.block_ip_roll_switch=True
+    security.block_ip_roll_switch=False
     security.practical_defaults_applied=True
     cfg.updated_at=now_iso();security.updated_at=now_iso();s.flush()
     return True
@@ -2160,8 +2160,12 @@ def ensure_exam_ip_session_lock(s,exam,student,window=None):
     row=s.scalar(select(ExamIPSessionLock).where(ExamIPSessionLock.exam_id==exam.id,ExamIPSessionLock.session_scope==scope,ExamIPSessionLock.ip_hash==ip_hash))
     if row:
         if row.student_id!=student.id:
-            audit_event(s,'exam_ip_roll_switch_blocked','exam',exam.id,f'blocked_student={student.roll_no}, scope={scope}')
-            return False,row
+            # Multiple students on a campus/LAN commonly share one public IP
+            # through NAT. IP address is therefore diagnostic evidence only,
+            # never an identity/locking key. The per-student device lock below
+            # remains responsible for preventing the same account from moving
+            # between browsers/devices during a secured exam.
+            return True,row
         row.last_seen_at=now_iso()
         return True,row
     row=ExamIPSessionLock(exam_id=exam.id,student_id=student.id,session_scope=scope,ip_hash=ip_hash,roll_no_snapshot=student.roll_no,locked_at=now_iso(),last_seen_at=now_iso())
@@ -2173,8 +2177,9 @@ def ensure_exam_ip_session_lock(s,exam,student,window=None):
         # lock instead of returning a server error.
         existing=s.scalar(select(ExamIPSessionLock).where(ExamIPSessionLock.exam_id==exam.id,ExamIPSessionLock.session_scope==scope,ExamIPSessionLock.ip_hash==ip_hash))
         if existing and existing.student_id!=student.id:
-            audit_event(s,'exam_ip_roll_switch_blocked','exam',exam.id,f'blocked_student={student.roll_no}, scope={scope}')
-            return False,existing
+            # Shared NAT/public IP: allow the other student. Do not treat the
+            # IP as proof that the same person/browser is being reused.
+            return True,existing
         if existing:
             existing.last_seen_at=now_iso();return True,existing
         raise
@@ -2183,25 +2188,12 @@ def ensure_exam_ip_session_lock(s,exam,student,window=None):
 
 
 def current_practical_exam_ip_locks_for_login(s,student):
-    """Bind/check IP locks for practical sessions that are active at login time."""
-    now=now_dt().replace(tzinfo=None)
-    exams_list=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.id.desc())).all()
-    for exam in exams_list:
-        cfg=get_exam_config(s,exam.id,create=False);security=get_exam_security_policy(s,exam.id,create=False)
-        if not cfg or (cfg.exam_type or '').strip().lower()!='practical_exam' or not security or not security.block_ip_roll_switch:
-            continue
-        window=resolved_exam_window_for_student(s,student.id,exam)
-        if not window.get('assigned'):
-            continue
-        start,end=window.get('start'),window.get('end')
-        # Login-level locking is session-aware: only claim an IP while the
-        # configured common exam window is currently open. Exam-entry checks
-        # below still protect practical exams that have no clock configured.
-        if start and now<start-timedelta(minutes=SESSION_TIMEOUT_MINUTES):continue
-        if end and now>end:continue
-        if not start and not end:continue
-        ok,row=ensure_exam_ip_session_lock(s,exam,student,window)
-        if not ok:return False,exam,row
+    """Never block student login by IP.
+
+    Campus Wi-Fi, labs, hostels and mobile gateways routinely put many users
+    behind the same public IP (NAT). Per-student device locking is enforced
+    when the secured exam is entered instead.
+    """
     return True,None,None
 
 
