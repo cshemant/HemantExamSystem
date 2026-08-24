@@ -37,15 +37,19 @@ async function saveAnswer(examId, questionId, answer, retryCount=0){
     if(retryCount<10) setTimeout(()=>saveAnswer(examId,questionId,answer,retryCount+1),3000);
   }
 }
-function startTimer(endEpoch){
+function startTimer(endEpoch,serverNowEpoch){
   const timer=document.getElementById('timer');
   const form=document.getElementById('exam-form');
   let handle=null;
+  // Server time is authoritative; a wrong student-device clock must not end an exam.
+  const initialLeft=Math.max(0,Number(endEpoch)-Number(serverNowEpoch));
+  const monotonicStart=(window.performance&&performance.now)?performance.now():0;
   const tick=()=>{
-    const left=Math.max(0,Math.floor(endEpoch-Date.now()/1000));
+    const elapsed=monotonicStart&&window.performance?Math.max(0,(performance.now()-monotonicStart)/1000):0;
+    const left=Math.max(0,Math.ceil(initialLeft-elapsed));
     const h=Math.floor(left/3600),m=Math.floor((left%3600)/60),s=left%60;
     if(timer) timer.textContent=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-    if(left<=0){if(handle)clearInterval(handle);if(form){let r=form.querySelector('input[name="submission_reason"]');if(!r){r=document.createElement('input');r.type='hidden';r.name='submission_reason';form.appendChild(r);}r.value='TIME_EXPIRED';beginExamSubmission(Number(form.getAttribute('data-exam-integrity')||0),'TIME_EXPIRED');form.submit();}}
+    if(left<=0){if(handle)clearInterval(handle);if(form&&!examSubmissionInProgress){let r=form.querySelector('input[name="submission_reason"]');if(!r){r=document.createElement('input');r.type='hidden';r.name='submission_reason';form.appendChild(r);}r.value='TIME_EXPIRED';beginExamSubmission(Number(form.getAttribute('data-exam-integrity')||0),'TIME_EXPIRED');form.submit();}}
   };
   tick();handle=setInterval(tick,1000);
 }

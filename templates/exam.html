@@ -31,5 +31,5 @@
     </div>
   </div>
 </div></form>
-<script>startTimer({{ end_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});</script>
+<script>startTimer({{ end_epoch }},{{ server_now_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});</script>
 {% endblock %}

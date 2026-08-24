@@ -6754,7 +6754,7 @@ def take_exam(exam_id):
     saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();answers={a.question_id:answer_record_value(a) for a in saved}
     security=get_exam_security_policy(s,exam_id,create=False)
     secure_shell=bool(request.args.get('secure_shell')=='1' and security and security.require_exam_pin)
-    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),cfg=cfg,security=security,secure_shell=secure_shell)
+    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell)
 
 @app.route('/student/save-answer',methods=['POST'])
 @student_required
@@ -6865,6 +6865,16 @@ def submit_exam(exam_id):
         s.commit()
         client_reason=(request.form.get('submission_reason') or 'MANUAL').strip().upper()
         if client_reason not in {'MANUAL','TIME_EXPIRED'}:client_reason='MANUAL'
+        # TIME_EXPIRED is only a client hint. Never let a wrong/fast device clock
+        # submit an examination before the server-authoritative end time.
+        if client_reason=='TIME_EXPIRED' and now_dt()<parse_dt(attempt.end_at):
+            _diagnostic_event(s,attempt,'premature_timeout_blocked',f'client requested TIME_EXPIRED; server_end={attempt.end_at}')
+            s.commit()
+            security=get_exam_security_policy(s,exam_id,create=False)
+            if security and security.require_exam_pin and exam_pin_is_verified(exam_id):
+                launch_token=create_secure_exam_launch_token(exam_id)
+                return redirect(url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=launch_token))
+            return redirect(url_for('take_exam',exam_id=exam_id))
         finalize_attempt(s,attempt,client_reason)
     # The secure iframe launch token is single-session exam state. Once the
     # paper is submitted, discard it before showing the result page.
