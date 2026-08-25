@@ -81,6 +81,13 @@
     if(guard)guard.hidden=!!document.fullscreenElement;
   }
 
+  document.addEventListener('visibilitychange',async()=>{
+    if(examFinished || !shellActive || submissionInProgress)return;
+    if(!document.hidden)return;
+    const data=await logIntegrity({{ exam.id }},'tab_hidden','Secure exam tab/window became hidden',{navigateOnSubmit:false});
+    if(data && data.submitted){finishShell('{{ url_for("submitted",exam_id=exam.id) }}');}
+  });
+
   document.addEventListener('fullscreenchange',async()=>{
     if(examFinished || !shellActive || submissionInProgress)return;
     if(document.fullscreenElement){

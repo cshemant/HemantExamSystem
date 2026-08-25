@@ -2,8 +2,8 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="csrf-token" content="{{ csrf_token }}">
 <title>{{ title or 'Exam System' }} | {{ institution.short_name if institution else 'Learn with Hemant' }}</title>
-<link rel="stylesheet" href="{{ url_for('static',filename='style.css') }}">
-<script src="{{ url_for('static',filename='app.js') }}"></script>
+<link rel="stylesheet" href="{{ url_for('static',filename='style.css') }}?v={{ app_version }}">
+<script src="{{ url_for('static',filename='app.js') }}?v={{ app_version }}"></script>
 </head><body class="{% if secure_shell %}secure-exam-shell-page{% endif %}"><a class="skip-link" href="#main-content">Skip to main content</a>
 <header class="site-header">
 <div class="container nav">

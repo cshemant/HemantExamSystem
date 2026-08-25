@@ -596,3 +596,5 @@ body.secure-exam-running .secure-exam-shell{visibility:visible!important}
 .exam-submit-confirm[hidden]{display:none}
 .exam-submit-confirm-card{width:min(460px,100%);background:#fff;border-radius:18px;padding:24px;box-shadow:0 24px 70px rgba(15,23,42,.3)}
 .exam-submit-confirm-card h2{margin:0 0 8px}.exam-submit-confirm-card p{margin:0 0 20px;color:#475569}.exam-submit-confirm-card .actions{display:flex;justify-content:flex-end;gap:10px}
+
+.sequential-progress-badge{display:inline-flex;align-items:center;padding:7px 11px;border:1px solid #cbd5e1;border-radius:999px;font-weight:800;font-size:13px;background:#f8fafc;color:#334155}.sequential-nav{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:18px}.sequential-security-note{font-size:13px;color:#64748b}.sequential-nav button:disabled{opacity:.58;cursor:not-allowed}@media(max-width:700px){.sequential-nav{align-items:stretch;flex-direction:column}.sequential-nav button{width:100%}}

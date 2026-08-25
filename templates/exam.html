@@ -1,10 +1,10 @@
 {% extends 'base.html' %}{% block content %}
 {% set pin_secure = security and security.require_exam_pin %}
 {% set manual_fullscreen = cfg and cfg.require_fullscreen and not pin_secure %}
-<div class="exam-head"><span class="exam-title">{{ display_title }}</span><span id="save-status" class="save-status" aria-live="polite"></span>{% if manual_fullscreen %}<button type="button" id="fullscreen-btn" class="btn small secondary">Enter Full Screen</button>{% endif %}<span class="timer">Time left: <span id="timer"></span></span></div>
+<div class="exam-head"><span class="exam-title">{{ display_title }}</span>{% if sequential_mode %}<span class="sequential-progress-badge">Question {{ current_position }} of {{ total_questions }}</span>{% endif %}<span id="save-status" class="save-status" aria-live="polite"></span>{% if manual_fullscreen %}<button type="button" id="fullscreen-btn" class="btn small secondary">Enter Full Screen</button>{% endif %}<span class="timer">Time left: <span id="timer"></span></span></div>
 {% if manual_fullscreen %}<div id="integrity-warning" class="integrity-banner">Integrity monitoring is enabled. Leaving the exam tab or full-screen mode is recorded for faculty review.</div>{% endif %}
-<form id="exam-form" method="post" action="{{ url_for('submit_exam',exam_id=exam.id) }}" data-exam-integrity="{{ exam.id }}" data-secure-shell="{{ '1' if secure_shell else '0' }}"{% if secure_shell %} target="_top"{% endif %}><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-{% for q in questions %}<div class="question exam-question" data-question-type="{{ q.question_type }}"><div class="question-title">Q{{ loop.index }}. {{ q.question }}</div><div class="mini-meta">{{ q.question_type_label }} · {{ q.marks }} mark(s)</div>
+<form id="exam-form" method="post" action="{{ url_for('submit_exam',exam_id=exam.id) }}" data-exam-integrity="{{ exam.id }}" data-secure-shell="{{ '1' if secure_shell else '0' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{% for q in questions %}<div class="question exam-question" data-question-type="{{ q.question_type }}"><div class="question-title">Q{{ current_position if sequential_mode else loop.index }}. {{ q.question }}</div><div class="mini-meta">{{ q.question_type_label }} · {{ q.marks }} mark(s)</div>
   {% if q.question_type=='single_choice' %}
     {% for label,key,value in q.display_options %}<label class="option"><input type="radio" name="q_{{ q.id }}" value="{{ key }}" {% if answers.get(q.id)==key %}checked{% endif %} onchange="saveAnswer({{ exam.id }},{{ q.id }},'{{ key }}')"><span><strong>{{ label }}.</strong> {{ value }}</span></label>{% endfor %}
   {% elif q.question_type=='multiple_select' %}
@@ -20,8 +20,10 @@
     <div class="mini-meta">This response will be manually graded by faculty after submission.</div>
   {% endif %}
 </div>{% endfor %}
-<button type="button" id="exam-submit-open">Submit Exam</button>
-<div id="exam-submit-confirm" class="exam-submit-confirm" hidden role="dialog" aria-modal="true" aria-labelledby="exam-submit-confirm-title">
+{% if sequential_mode and current_position < total_questions %}
+<div class="sequential-nav"><div class="sequential-security-note">Answer optional · Next unlocks after <strong>{{ cfg.sequential_min_seconds }}</strong> seconds</div><button type="submit" formaction="{{ url_for('next_exam_question',exam_id=exam.id) }}" formmethod="post" id="sequential-next" data-wait-seconds="{{ sequential_wait }}">Next Question</button></div>
+{% else %}<button type="button" id="exam-submit-open">Submit Exam</button>{% endif %}
+{% if not sequential_mode or current_position == total_questions %}<div id="exam-submit-confirm" class="exam-submit-confirm" hidden role="dialog" aria-modal="true" aria-labelledby="exam-submit-confirm-title">
   <div class="exam-submit-confirm-card">
     <h2 id="exam-submit-confirm-title">Submit exam?</h2>
     <p>Your saved answers will be submitted and the exam will end.</p>
@@ -30,6 +32,6 @@
       <button type="button" id="exam-submit-confirm-yes" class="btn">Confirm & Submit</button>
     </div>
   </div>
-</div></form>
-<script>startTimer({{ end_epoch }},{{ server_now_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});</script>
+</div>{% endif %}</form>
+<script>startTimer({{ end_epoch }},{{ server_now_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});{% if sequential_mode and current_position < total_questions %}startSequentialNextCountdown();{% endif %}</script>
 {% endblock %}

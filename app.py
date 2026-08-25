@@ -29,7 +29,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.29.0'
+APP_VERSION='2.30.6'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -272,6 +272,8 @@ class ExamConfig(Base):
     unit_weights:Mapped[str]=mapped_column(String,nullable=False,default='')
     randomize_questions:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
     shuffle_options:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    secure_sequential:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    sequential_min_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=10)
     require_fullscreen:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     tab_switch_limit:Mapped[int]=mapped_column(Integer,nullable=False,default=3)
     # Exam-level classification.  This lets an already-created exam be converted
@@ -293,6 +295,15 @@ class AttemptQuestion(Base):
     question_id:Mapped[int]=mapped_column(ForeignKey('questions.id'),nullable=False)
     position:Mapped[int]=mapped_column(Integer,nullable=False)
     option_order:Mapped[str]=mapped_column(String,nullable=False,default='ABCD')
+
+class SequentialAttemptProgress(Base):
+    __tablename__='sequential_attempt_progress'
+    __table_args__=(UniqueConstraint('attempt_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False)
+    current_position:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
+    question_started_at:Mapped[str]=mapped_column(String,nullable=False)
+    updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class IntegrityEvent(Base):
     __tablename__='integrity_events'
@@ -784,6 +795,8 @@ def run_schema_upgrades():
         ('exam_configs','practical_experiment_no',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','practical_code_start_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','practical_code_end_at',"VARCHAR NOT NULL DEFAULT ''"),
+        ('exam_configs','secure_sequential',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_configs','sequential_min_seconds',"INTEGER NOT NULL DEFAULT 10"),
         ('audit_logs','prev_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('audit_logs','event_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('practical_registers','attendance_max_marks','INTEGER NOT NULL DEFAULT 5'),
@@ -834,6 +847,8 @@ def apply_practical_exam_security_defaults(s,exam_id,cfg=None,security=None,forc
         return False
     cfg.randomize_questions=True
     cfg.shuffle_options=True
+    cfg.secure_sequential=True
+    cfg.sequential_min_seconds=max(1,int(cfg.sequential_min_seconds or 10))
     cfg.require_fullscreen=True
     cfg.tab_switch_limit=3
     security.require_exam_pin=True
@@ -1944,7 +1959,10 @@ def security_headers(response):
     # Every page remains non-frameable except the authenticated secure exam
     # document loaded by our own PIN-verification shell.  That single route is
     # same-origin only, so external sites still cannot embed the application.
-    secure_exam_frame=bool(request.endpoint=='take_exam' and request.args.get('secure_shell')=='1')
+    secure_exam_frame=bool(
+        (request.endpoint=='take_exam' and request.args.get('secure_shell')=='1')
+        or request.endpoint=='submitted'
+    )
     response.headers['X-Frame-Options']='SAMEORIGIN' if secure_exam_frame else 'DENY'
     response.headers.setdefault('Referrer-Policy','same-origin')
     scanner_page=request.endpoint=='practical_register_detail'
@@ -2090,7 +2108,7 @@ def result_performance(score,total_marks):
 def get_exam_config(s,exam_id,create=False):
     cfg=s.scalar(select(ExamConfig).where(ExamConfig.exam_id==exam_id))
     if not cfg and create:
-        cfg=ExamConfig(exam_id=exam_id,question_count=0,pool_size=0,easy_pct=30,medium_pct=50,hard_pct=20,unit_weights='',randomize_questions=True,shuffle_options=True,require_fullscreen=False,tab_switch_limit=3,exam_type='regular',practical_experiment_no='',last_generation_summary='',updated_at=now_iso())
+        cfg=ExamConfig(exam_id=exam_id,question_count=0,pool_size=0,easy_pct=30,medium_pct=50,hard_pct=20,unit_weights='',randomize_questions=True,shuffle_options=True,secure_sequential=False,sequential_min_seconds=10,require_fullscreen=False,tab_switch_limit=3,exam_type='regular',practical_experiment_no='',last_generation_summary='',updated_at=now_iso())
         s.add(cfg); s.flush()
     return cfg
 
@@ -5239,6 +5257,7 @@ def delete_exam(exam_id):
         # the attempt itself. V91+ diagnostic tables also carry FK references.
         s.execute(delete(AttemptDiagnosticEvent).where(AttemptDiagnosticEvent.attempt_id.in_(attempt_ids)))
         s.execute(delete(AttemptDiagnostic).where(AttemptDiagnostic.attempt_id.in_(attempt_ids)))
+        s.execute(delete(SequentialAttemptProgress).where(SequentialAttemptProgress.attempt_id.in_(attempt_ids)))
         s.execute(delete(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id.in_(attempt_ids)))
         s.execute(delete(IntegrityEvent).where(IntegrityEvent.attempt_id.in_(attempt_ids)))
         s.execute(delete(Answer).where(Answer.attempt_id.in_(attempt_ids)))
@@ -5474,18 +5493,18 @@ def exam_builder(exam_id):
     if not exam:abort(404)
     cfg=get_exam_config(s,exam_id,create=True);security=get_exam_security_policy(s,exam_id,create=True)
     if apply_practical_exam_security_defaults(s,exam_id,cfg,security):
-        audit_event(s,'practical_exam_secure_defaults_applied','exam',exam_id,'fullscreen=1, rotating_pin=1, strict_start=1, auto_submit=1, defer_results=1, ip_roll_lock=1')
+        audit_event(s,'practical_exam_secure_defaults_applied','exam',exam_id,'secure_sequential=1, min_question_seconds=10, fullscreen=1, rotating_pin=1, strict_start=1, auto_submit=1, defer_results=1, ip_roll_lock=0')
         s.commit()
     if request.method=='POST':
         action=request.form.get('action','save')
         try:
             qcount=max(1,int(request.form.get('question_count','20')));pool_size=max(qcount,int(request.form.get('pool_size',str(qcount))))
-            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(10,min(60,int(request.form.get('heartbeat_seconds','15') or 15)));start_grace_minutes=max(0,min(60,int(request.form.get('start_grace_minutes','5') or 5)))
+            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(10,min(60,int(request.form.get('heartbeat_seconds','15') or 15)));start_grace_minutes=max(0,min(60,int(request.form.get('start_grace_minutes','5') or 5)));sequential_min_seconds=max(0,min(120,int(request.form.get('sequential_min_seconds','10') or 10)))
         except ValueError:flash('Blueprint numeric values are invalid.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         if easy+medium+hard!=100:flash('Difficulty distribution must total 100%.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         try:unit_weights=parse_unit_weights(request.form.get('unit_weights',''))
         except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
-        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.strict_start_window=request.form.get('strict_start_window')=='on';security.start_grace_minutes=start_grace_minutes;security.auto_submit_on_integrity_limit=request.form.get('auto_submit_on_integrity_limit')=='on';security.defer_results_until_end=request.form.get('defer_results_until_end')=='on';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.practical_defaults_applied=True if (cfg.exam_type or '').strip().lower()=='practical_exam' else security.practical_defaults_applied;security.updated_at=now_iso();s.flush()
+        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.secure_sequential=request.form.get('secure_sequential')=='on';cfg.sequential_min_seconds=sequential_min_seconds;cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.strict_start_window=request.form.get('strict_start_window')=='on';security.start_grace_minutes=start_grace_minutes;security.auto_submit_on_integrity_limit=request.form.get('auto_submit_on_integrity_limit')=='on';security.defer_results_until_end=request.form.get('defer_results_until_end')=='on';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.practical_defaults_applied=True if (cfg.exam_type or '').strip().lower()=='practical_exam' else security.practical_defaults_applied;security.updated_at=now_iso();s.flush()
         if action=='generate':
             if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)>0:flash('This exam already has attempts. The question pool is locked to protect result integrity.','error');s.rollback();return redirect(url_for('exam_builder',exam_id=exam_id))
             stmt=select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
@@ -6760,6 +6779,23 @@ def verify_student_exam_pin(exam_id):
     return render_template('exam_pin_verify.html',exam=exam,student=student,display_title=student_exam_display_title(s,exam),rotating_pin=rotating_exam_pin(exam_id,student.id),pin_seconds_remaining=rotating_exam_pin_seconds_remaining())
 
 
+def _sequential_progress(s,attempt,create=False):
+    row=s.scalar(select(SequentialAttemptProgress).where(SequentialAttemptProgress.attempt_id==attempt.id))
+    if not row and create:
+        now=now_iso();row=SequentialAttemptProgress(attempt_id=attempt.id,current_position=1,question_started_at=now,updated_at=now);s.add(row);s.flush()
+    return row
+
+def _attempt_question_at_position(s,attempt,position):
+    return s.scalar(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id,AttemptQuestion.position==position))
+
+def _answer_is_present(s,attempt_id,qid):
+    row=s.scalar(select(Answer).where(Answer.attempt_id==attempt_id,Answer.question_id==qid))
+    return bool(row and str(answer_record_value(row) or '').strip())
+
+def _sequential_elapsed_seconds(progress):
+    try:return max(0,int((now_dt()-parse_dt(progress.question_started_at)).total_seconds()))
+    except Exception:return 0
+
 @app.route('/student/exam/<int:exam_id>')
 @student_required
 def take_exam(exam_id):
@@ -6802,6 +6838,8 @@ def take_exam(exam_id):
             keys=list('ABCD')
             if cfg and cfg.shuffle_options:random.shuffle(keys)
             s.add(AttemptQuestion(attempt_id=attempt.id,question_id=qid,position=pos,option_order=''.join(keys)))
+        if cfg and cfg.secure_sequential:
+            _sequential_progress(s,attempt,create=True)
         s.commit()
     end_dt=parse_dt(attempt.end_at)
     if now_dt()>=end_dt:finalize_attempt(s,attempt,'TIME_EXPIRED');return redirect(url_for('submitted',exam_id=exam_id))
@@ -6810,6 +6848,14 @@ def take_exam(exam_id):
         qids=[int(x) for x in attempt.question_order.split(',') if x]
         for pos,qid in enumerate(qids,1):s.add(AttemptQuestion(attempt_id=attempt.id,question_id=qid,position=pos,option_order='ABCD'))
         s.commit();aq_rows=s.scalars(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id).order_by(AttemptQuestion.position)).all()
+    sequential_mode=bool(cfg and cfg.secure_sequential)
+    sequential_progress=None;current_position=1;total_questions=len(aq_rows);sequential_elapsed=0;sequential_wait=0
+    if sequential_mode:
+        sequential_progress=_sequential_progress(s,attempt,create=True);s.commit()
+        current_position=max(1,min(sequential_progress.current_position,total_questions or 1))
+        aq_rows=[row for row in aq_rows if row.position==current_position]
+        sequential_elapsed=_sequential_elapsed_seconds(sequential_progress)
+        sequential_wait=max(0,int(cfg.sequential_min_seconds or 0)-sequential_elapsed)
     qids=[x.question_id for x in aq_rows];qrows=s.scalars(select(Question).where(Question.id.in_(qids))).all();qmap={q.id:q for q in qrows};views=[]
     for aq in aq_rows:
         q=qmap.get(aq.question_id)
@@ -6819,7 +6865,43 @@ def take_exam(exam_id):
     saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();answers={a.question_id:answer_record_value(a) for a in saved}
     security=get_exam_security_policy(s,exam_id,create=False)
     secure_shell=bool(request.args.get('secure_shell')=='1' and security and security.require_exam_pin)
-    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell)
+    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait)
+
+@app.route('/student/exam/<int:exam_id>/next-question',methods=['POST'])
+@student_required
+def next_exam_question(exam_id):
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
+
+    def resume_current_question():
+        security=get_exam_security_policy(s,exam_id,create=False)
+        if security and security.require_exam_pin and exam_pin_is_verified(exam_id):
+            token=create_secure_exam_launch_token(exam_id)
+            return redirect(url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=token))
+        return redirect(url_for('take_exam',exam_id=exam_id))
+
+    if not attempt or attempt.status=='submitted':return redirect(url_for('submitted',exam_id=exam_id))
+    if not cfg or not cfg.secure_sequential:return resume_current_question()
+    if not secure_exam_device_allowed(s,attempt):flash('This exam is locked to another device.','error');return redirect(url_for('student_dashboard'))
+    if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return redirect(url_for('submitted',exam_id=exam_id))
+    progress=_sequential_progress(s,attempt,create=True);aq=_attempt_question_at_position(s,attempt,progress.current_position)
+    if not aq:flash('Current question could not be resolved.','error');s.commit();return resume_current_question()
+    question=s.get(Question,aq.question_id);field=f'q_{aq.question_id}';values=request.form.getlist(field)
+    if values:
+        value=','.join(values) if question and canonical_question_type(question.question_type)=='multiple_select' else values[0]
+        try:save_answer_record(s,attempt.id,aq.question_id,value[:MAX_ANSWER_LENGTH],question)
+        except ValueError as exc:flash(str(exc),'error');s.rollback();return resume_current_question()
+        s.flush()
+    # Answering is optional in Secure Sequential mode. Students may skip a
+    # question after the configured minimum viewing time; unanswered questions
+    # simply remain unanswered and score zero.
+    answered=_answer_is_present(s,attempt.id,aq.question_id)
+    elapsed=_sequential_elapsed_seconds(progress);minimum=max(0,int(cfg.sequential_min_seconds or 0))
+    if elapsed<minimum:
+        flash(f'Please spend at least {minimum} seconds on this question. {minimum-elapsed} second(s) remaining.','error');s.commit();return resume_current_question()
+    total=s.scalar(select(func.count()).select_from(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id)) or 0
+    if progress.current_position<total:
+        progress.current_position+=1;progress.question_started_at=now_iso();progress.updated_at=now_iso();_diagnostic_event(s,attempt,'question_advanced',f'position={progress.current_position}; previous_elapsed={elapsed}s; answered={1 if answered else 0}');s.commit()
+    return resume_current_question()
 
 @app.route('/student/save-answer',methods=['POST'])
 @student_required
@@ -6834,6 +6916,10 @@ def save_answer():
     if not secure_exam_device_allowed(s,attempt):return jsonify(error='Exam is locked to another device.',device_locked=True),409
     if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return jsonify(saved=False,submitted=True)
     if qid not in attempt_question_ids(s,attempt):return jsonify(error='Question not part of this attempt'),400
+    cfg=get_exam_config(s,exam_id,create=False)
+    if cfg and cfg.secure_sequential:
+        progress=_sequential_progress(s,attempt,create=True);current=_attempt_question_at_position(s,attempt,progress.current_position)
+        if not current or current.question_id!=qid:return jsonify(error='Only the current question can be answered in Secure Sequential mode.'),409
     question=s.get(Question,qid)
     try:save_answer_record(s,attempt.id,qid,ans,question)
     except ValueError as exc:return jsonify(error=str(exc)),400
@@ -6916,9 +7002,29 @@ def student_heartbeat():
 @student_required
 def submit_exam(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
-    if not attempt:flash('Attempt not found.','error');return redirect(url_for('student_dashboard'))
-    if not secure_exam_device_allowed(s,attempt):flash('This exam is locked to another browser/device. Ask the invigilator to reset your device lock.','error');return redirect(url_for('student_dashboard'))
-    allowed=set(attempt_question_ids(s,attempt))
+    ajax=request.headers.get('X-Requested-With')=='XMLHttpRequest'
+
+    def exam_resume_url():
+        security=get_exam_security_policy(s,exam_id,create=False)
+        if security and security.require_exam_pin and exam_pin_is_verified(exam_id):
+            token=create_secure_exam_launch_token(exam_id)
+            return url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=token)
+        return url_for('take_exam',exam_id=exam_id)
+
+    def reject_submit(message):
+        flash(message,'error')
+        url=exam_resume_url()
+        if ajax:return jsonify(ok=False,submitted=False,exam_url=url,message=message),409
+        return redirect(url)
+
+    if not attempt:
+        if ajax:return jsonify(ok=False,submitted=False,exam_url=url_for('student_dashboard'),message='Attempt not found.'),404
+        flash('Attempt not found.','error');return redirect(url_for('student_dashboard'))
+    if not secure_exam_device_allowed(s,attempt):
+        message='This exam is locked to another browser/device. Ask the invigilator to reset your device lock.'
+        if ajax:return jsonify(ok=False,submitted=False,exam_url=url_for('student_dashboard'),message=message),409
+        flash(message,'error');return redirect(url_for('student_dashboard'))
+    allowed=set(attempt_question_ids(s,attempt));cfg=get_exam_config(s,exam_id,create=False)
     if attempt.status!='submitted':
         questions={q.id:q for q in (s.scalars(select(Question).where(Question.id.in_(allowed))).all() if allowed else [])}
         for qid,question in questions.items():
@@ -6930,21 +7036,32 @@ def submit_exam(exam_id):
         s.commit()
         client_reason=(request.form.get('submission_reason') or 'MANUAL').strip().upper()
         if client_reason not in {'MANUAL','TIME_EXPIRED'}:client_reason='MANUAL'
-        # TIME_EXPIRED is only a client hint. Never let a wrong/fast device clock
-        # submit an examination before the server-authoritative end time.
-        if client_reason=='TIME_EXPIRED' and now_dt()<parse_dt(attempt.end_at):
-            _diagnostic_event(s,attempt,'premature_timeout_blocked',f'client requested TIME_EXPIRED; server_end={attempt.end_at}')
-            s.commit()
-            security=get_exam_security_policy(s,exam_id,create=False)
-            if security and security.require_exam_pin and exam_pin_is_verified(exam_id):
-                launch_token=create_secure_exam_launch_token(exam_id)
-                return redirect(url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=launch_token))
-            return redirect(url_for('take_exam',exam_id=exam_id))
-        finalize_attempt(s,attempt,client_reason)
-    # The secure iframe launch token is single-session exam state. Once the
-    # paper is submitted, discard it before showing the result page.
+
+        # Time expiry is authoritative and must submit from whatever sequential
+        # question the student is currently viewing. It must never be blocked by
+        # "reach final question" or minimum-time validation.
+        if client_reason=='TIME_EXPIRED':
+            if now_dt()<parse_dt(attempt.end_at):
+                _diagnostic_event(s,attempt,'premature_timeout_blocked',f'client requested TIME_EXPIRED; server_end={attempt.end_at}')
+                s.commit()
+                url=exam_resume_url()
+                if ajax:return jsonify(ok=False,submitted=False,exam_url=url,message='Exam time has not expired yet.'),409
+                return redirect(url)
+            finalize_attempt(s,attempt,'TIME_EXPIRED')
+        else:
+            if cfg and cfg.secure_sequential:
+                progress=_sequential_progress(s,attempt,create=True);total=s.scalar(select(func.count()).select_from(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id)) or 0
+                current=_attempt_question_at_position(s,attempt,progress.current_position)
+                if progress.current_position<total or not current:
+                    return reject_submit('Use Next until you reach the final question before submitting.')
+                minimum=max(0,int(cfg.sequential_min_seconds or 0));elapsed=_sequential_elapsed_seconds(progress)
+                if elapsed<minimum:
+                    return reject_submit(f'Please spend at least {minimum} seconds on the final question before submitting.')
+            finalize_attempt(s,attempt,'MANUAL')
     clear_secure_exam_launch_token(exam_id)
-    return redirect(url_for('submitted',exam_id=exam_id))
+    result_url=url_for('submitted',exam_id=exam_id)
+    if ajax:return jsonify(ok=True,submitted=True,submitted_url=result_url)
+    return redirect(result_url)
 
 @app.route('/student/submitted/<int:exam_id>')
 @student_required

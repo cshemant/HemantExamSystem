@@ -13,6 +13,58 @@ function beginExamSubmission(examId,reason='MANUAL'){
 }
 function isExamSubmissionInProgress(){return examSubmissionInProgress===true;}
 
+async function submitExamToServer(form,examId,reason){
+  let reasonInput=form.querySelector('input[name="submission_reason"]');
+  if(!reasonInput){
+    reasonInput=document.createElement('input');
+    reasonInput.type='hidden';
+    reasonInput.name='submission_reason';
+    form.appendChild(reasonInput);
+  }
+  reasonInput.value=reason;
+
+  const insideSecureShell=form.getAttribute('data-secure-shell')==='1' && window.parent!==window;
+  if(!insideSecureShell){
+    beginExamSubmission(examId,reason);
+    form.submit();
+    return {ok:true,navigating:true};
+  }
+
+  examSubmissionInProgress=true;
+  try{
+    const response=await fetch(form.action,{
+      method:'POST',
+      body:new FormData(form),
+      credentials:'same-origin',
+      headers:{
+        'X-Requested-With':'XMLHttpRequest',
+        'Accept':'application/json'
+      },
+      cache:'no-store'
+    });
+    const payload=await response.json().catch(()=>({ok:false,message:'Submission response could not be read.'}));
+
+    if(response.ok && payload.ok && payload.submitted && payload.submitted_url){
+      try{
+        window.parent.postMessage({
+          type:'secure-exam-submitted',
+          exam_id:Number(examId),
+          url:payload.submitted_url
+        },window.location.origin);
+        return {ok:true,submitted:true};
+      }catch(_err){}
+      window.top.location.replace(payload.submitted_url);
+      return {ok:true,submitted:true,navigating:true};
+    }
+
+    examSubmissionInProgress=false;
+    return {ok:false,payload:payload,status:response.status};
+  }catch(_err){
+    examSubmissionInProgress=false;
+    return {ok:false,payload:{message:'Submission failed — please try again'}};
+  }
+}
+
 async function saveAnswer(examId, questionId, answer, retryCount=0){
   const status=document.getElementById('save-status');
   if(status) status.textContent='Saving…';
@@ -27,8 +79,12 @@ async function saveAnswer(examId, questionId, answer, retryCount=0){
     if(data.submitted){
       const resultUrl='/student/submitted/'+examId;
       const form=document.getElementById('exam-form');
-      if(form && form.getAttribute('data-secure-shell')==='1' && window.top!==window.self){window.top.location.href=resultUrl;}
-      else window.location.href=resultUrl;
+      const secureFrame=form && form.getAttribute('data-secure-shell')==='1' && window.parent!==window;
+      if(secureFrame){
+        examSubmissionInProgress=true;
+        try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:Number(examId),url:resultUrl},window.location.origin);return;}catch(_err){}
+      }
+      window.location.href=resultUrl;
       return;
     }
     if(status){status.textContent='Saved';setTimeout(()=>{if(status.textContent==='Saved')status.textContent='';},1000);}
@@ -49,7 +105,19 @@ function startTimer(endEpoch,serverNowEpoch){
     const left=Math.max(0,Math.ceil(initialLeft-elapsed));
     const h=Math.floor(left/3600),m=Math.floor((left%3600)/60),s=left%60;
     if(timer) timer.textContent=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-    if(left<=0){if(handle)clearInterval(handle);if(form&&!examSubmissionInProgress){let r=form.querySelector('input[name="submission_reason"]');if(!r){r=document.createElement('input');r.type='hidden';r.name='submission_reason';form.appendChild(r);}r.value='TIME_EXPIRED';beginExamSubmission(Number(form.getAttribute('data-exam-integrity')||0),'TIME_EXPIRED');form.submit();}}
+    if(left<=0){
+      if(handle)clearInterval(handle);
+      if(form&&!examSubmissionInProgress){
+        const examId=Number(form.getAttribute('data-exam-integrity')||0);
+        submitExamToServer(form,examId,'TIME_EXPIRED').then(result=>{
+          if(result && result.ok)return;
+          // A very small client/server timing difference can make the first
+          // request arrive just before server expiry. Retry briefly instead of
+          // navigating the secure iframe to a verification/error page.
+          setTimeout(()=>{if(!examSubmissionInProgress)submitExamToServer(form,examId,'TIME_EXPIRED');},1200);
+        });
+      }
+    }
   };
   tick();handle=setInterval(tick,1000);
 }
@@ -73,7 +141,10 @@ async function logIntegrity(examId,eventType,details='',options={}){
         if(secureFrame){
           try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:Number(examId),url:resultUrl},window.location.origin);return data;}catch(_err){}
         }
-        if(window.top!==window.self) window.top.location.href=resultUrl; else window.location.href=resultUrl;
+        if(window.parent!==window){
+          try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:Number(examId),url:resultUrl},window.location.origin);return data;}catch(_err){}
+        }
+        window.location.href=resultUrl;
       }
       return data;
     }
@@ -88,6 +159,8 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
   let tabEvents=0;
   const banner=document.getElementById('integrity-warning');
   const fullscreenBtn=document.getElementById('fullscreen-btn');
+  const examForm=document.getElementById('exam-form');
+  const insideSecureShell=!!(examForm && examForm.dataset.secureShell==='1' && window.parent!==window);
   const updateBanner=()=>{
     if(!banner) return;
     if(tabEvents>0){
@@ -96,10 +169,15 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
       banner.classList.add('active');
     }
   };
-  document.addEventListener('visibilitychange',async()=>{
-    if(examSubmissionInProgress)return;
-    if(document.hidden){const data=await logIntegrity(examId,'tab_hidden','Exam tab became hidden');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();}
-  });
+  // In the secure-shell iframe, an ordinary Next Question navigation makes
+  // the old iframe document hidden during unload. That is not a real tab switch.
+  // The outer secure shell monitors top-level visibility instead.
+  if(!insideSecureShell){
+    document.addEventListener('visibilitychange',async()=>{
+      if(examSubmissionInProgress)return;
+      if(document.hidden){const data=await logIntegrity(examId,'tab_hidden','Exam tab became hidden');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();}
+    });
+  }
   if(requireFullscreen){
     if(fullscreenBtn){fullscreenBtn.addEventListener('click',async()=>{
       try{await document.documentElement.requestFullscreen();enteredFullscreen=true;fullscreenBtn.textContent='Full Screen Active';}
@@ -111,6 +189,15 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
       if(enteredFullscreen){const data=await logIntegrity(examId,'fullscreen_exit','Full-screen mode exited');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();if(fullscreenBtn)fullscreenBtn.textContent='Re-enter Full Screen';}
     });
   }
+}
+
+function startSequentialNextCountdown(){
+  const btn=document.getElementById('sequential-next');if(!btn)return;
+  let left=Math.max(0,Number(btn.dataset.waitSeconds||0));
+  const original='Next Question';
+  const render=()=>{btn.disabled=left>0;btn.textContent=left>0?`Next available in ${left}s`:original;};
+  render();if(left<=0)return;
+  const handle=setInterval(()=>{left=Math.max(0,left-1);render();if(left<=0)clearInterval(handle);},1000);
 }
 
 function initExamSubmitConfirmation(){
@@ -126,14 +213,24 @@ function initExamSubmitConfirmation(){
   noBtn.addEventListener('click',close);
   dialog.addEventListener('click',event=>{if(event.target===dialog)close();});
   document.addEventListener('keydown',event=>{if(event.key==='Escape' && !dialog.hidden){event.preventDefault();close();}});
-  yesBtn.addEventListener('click',()=>{
+  yesBtn.addEventListener('click',async()=>{
     if(examSubmissionInProgress)return;
-    let reason=form.querySelector('input[name="submission_reason"]');
-    if(!reason){reason=document.createElement('input');reason.type='hidden';reason.name='submission_reason';form.appendChild(reason);}
-    reason.value='MANUAL';
     yesBtn.disabled=true;noBtn.disabled=true;
-    beginExamSubmission(examId,'MANUAL');
-    form.submit();
+    if(openBtn)openBtn.disabled=true;
+
+    const result=await submitExamToServer(form,examId,'MANUAL');
+    if(result && result.ok)return;
+
+    examSubmissionInProgress=false;
+    yesBtn.disabled=false;noBtn.disabled=false;
+    if(openBtn)openBtn.disabled=false;
+    dialog.hidden=true;
+    const payload=(result && result.payload) || {};
+    const status=document.getElementById('save-status');
+    if(status)status.textContent=payload.message || 'Submission failed — please try again';
+    if(payload.exam_url && payload.exam_url.startsWith('/student/exam/')){
+      window.location.replace(payload.exam_url);
+    }
   });
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initExamSubmitConfirmation);else initExamSubmitConfirmation();
