@@ -1,5 +1,5 @@
 {% extends 'base.html' %}{% block content %}
-<script>window.EXAM_VOICE_SUBJECT_CATALOG={{ (voice_subject_catalog or [])|tojson }};window.EXAM_VOICE_CURRICULUM_CATALOG={{ (curriculum_exam_options or [])|tojson }};</script>
+<script>window.EXAM_VOICE_SUBJECT_CATALOG={{ (voice_subject_catalog or [])|tojson }};window.EXAM_VOICE_CURRICULUM_CATALOG={{ (curriculum_exam_options or [])|tojson }};window.EXAM_VOICE_AI_CONFIGURED={{ ai.configured|tojson }};</script>
 <div class="page-head"><h1>Exams</h1></div>
 <div class="card" id="ai-curriculum-exam-card">
   <div class="import-header"><div><h2>AI-Assisted Exam from Syllabus</h2><p class="muted">Uses the confirmed syllabus for the active institution. Existing approved questions are reused first; AI generates only the missing questions.</p></div><a class="btn secondary small" href="{{ url_for('academic_setup') }}">Academic Setup</a></div>
@@ -9,9 +9,9 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div class="grid">
       <div><label>Curriculum Subject</label><select name="curriculum_subject_id" id="ai-curriculum-subject" required><option value="">Choose subject...</option>{% for subject in curriculum_exam_options %}<option value="{{ subject.id }}" data-units='{{ subject.units|tojson }}'>{{ subject.name }}{% if subject.program %} · {{ subject.program }}{% endif %}</option>{% endfor %}</select></div>
-      <div><label>Unit</label><select name="unit" id="ai-curriculum-unit" required><option value="">Choose unit...</option></select></div>
+      <div><label>Unit</label><select name="unit" id="ai-curriculum-unit"><option value="">All Units</option></select></div>
       <div><label>Topic focus (optional)</label><input name="topic" id="ai-curriculum-topic" placeholder="e.g. Hypervisors or VM migration"></div>
-      <div><label>Questions</label><input name="question_count" id="ai-curriculum-count" type="number" min="1" max="50" value="10" required></div>
+      <div><label>Questions</label><input name="question_count" id="ai-curriculum-count" type="number" min="1" max="100" value="10" required></div>
       <div><label>Difficulty</label><select name="difficulty" id="ai-curriculum-difficulty"><option>Easy</option><option selected>Medium</option><option>Hard</option></select></div>
       <div><label>Question Type</label><select name="question_type" id="ai-curriculum-question-type"><option value="single_choice" selected>Single Choice (MCQ)</option><option value="multiple_select">Multiple Select</option><option value="true_false">True / False</option><option value="numerical">Numerical</option><option value="short_text">Short Text</option><option value="essay">Descriptive / Essay</option></select></div>
       <div><label>Duration (minutes)</label><input name="duration" id="ai-curriculum-duration" type="number" min="1" max="600" value="30" required></div>
@@ -26,7 +26,7 @@
 (function(){
  const subject=document.getElementById('ai-curriculum-subject'),unit=document.getElementById('ai-curriculum-unit'),context=document.getElementById('ai-curriculum-context');
  if(!subject||!unit)return;
- function sync(){let units=[];try{units=JSON.parse(subject.options[subject.selectedIndex]?.dataset.units||'[]')}catch(_e){};unit.innerHTML='<option value="">Choose unit...</option>';units.forEach(x=>{const o=document.createElement('option');o.value=x.value;o.textContent=x.label||('Unit '+x.value);o.dataset.summary=x.summary||'';o.dataset.topics=JSON.stringify(x.topics||[]);unit.appendChild(o)});context.textContent='';}
+ function sync(){let units=[];try{units=JSON.parse(subject.options[subject.selectedIndex]?.dataset.units||'[]')}catch(_e){};unit.innerHTML='<option value="">All Units</option>';units.forEach(x=>{const o=document.createElement('option');o.value=x.value;o.textContent=x.label||('Unit '+x.value);o.dataset.summary=x.summary||'';o.dataset.topics=JSON.stringify(x.topics||[]);unit.appendChild(o)});context.textContent='';}
  function show(){const o=unit.options[unit.selectedIndex];if(!o||!o.value){context.textContent='';return;}let topics=[];try{topics=JSON.parse(o.dataset.topics||'[]')}catch(_e){};context.textContent=(o.dataset.summary||'')+(topics.length?' · Topics: '+topics.slice(0,8).join(', '):'');}
  subject.addEventListener('change',sync);unit.addEventListener('change',show);sync();
 })();
@@ -60,8 +60,23 @@
         <label>Duration (minutes)</label>
         <input name="duration" type="number" min="1" value="20" required>
       </div>
+      <div>
+        <label>Question count (AI auto-fill)</label>
+        <input name="question_count" type="number" min="1" max="100" value="10">
+      </div>
+      <div>
+        <label>Difficulty</label>
+        <select name="difficulty"><option>Easy</option><option selected>Medium</option><option>Hard</option></select>
+      </div>
+      <div>
+        <label>Question Type</label>
+        <select name="question_type"><option value="single_choice" selected>Single Choice (MCQ)</option><option value="multiple_select">Multiple Select</option><option value="true_false">True / False</option><option value="numerical">Numerical</option><option value="short_text">Short Text</option><option value="essay">Descriptive / Essay</option></select>
+      </div>
+      <div class="check-row">
+        <label><input type="checkbox" name="auto_fill_ai" value="1"> Auto-fill the requested count: reuse approved questions first, then generate only the shortage with the configured AI provider.</label>
+      </div>
     </div>
-    <button>Create Exam</button>
+    <button>Create Exam</button><p class="mini-meta">For voice requests that include a question count, AI auto-fill is enabled automatically. If no confirmed syllabus exists, generation uses the existing approved Question Bank as context and keeps new questions in review-pending Draft status.</p>
   </form>
 </div>
 <script>

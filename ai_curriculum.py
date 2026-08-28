@@ -304,9 +304,29 @@ QUESTION_SCHEMA: dict[str, Any] = {
 }
 
 
-def generate_questions(*, institution: str, program: str, subject: str, unit_no: str, unit_title: str, syllabus_text: str, topics: list[str], requested_topic: str, count: int, difficulty: str, question_types: list[str] | None = None) -> dict[str, Any]:
-    count = max(1, min(50, int(count)))
+def _question_rules() -> str:
+    return """
+Rules:
+- Avoid duplicates and near-duplicates.
+- For single_choice and multiple_select, provide four plausible options A-D.
+- For single_choice, answer_key must be exactly A, B, C, or D.
+- For multiple_select, answer_key must be comma-separated option letters such as A,C.
+- For true_false, answer_key must be true or false; option fields may be blank.
+- For numerical, answer_key must be a numeric value and answer_tolerance may be 0 or a positive number.
+- For short_text, answer_key may contain alternatives separated by |.
+- For essay, answer_key may be blank because it is manually graded.
+- Use Bloom levels from Remember, Understand, Apply, Analyze, Evaluate, Create.
+- Provide a concise explanation/solution for faculty review.
+- CO mapping may be blank when the supplied context does not provide CO information.
+""".strip()
+
+
+def generate_questions(*, institution: str, program: str, subject: str, unit_no: str, unit_title: str, syllabus_text: str, topics: list[str], requested_topic: str, count: int, difficulty: str, question_types: list[str] | None = None, avoid_questions: list[str] | None = None) -> dict[str, Any]:
+    # Keep individual provider calls reasonably small. The Flask layer batches
+    # larger exam requests (for example 60 or 100 questions) across calls.
+    count = max(1, min(25, int(count)))
     requested_types = question_types or ["single_choice"]
+    avoid = "\n".join(f"- {q}" for q in (avoid_questions or [])[-80:])
     prompt = f"""
 Generate exactly {count} assessment questions as JSON for the curriculum below.
 Institution: {institution}
@@ -322,24 +342,58 @@ Authoritative syllabus context (do not go outside this context):
 
 Known topics: {', '.join(topics[:100])}
 
-Rules:
+Questions already available/generated and therefore forbidden as duplicates:
+{avoid or '- none supplied'}
+
 - Stay within the supplied syllabus; do not introduce unrelated topics.
-- Avoid duplicates and near-duplicates.
-- For single_choice and multiple_select, provide four plausible options A-D.
-- For single_choice, answer_key must be exactly A, B, C, or D.
-- For multiple_select, answer_key must be comma-separated option letters such as A,C.
-- For true_false, answer_key must be true or false; option fields may be blank.
-- For numerical, answer_key must be a numeric value and answer_tolerance may be 0 or a positive number.
-- For short_text, answer_key may contain alternatives separated by |.
-- For essay, answer_key may be blank because it is manually graded.
-- Use Bloom levels from Remember, Understand, Apply, Analyze, Evaluate, Create.
-- Provide a concise explanation/solution for faculty review.
-- CO mapping may be blank when the syllabus does not provide CO information.
+{_question_rules()}
 """.strip()
     result = structured_generate(prompt, "question_batch", QUESTION_SCHEMA)
     questions = result.get("questions") if isinstance(result, dict) else None
     if not isinstance(questions, list):
         raise AIProviderError("AI response did not contain a question list.")
-    # Enforce count at the application boundary even if a provider under/over-produces.
+    result["questions"] = questions[:count]
+    return result
+
+
+def generate_subject_context_questions(*, institution: str, subject: str, course_semester: str, unit: str, context_text: str, known_topics: list[str], requested_topic: str, count: int, difficulty: str, question_types: list[str] | None = None, avoid_questions: list[str] | None = None) -> dict[str, Any]:
+    """Generate questions when no confirmed syllabus has been uploaded yet.
+
+    This is deliberately weaker than syllabus-grounded generation. The caller
+    supplies existing Question Bank material as the allowed context so the model
+    is not tied to any university-specific hard-coded syllabus. Generated rows
+    remain review-pending drafts.
+    """
+    count = max(1, min(25, int(count)))
+    requested_types = question_types or ["single_choice"]
+    avoid = "\n".join(f"- {q}" for q in (avoid_questions or [])[-80:])
+    prompt = f"""
+Generate exactly {count} assessment questions as JSON using the subject context below.
+Institution: {institution or 'Not specified'}
+Subject: {subject}
+Course/Semester: {course_semester or 'Not specified'}
+Requested unit: {unit or 'All available units'}
+Requested topic focus: {requested_topic or 'No additional topic restriction'}
+Requested difficulty: {difficulty}
+Allowed question types: {', '.join(requested_types)}
+
+IMPORTANT: No confirmed syllabus is available for this request. Treat the supplied
+Question Bank context as the boundary. Stay close to its units/topics/concepts and
+do not invent institution-specific syllabus coverage that is not evidenced here.
+
+Existing Question Bank context:
+{context_text[:60000]}
+
+Known topics: {', '.join(known_topics[:120])}
+
+Questions already available/generated and therefore forbidden as duplicates:
+{avoid or '- none supplied'}
+
+{_question_rules()}
+""".strip()
+    result = structured_generate(prompt, "question_batch", QUESTION_SCHEMA)
+    questions = result.get("questions") if isinstance(result, dict) else None
+    if not isinstance(questions, list):
+        raise AIProviderError("AI response did not contain a question list.")
     result["questions"] = questions[:count]
     return result

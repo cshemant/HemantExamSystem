@@ -220,7 +220,7 @@
   // Lightweight test hook: production never enables testMode. It lets release
   // validation exercise the parser without needing a browser DOM.
   if(cfg.testMode){
-    window.EXAM_VOICE_TEST_API={normalizeLoose,replaceNumberWords,candidateScore,extractDuration,extractUnitInfo,isCreateVerb,hasExamNoun};
+    window.EXAM_VOICE_TEST_API={normalizeLoose,replaceNumberWords,candidateScore,extractDuration,extractQuestionCount,extractUnitInfo,isCreateVerb,hasExamNoun};
     return;
   }
 
@@ -254,7 +254,7 @@
           <div class="voice-help" id="voice-help-box" hidden>
             <strong>No command memorization needed</strong>
             <ul>
-              <li>“Make a cloud computing test for half an hour.”</li>
+              <li>“Create Cyber Security exam with 60 questions for 60 minutes.”</li><li>“Make a cloud computing test for half an hour.”</li>
               <li>“Cloud Computing ka Unit 2 exam bana do 30 minute ka.”</li>
               <li>“Give every student 10 questions and turn fullscreen on.”</li>
               <li>“Kal 10 se 11 Section K ke liye Lab 204 me schedule karo.”</li>
@@ -439,8 +439,8 @@
 
   function extractQuestionCount(text){
     const n=normalizeLoose(replaceNumberWords(text));
-    let m=n.match(/\b(\d{1,2})\s*(?:questions?|mcqs?|items?)\b/)||n.match(/\b(?:questions?|mcqs?)\s*(?:count|number)?\s*(?:is|to|of)?\s*(\d{1,2})\b/);
-    return m?Math.max(1,Math.min(50,Number(m[1]))):null;
+    let m=n.match(/\b(\d{1,3})\s*(?:questions?|mcqs?|items?)\b/)||n.match(/\b(?:questions?|mcqs?)\s*(?:count|number)?\s*(?:is|to|of)?\s*(\d{1,3})\b/);
+    return m?Math.max(1,Math.min(100,Number(m[1]))):null;
   }
 
   function inferCurriculumQuestionType(text){
@@ -509,8 +509,11 @@
           const exact=units.find(u=>normalize(String(u.value||''))===normalize(String(unitInfo.value||''))||normalize(u.label||'')===`unit ${normalize(unitInfo.value)}`);
           if(!exact){respond(`I matched ${row.name}, but Unit ${unitInfo.value} is not present in its confirmed syllabus.`,'error');return true;}
           unitValue=String(exact.value||'');
-        }else if(units.length===1){unitValue=String(units[0].value||'');}
-        else{respond(`I matched “${row.name}”. Tell me which syllabus unit to use, for example “Unit 2”.`,'warning');return true;}
+        }else{
+          // No unit means the professor wants the subject as a whole. The backend
+          // distributes AI generation across all confirmed syllabus units.
+          unitValue='';
+        }
         if(unitSelect){unitSelect.value=unitValue;unitSelect.dispatchEvent(new Event('change',{bubbles:true}));}
         const duration=extractDuration(n)||30;const questionCount=extractQuestionCount(n)||10;
         const diff=/\bhard\b/.test(n)?'Hard':(/\beasy\b/.test(n)?'Easy':'Medium');
@@ -522,7 +525,7 @@
         const countInput=document.getElementById('ai-curriculum-count'),durationInput=document.getElementById('ai-curriculum-duration'),topicInput=document.getElementById('ai-curriculum-topic'),difficultyInput=document.getElementById('ai-curriculum-difficulty'),typeInput=document.getElementById('ai-curriculum-question-type'),titleInput=document.getElementById('ai-curriculum-title');
         const questionType=inferCurriculumQuestionType(n);
         if(countInput)countInput.value=String(questionCount);if(durationInput)durationInput.value=String(duration);if(topicInput)topicInput.value=topic;if(difficultyInput)difficultyInput.value=diff;if(typeInput)typeInput.value=questionType;
-        const unitLabel=`Unit ${unitValue}`;const title=extractTitle(text,{specified:true,all:false,value:unitValue},row.name);if(titleInput)titleInput.value=title;
+        const unitLabel=unitValue?`Unit ${unitValue}`:'All Units';const title=extractTitle(text,unitValue?{specified:true,all:false,value:unitValue}:{specified:true,all:true,value:''},row.name);if(titleInput)titleInput.value=title;
         const correction=resolved.confidence<.97?'<div class="voice-smart-note">✓ Subject matched using curriculum context and typo/alias tolerance.</div>':'';
         const summary=`${correction}<div class="voice-summary-grid"><span>Action</span><strong>Create syllabus-grounded draft exam</strong><span>Institution</span><strong>${htmlEscape(row.institution||'Active institution')}</strong><span>Subject</span><strong>${htmlEscape(row.name)}</strong><span>Unit</span><strong>${htmlEscape(unitLabel)}</strong><span>Topic</span><strong>${htmlEscape(topic||'Entire unit')}</strong><span>Questions</span><strong>${questionCount}</strong><span>Type</span><strong>${htmlEscape(questionType.replaceAll('_',' '))}</strong><span>Difficulty</span><strong>${diff}</strong><span>Duration</span><strong>${duration} minutes</strong></div><div class="voice-smart-note">Approved Question Bank items are reused first. If more are needed, AI generates syllabus-grounded draft questions and the exam cannot be activated until they are reviewed.</div>`;
         confirm('Create this syllabus-grounded exam?',summary,()=>{writeContext({subject:row.name,unit:unitValue,examTitle:title,title,route:'exams'});setStatus('Creating exam and preparing questions…');curriculumForm.requestSubmit();},'Confirm & Create');return true;
@@ -544,9 +547,16 @@
         const exact=rankedUnits.find(c=>normalize(c.value)===normalize(unitInfo.value)||normalize(c.label)===`unit ${normalize(unitInfo.value)}`||normalize(c.label)===normalize(unitInfo.value));
         if(exact)unitSelect.value=exact.option.value;else{respond(`I understood Unit ${unitInfo.value}, but that unit is not available for ${subjectOption.textContent.trim()}.`,'error');return;}
       }else if(unitSelect)unitSelect.value='';
-      const duration=extractDuration(n)||20;const form=subjectSelect.closest('form');const titleInput=form&&form.querySelector('[name="exam_title"]');const durationInput=form&&form.querySelector('[name="duration"]');const subjectName=subjectOption.textContent.trim();const title=extractTitle(text,unitInfo,subjectName);
-      if(titleInput)titleInput.value=title;if(durationInput)durationInput.value=String(duration);const unitLabel=unitInfo.specified&&!unitInfo.all?`Unit ${unitInfo.value}`:'All Units';const correction=confidence<.97?'<div class="voice-smart-note">✓ Subject name was matched using typo/alias tolerance.</div>':'';const summary=`${correction}<div class="voice-summary-grid"><span>Action</span><strong>Create manual draft exam</strong><span>Subject</span><strong>${htmlEscape(subjectName)}</strong><span>Unit</span><strong>${htmlEscape(unitLabel)}</strong><span>Title</span><strong>${htmlEscape(title)}</strong><span>Duration</span><strong>${duration} minutes</strong></div>`;
-      confirm('Create this exam?',summary,()=>{writeContext({subject:subjectName,unit:unitInfo.all?'':unitInfo.value,examTitle:title,title,route:'exams'});if(form){setStatus('Creating draft exam…');form.requestSubmit();}},'Confirm & Create');
+      const duration=extractDuration(n)||20;const questionCount=extractQuestionCount(n);const form=subjectSelect.closest('form');const titleInput=form&&form.querySelector('[name="exam_title"]');const durationInput=form&&form.querySelector('[name="duration"]');const countInput=form&&form.querySelector('[name="question_count"]');const aiToggle=form&&form.querySelector('[name="auto_fill_ai"]');const difficultyInput=form&&form.querySelector('[name="difficulty"]');const typeInput=form&&form.querySelector('[name="question_type"]');const subjectName=subjectOption.textContent.trim();const title=extractTitle(text,unitInfo,subjectName);
+      if(titleInput)titleInput.value=title;if(durationInput)durationInput.value=String(duration);
+      if(questionCount&&countInput)countInput.value=String(questionCount);if(questionCount&&aiToggle)aiToggle.checked=true;
+      if(questionCount&&difficultyInput)difficultyInput.value=/\bhard\b/.test(n)?'Hard':(/\beasy\b/.test(n)?'Easy':'Medium');if(questionCount&&typeInput)typeInput.value=inferCurriculumQuestionType(n);
+      const unitLabel=unitInfo.specified&&!unitInfo.all?`Unit ${unitInfo.value}`:'All Units';const correction=confidence<.97?'<div class="voice-smart-note">✓ Subject name was matched using typo/alias tolerance.</div>':'';
+      const action=questionCount?'Create AI-assisted draft exam':'Create manual draft exam';
+      const qrow=questionCount?`<span>Questions</span><strong>${questionCount}</strong>`:'';
+      const note=questionCount?`<div class="voice-smart-note">Approved questions are reused first. If the requested count is larger, the configured AI provider generates only the shortage. A confirmed uploaded syllabus is preferred; otherwise existing approved Question Bank content is used as neutral context. New AI questions remain Draft until reviewed.</div>`:'';
+      const summary=`${correction}<div class="voice-summary-grid"><span>Action</span><strong>${action}</strong><span>Subject</span><strong>${htmlEscape(subjectName)}</strong><span>Unit</span><strong>${htmlEscape(unitLabel)}</strong>${qrow}<span>Title</span><strong>${htmlEscape(title)}</strong><span>Duration</span><strong>${duration} minutes</strong></div>${note}`;
+      confirm('Create this exam?',summary,()=>{writeContext({subject:subjectName,unit:unitInfo.all?'':unitInfo.value,examTitle:title,title,route:'exams'});if(form){setStatus(questionCount?'Creating exam and auto-filling questions…':'Creating draft exam…');form.requestSubmit();}},'Confirm & Create');
     };
     resolveSubject(subjectSelect,n,finish);return true;
   }

@@ -25,14 +25,14 @@ from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
 from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
-from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, AIProviderError
+from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, generate_subject_context_questions, AIProviderError
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.34.0'
+APP_VERSION='2.35.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -5306,17 +5306,122 @@ def update_curriculum_unit(unit_id):
 
 
 def _generate_ai_bank_questions(s,bundle,unit,topic,count,difficulty,created_by,question_types=None):
-    topics=s.scalars(select(SyllabusTopic).where(SyllabusTopic.unit_id==unit.id).order_by(SyllabusTopic.sort_order)).all()
-    result=generate_questions(institution=(bundle['institution'].name if bundle['institution'] else ''),program=(bundle['program'].name if bundle['program'] else ''),subject=bundle['subject'].name,unit_no=unit.unit_no,unit_title=unit.title,syllabus_text=unit.raw_text or unit.summary,topics=[t.name for t in topics],requested_topic=topic,count=count,difficulty=difficulty,question_types=(question_types or ['single_choice']))
-    created=[];errors=[];provider=ai_status()['provider']
+    """Generate syllabus-grounded BankQuestion drafts, batching large requests.
+
+    Provider calls are kept to <=20 questions each. This is more reliable for
+    requests such as 60/100 questions and lets us feed previously generated
+    questions back as an explicit duplicate-avoidance list.
+    """
+    requested=max(1,min(100,int(count or 1)))
+    topic_rows=s.scalars(select(SyllabusTopic).where(SyllabusTopic.unit_id==unit.id).order_by(SyllabusTopic.sort_order)).all()
+    topic_names=[t.name for t in topic_rows]
+    provider=ai_status()['provider']
     course=(bundle['program'].name if bundle['program'] else '')+(f" / Sem {bundle['subject'].semester}" if bundle['subject'].semester else '')
-    for item in result.get('questions') or []:
-        payload,error=_generated_question_payload(item)
-        if error:errors.append(error);continue
-        duplicate=s.scalar(select(BankQuestion).where(BankQuestion.curriculum_subject_id==bundle['subject'].id,func.lower(BankQuestion.question)==payload['question'].lower()))
-        if duplicate:continue
-        bq=BankQuestion(subject=bundle['subject'].name,course_semester=course,unit=unit.unit_no,topic=payload['topic'] or topic,question_type=payload['question_type'],question=payload['question'],option_a=payload['option_a'],option_b=payload['option_b'],option_c=payload['option_c'],option_d=payload['option_d'],correct_answer=payload['correct_answer'],answer_key=payload['answer_key'],answer_tolerance=payload['answer_tolerance'],answer_case_sensitive=payload['answer_case_sensitive'],marks=payload['marks'],difficulty=payload['difficulty'],bloom_level=payload['bloom_level'],co_mapping=payload['co_mapping'],po_mapping='',pso_mapping='',tags='AI generated, syllabus grounded',practice_visibility='official_only',practical_experiment_no='',explanation=payload['explanation'],status='draft',version=1,created_by=created_by,created_at=now_iso(),updated_at=now_iso(),institution_id=bundle['subject'].institution_id,curriculum_subject_id=bundle['subject'].id,source=f'ai_{provider}',ai_review_status='pending')
-        s.add(bq);s.flush();created.append(bq)
+    existing_texts=[q for q in s.scalars(select(BankQuestion.question).where(BankQuestion.curriculum_subject_id==bundle['subject'].id,BankQuestion.unit==unit.unit_no)).all() if q]
+    created=[];errors=[];calls=0
+    while len(created)<requested and calls<8:
+        batch=min(20,requested-len(created));calls+=1
+        result=generate_questions(
+            institution=(bundle['institution'].name if bundle['institution'] else ''),
+            program=(bundle['program'].name if bundle['program'] else ''),
+            subject=bundle['subject'].name,unit_no=unit.unit_no,unit_title=unit.title,
+            syllabus_text=unit.raw_text or unit.summary,topics=topic_names,requested_topic=topic,
+            count=batch,difficulty=difficulty,question_types=(question_types or ['single_choice']),
+            avoid_questions=existing_texts+[q.question for q in created],
+        )
+        batch_added=0
+        for item in result.get('questions') or []:
+            payload,error=_generated_question_payload(item)
+            if error:errors.append(error);continue
+            duplicate=s.scalar(select(BankQuestion).where(BankQuestion.curriculum_subject_id==bundle['subject'].id,func.lower(BankQuestion.question)==payload['question'].lower()))
+            if duplicate:continue
+            bq=BankQuestion(
+                subject=bundle['subject'].name,course_semester=course,unit=unit.unit_no,
+                topic=payload['topic'] or topic,question_type=payload['question_type'],question=payload['question'],
+                option_a=payload['option_a'],option_b=payload['option_b'],option_c=payload['option_c'],option_d=payload['option_d'],
+                correct_answer=payload['correct_answer'],answer_key=payload['answer_key'],answer_tolerance=payload['answer_tolerance'],
+                answer_case_sensitive=payload['answer_case_sensitive'],marks=payload['marks'],difficulty=payload['difficulty'],
+                bloom_level=payload['bloom_level'],co_mapping=payload['co_mapping'],po_mapping='',pso_mapping='',
+                tags='AI generated, syllabus grounded',practice_visibility='official_only',practical_experiment_no='',
+                explanation=payload['explanation'],status='draft',version=1,created_by=created_by,
+                created_at=now_iso(),updated_at=now_iso(),institution_id=bundle['subject'].institution_id,
+                curriculum_subject_id=bundle['subject'].id,source=f'ai_{provider}',ai_review_status='pending'
+            )
+            s.add(bq);s.flush();created.append(bq);batch_added+=1
+            if len(created)>=requested:break
+        if batch_added==0:
+            errors.append('AI did not return additional unique valid questions in the last batch.')
+            break
+    return created,errors
+
+
+def _subject_context_rows(s,subject_name,selected_unit='',active_institution=None):
+    stmt=select(BankQuestion).where(
+        BankQuestion.subject==subject_name,
+        BankQuestion.status=='approved',
+        BankQuestion.practice_visibility.in_(['official_only','both','practical_exam'])
+    )
+    scope=bank_question_institution_scope(active_institution)
+    if scope is not None:stmt=stmt.where(scope)
+    if selected_unit:stmt=stmt.where(BankQuestion.unit==selected_unit)
+    return list(s.scalars(stmt.order_by(BankQuestion.unit,BankQuestion.topic,BankQuestion.id)).all())
+
+
+def _generate_ai_subject_context_questions(s,subject,selected_unit,count,difficulty,created_by,question_types=None,active_institution=None,topic=''):
+    """Fallback AI generation for legacy/catalog subjects without a confirmed syllabus.
+
+    Existing approved Question Bank rows provide the grounding context. This is
+    intentionally labelled as subject-context generation and remains review-pending.
+    """
+    requested=max(1,min(100,int(count or 1)))
+    context_rows=_subject_context_rows(s,subject.name,selected_unit,active_institution)
+    if not context_rows:
+        raise AIProviderError('No confirmed syllabus or approved Question Bank context is available. Upload/confirm a syllabus in Academic Setup first.')
+    provider=ai_status()['provider']
+    institution_name=active_institution.name if active_institution else ''
+    topics=[];seen_topics=set()
+    context_lines=[]
+    for row in context_rows[:120]:
+        unit=(row.unit or '').strip();row_topic=(row.topic or '').strip()
+        if row_topic and row_topic.casefold() not in seen_topics:
+            seen_topics.add(row_topic.casefold());topics.append(row_topic)
+        context_lines.append(f"Unit {unit or '-'} | Topic {row_topic or '-'} | {row.question}")
+    existing_texts=[row.question for row in context_rows if row.question]
+    created=[];errors=[];calls=0
+    while len(created)<requested and calls<8:
+        batch=min(20,requested-len(created));calls+=1
+        result=generate_subject_context_questions(
+            institution=institution_name,subject=subject.name,course_semester=subject.course_semester or '',
+            unit=selected_unit,context_text='\n'.join(context_lines),known_topics=topics,requested_topic=topic,
+            count=batch,difficulty=difficulty,question_types=(question_types or ['single_choice']),
+            avoid_questions=existing_texts+[q.question for q in created],
+        )
+        batch_added=0
+        for item in result.get('questions') or []:
+            payload,error=_generated_question_payload(item)
+            if error:errors.append(error);continue
+            duplicate_stmt=select(BankQuestion).where(BankQuestion.subject==subject.name,func.lower(BankQuestion.question)==payload['question'].lower())
+            scope=bank_question_institution_scope(active_institution)
+            if scope is not None:duplicate_stmt=duplicate_stmt.where(scope)
+            if s.scalar(duplicate_stmt):continue
+            inferred_unit=selected_unit or next((r.unit for r in context_rows if r.unit and (payload['topic'] or '').casefold() in ((r.topic or '')+' '+(r.tags or '')).casefold()),'')
+            bq=BankQuestion(
+                subject=subject.name,course_semester=subject.course_semester or '',unit=inferred_unit or '',
+                topic=payload['topic'] or topic,question_type=payload['question_type'],question=payload['question'],
+                option_a=payload['option_a'],option_b=payload['option_b'],option_c=payload['option_c'],option_d=payload['option_d'],
+                correct_answer=payload['correct_answer'],answer_key=payload['answer_key'],answer_tolerance=payload['answer_tolerance'],
+                answer_case_sensitive=payload['answer_case_sensitive'],marks=payload['marks'],difficulty=payload['difficulty'],
+                bloom_level=payload['bloom_level'],co_mapping=payload['co_mapping'],po_mapping='',pso_mapping='',
+                tags='AI generated, Question Bank context (no confirmed syllabus)',practice_visibility='official_only',
+                practical_experiment_no='',explanation=payload['explanation'],status='draft',version=1,created_by=created_by,
+                created_at=now_iso(),updated_at=now_iso(),institution_id=(active_institution.id if active_institution else None),
+                curriculum_subject_id=None,source=f'ai_{provider}_subject_context',ai_review_status='pending'
+            )
+            s.add(bq);s.flush();created.append(bq);batch_added+=1
+            if len(created)>=requested:break
+        if batch_added==0:
+            errors.append('AI did not return additional unique valid questions in the last batch.')
+            break
     return created,errors
 
 
@@ -5329,7 +5434,7 @@ def curriculum_generate_questions(subject_id):
     if not confirmed:flash('Confirm the syllabus before generating official Question Bank drafts.','error');return redirect(url_for('academic_setup')+f'#curriculum-subject-{subject_id}')
     unit=_find_curriculum_unit(s,subject_id,request.form.get('unit'))
     if not unit:flash('Choose a syllabus unit before generating questions.','error');return redirect(url_for('academic_setup')+f'#curriculum-subject-{subject_id}')
-    try:count=max(1,min(50,int(request.form.get('count','10'))))
+    try:count=max(1,min(100,int(request.form.get('count','10'))))
     except ValueError:count=10
     try:
         requested_type=canonical_question_type(request.form.get('question_type') or 'single_choice')
@@ -5349,37 +5454,71 @@ def create_ai_exam_from_curriculum():
     if not bundle:flash('Choose a valid curriculum subject.','error');return redirect(url_for('exams'))
     confirmed=s.scalar(select(SyllabusDocument.id).where(SyllabusDocument.curriculum_subject_id==subject_id,SyllabusDocument.status=='confirmed').order_by(SyllabusDocument.id.desc()))
     if not confirmed:flash('Confirm this subject syllabus before creating an AI-assisted exam.','error');return redirect(url_for('exams'))
-    unit=_find_curriculum_unit(s,subject_id,request.form.get('unit'))
-    if not unit:flash('Choose a syllabus unit for AI-assisted exam creation.','error');return redirect(url_for('exams'))
-    try:count=max(1,min(50,int(request.form.get('question_count','10'))));duration=max(1,min(600,int(request.form.get('duration','30'))))
+
+    requested_unit=(request.form.get('unit') or '').strip()
+    if requested_unit:
+        one=_find_curriculum_unit(s,subject_id,requested_unit)
+        selected_units=[one] if one else []
+    else:
+        selected_units=[item['row'] for item in bundle['units']]
+    if not selected_units:
+        flash('No confirmed syllabus unit is available for AI-assisted exam creation.','error');return redirect(url_for('exams'))
+
+    try:count=max(1,min(100,int(request.form.get('question_count','10'))));duration=max(1,min(600,int(request.form.get('duration','30'))))
     except ValueError:count,duration=10,30
     topic=(request.form.get('topic') or '').strip();difficulty=canonical_difficulty(request.form.get('difficulty'))
-    title=(request.form.get('exam_title') or '').strip() or f'{bundle["subject"].name} - Unit {unit.unit_no} - Set A'
+    unit_label=f'Unit {selected_units[0].unit_no}' if len(selected_units)==1 else 'All Units'
+    title=(request.form.get('exam_title') or '').strip() or f'{bundle["subject"].name} - {unit_label} - Set A'
     exam=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(exam);s.flush();cfg=get_exam_config(s,exam.id,create=True);get_exam_approval(s,exam.id,create=True)
-    cfg.subject=bundle['subject'].name;cfg.course_semester=(bundle['program'].name if bundle['program'] else '')+(f" / Sem {bundle['subject'].semester}" if bundle['subject'].semester else '');cfg.unit_weights=json.dumps({unit.unit_no:1},ensure_ascii=False);cfg.institution_id=bundle['subject'].institution_id;cfg.curriculum_subject_id=bundle['subject'].id;cfg.randomize_questions=True;cfg.shuffle_options=True
-    stmt=select(BankQuestion).where(BankQuestion.curriculum_subject_id==subject_id,BankQuestion.unit==unit.unit_no,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
-    existing=s.scalars(stmt).all()
+    cfg.subject=bundle['subject'].name
+    cfg.course_semester=(bundle['program'].name if bundle['program'] else '')+(f" / Sem {bundle['subject'].semester}" if bundle['subject'].semester else '')
+    cfg.unit_weights=json.dumps({u.unit_no:1 for u in selected_units},ensure_ascii=False)
+    cfg.institution_id=bundle['subject'].institution_id;cfg.curriculum_subject_id=bundle['subject'].id
+    cfg.randomize_questions=True;cfg.shuffle_options=True
+
+    selected_unit_values=[u.unit_no for u in selected_units]
+    stmt=select(BankQuestion).where(
+        BankQuestion.curriculum_subject_id==subject_id,
+        BankQuestion.unit.in_(selected_unit_values),
+        BankQuestion.status=='approved',
+        BankQuestion.practice_visibility.in_(['official_only','both'])
+    )
+    existing=list(s.scalars(stmt).all())
     if topic:
         focused=[q for q in existing if topic.casefold() in (q.topic or '').casefold() or topic.casefold() in (q.tags or '').casefold() or topic.casefold() in (q.question or '').casefold()]
         if focused:existing=focused
     random.shuffle(existing);added_existing=0
     for bq in existing[:count]:
         if copy_bank_question_to_exam(s,bq,exam.id):added_existing+=1
+
     missing=max(0,count-added_existing);generated=[];errors=[]
     if missing:
         if ai_status()['configured']:
+            requested_type=canonical_question_type(request.form.get('question_type') or 'single_choice')
+            remaining=missing
             try:
-                requested_type=canonical_question_type(request.form.get('question_type') or 'single_choice')
-                generated,errors=_generate_ai_bank_questions(s,bundle,unit,topic,missing,difficulty,actor_label(s),[requested_type])
+                for index,unit in enumerate(selected_units):
+                    units_left=len(selected_units)-index
+                    share=max(1,(remaining+units_left-1)//units_left)
+                    made,batch_errors=_generate_ai_bank_questions(s,bundle,unit,topic,share,difficulty,actor_label(s),[requested_type])
+                    generated.extend(made);errors.extend(batch_errors);remaining=max(0,missing-len(generated))
+                    if remaining<=0:break
             except AIProviderError as exc:
-                errors=[str(exc)]
-            for bq in generated:copy_bank_question_to_exam(s,bq,exam.id)
+                errors.append(str(exc))
+            for bq in generated[:missing]:copy_bank_question_to_exam(s,bq,exam.id)
         else:errors=['AI provider is not configured.']
-    pool_count=sync_manual_exam_question_count(s,exam.id);cfg.question_count=min(count,pool_count);cfg.pool_size=pool_count;cfg.ai_review_pending=bool(generated);cfg.last_generation_summary=f'Curriculum exam: existing approved={added_existing}, AI draft={len(generated)}, requested={count}, unit={unit.unit_no}, topic={topic or "all"}';cfg.updated_at=now_iso();audit_event(s,'curriculum_ai_exam_created','exam',exam.id,cfg.last_generation_summary);s.commit()
-    if generated:flash(f'Created “{title}” with {pool_count} question(s). {len(generated)} AI-generated question(s) require faculty review before activation.')
-    elif pool_count>=count:flash(f'Created “{title}” using {pool_count} approved syllabus-matched Question Bank questions.')
-    else:flash(f'Created “{title}” with {pool_count}/{count} question(s). '+('; '.join(errors) if errors else 'Add or generate more questions.'),'error')
-    return redirect(url_for('question_bank',subject=bundle['subject'].name,target_exam_id=exam.id)+'#bank-questions')
+
+    pool_count=sync_manual_exam_question_count(s,exam.id)
+    cfg.question_count=min(count,pool_count);cfg.pool_size=pool_count;cfg.ai_review_pending=bool(generated)
+    cfg.last_generation_summary=f'Curriculum exam: existing approved={added_existing}, AI draft={len(generated)}, requested={count}, units={",".join(selected_unit_values)}, topic={topic or "all"}'
+    cfg.updated_at=now_iso();audit_event(s,'curriculum_ai_exam_created','exam',exam.id,cfg.last_generation_summary);s.commit()
+    if generated:
+        flash(f'Created “{title}” with {pool_count}/{count} question(s): {added_existing} existing approved + {len(generated)} newly AI-generated draft question(s). Review the AI questions before activation.')
+    elif pool_count>=count:
+        flash(f'Created “{title}” using {pool_count} approved syllabus-matched Question Bank questions.')
+    else:
+        flash(f'Created “{title}” with {pool_count}/{count} question(s). '+('; '.join(errors) if errors else 'Add or generate more questions.'),'error')
+    return redirect(url_for('question_bank',subject=bundle['subject'].name,unit=(selected_units[0].unit_no if len(selected_units)==1 else ''),target_exam_id=exam.id)+'#bank-questions')
 
 @app.route('/admin/question-bank',methods=['GET','POST'])
 @staff_required
@@ -5918,55 +6057,108 @@ def set_question_practice_visibility():
 @app.route('/admin/exams/from-subject',methods=['POST'])
 @staff_required
 def create_exam_for_existing_subject():
-    """Create a separate, empty exam under an existing subject.
+    """Create an exam under an existing Subject Catalog entry.
 
-    Question Bank rows are copied only when the admin explicitly selects them and
-    uses Add Selected to Exam. This keeps multiple exams under one subject fully
-    isolated from each other.
+    Normal form submissions preserve the long-standing manual/empty behavior.
+    Voice/assistant submissions can set ``auto_fill_ai=1`` and a question count;
+    then approved Question Bank items are copied first and AI generates only the
+    shortage. A confirmed curriculum syllabus is preferred. If none exists, the
+    existing approved Question Bank becomes the provider-neutral grounding context.
     """
     s=DB()
-    try:
-        subject_id=int(request.form.get('subject_id','0'))
-    except ValueError:
-        subject_id=0
+    try:subject_id=int(request.form.get('subject_id','0'))
+    except ValueError:subject_id=0
     subject=s.get(SubjectCatalog,subject_id)
     if not subject or not subject.is_active:
-        flash('Choose a valid existing subject.','error')
-        return redirect(url_for('exams'))
+        flash('Choose a valid existing subject.','error');return redirect(url_for('exams'))
 
     exam_title=(request.form.get('exam_title') or '').strip()
     if not exam_title:
-        flash('Enter an exam title.','error')
-        return redirect(url_for('exams'))
-
+        flash('Enter an exam title.','error');return redirect(url_for('exams'))
     selected_unit=(request.form.get('unit') or '').strip()
-    try:
-        duration=max(1,int(request.form.get('duration','20')))
-    except ValueError:
-        duration=20
+    try:duration=max(1,min(600,int(request.form.get('duration','20'))))
+    except ValueError:duration=20
 
-    exam=Exam(title=exam_title,duration_minutes=duration,is_active=False,created_at=now_iso())
-    s.add(exam);s.flush()
-    cfg=get_exam_config(s,exam.id,create=True)
-    cfg.subject=subject.name
-    cfg.course_semester=subject.course_semester or ''
-    cfg.question_count=0
-    cfg.pool_size=0
+    auto_fill=request.form.get('auto_fill_ai')=='1'
+    try:requested_count=max(1,min(100,int(request.form.get('question_count','10')))) if auto_fill else 0
+    except ValueError:requested_count=10 if auto_fill else 0
+    difficulty=canonical_difficulty(request.form.get('difficulty') or 'Medium')
+    requested_type=canonical_question_type(request.form.get('question_type') or 'single_choice')
+    topic=(request.form.get('topic') or '').strip()
+
+    exam=Exam(title=exam_title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(exam);s.flush()
+    cfg=get_exam_config(s,exam.id,create=True);get_exam_approval(s,exam.id,create=True)
+    cfg.subject=subject.name;cfg.course_semester=subject.course_semester or ''
+    cfg.question_count=0;cfg.pool_size=0
     cfg.unit_weights=json.dumps({selected_unit:1},ensure_ascii=False) if selected_unit else ''
-    cfg.randomize_questions=True
-    cfg.shuffle_options=True
-    cfg.require_fullscreen=False
-    cfg.tab_switch_limit=3
-    cfg.last_generation_summary=f'Manual exam created for {subject.name}' + (f' / Unit {selected_unit}' if selected_unit else '') + '; no questions copied automatically.'
-    cfg.updated_at=now_iso()
-    get_exam_approval(s,exam.id,create=True)
-    audit_event(
-        s,'catalog_subject_exam_created','exam',exam.id,
-        f'manual_subject_exam=1, subject={subject.name}, unit={selected_unit or "all"}, pool=0, title={exam_title}'
-    )
-    s.commit()
+    cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.require_fullscreen=False;cfg.tab_switch_limit=3
 
-    flash(f'Created “{exam_title}” under {subject.name}. Select only the questions you want and add them to this exam.')
+    if not auto_fill:
+        cfg.last_generation_summary=f'Manual exam created for {subject.name}' + (f' / Unit {selected_unit}' if selected_unit else '') + '; no questions copied automatically.'
+        cfg.updated_at=now_iso()
+        audit_event(s,'catalog_subject_exam_created','exam',exam.id,f'manual_subject_exam=1, subject={subject.name}, unit={selected_unit or "all"}, pool=0, title={exam_title}')
+        s.commit();flash(f'Created “{exam_title}” under {subject.name}. Select only the questions you want and add them to this exam.')
+        return redirect(url_for('question_bank',subject=subject.name,unit=selected_unit,target_exam_id=exam.id)+'#bank-questions')
+
+    active_inst=current_curriculum_institution(s)
+    existing=_subject_context_rows(s,subject.name,selected_unit,active_inst)
+    if topic:
+        focused=[q for q in existing if topic.casefold() in (q.topic or '').casefold() or topic.casefold() in (q.tags or '').casefold() or topic.casefold() in (q.question or '').casefold()]
+        if focused:existing=focused
+    random.shuffle(existing);added_existing=0
+    for bq in existing[:requested_count]:
+        if copy_bank_question_to_exam(s,bq,exam.id):added_existing+=1
+
+    missing=max(0,requested_count-added_existing);generated=[];errors=[];generation_mode='existing_only'
+    # Prefer the active institution's confirmed syllabus when the same subject is
+    # present there. This keeps Poornima/JECRC/etc. differences in data, not code.
+    curriculum_subject=None;bundle=None;selected_units=[]
+    if active_inst:
+        candidates=s.scalars(select(CurriculumSubject).where(CurriculumSubject.institution_id==active_inst.id,CurriculumSubject.is_active==True,func.lower(CurriculumSubject.name)==subject.name.lower()).order_by(CurriculumSubject.id.desc())).all()
+        for candidate in candidates:
+            confirmed=s.scalar(select(SyllabusDocument.id).where(SyllabusDocument.curriculum_subject_id==candidate.id,SyllabusDocument.status=='confirmed').order_by(SyllabusDocument.id.desc()))
+            if confirmed:
+                curriculum_subject=candidate;bundle=curriculum_subject_bundle(s,candidate.id);break
+    if bundle:
+        if selected_unit:
+            one=_find_curriculum_unit(s,bundle['subject'].id,selected_unit);selected_units=[one] if one else []
+        else:selected_units=[item['row'] for item in bundle['units']]
+        if selected_units:
+            cfg.institution_id=bundle['subject'].institution_id;cfg.curriculum_subject_id=bundle['subject'].id
+            cfg.unit_weights=json.dumps({u.unit_no:1 for u in selected_units},ensure_ascii=False)
+
+    if missing:
+        if not ai_status()['configured']:
+            errors.append('AI provider is not configured.')
+        elif bundle and selected_units:
+            generation_mode='syllabus_grounded'
+            remaining=missing
+            try:
+                for index,unit in enumerate(selected_units):
+                    units_left=len(selected_units)-index;share=max(1,(remaining+units_left-1)//units_left)
+                    made,batch_errors=_generate_ai_bank_questions(s,bundle,unit,topic,share,difficulty,actor_label(s),[requested_type])
+                    generated.extend(made);errors.extend(batch_errors);remaining=max(0,missing-len(generated))
+                    if remaining<=0:break
+            except AIProviderError as exc:errors.append(str(exc))
+        else:
+            generation_mode='question_bank_context'
+            try:
+                generated,errors=_generate_ai_subject_context_questions(s,subject,selected_unit,missing,difficulty,actor_label(s),[requested_type],active_inst,topic)
+            except AIProviderError as exc:errors=[str(exc)]
+        for bq in generated[:missing]:copy_bank_question_to_exam(s,bq,exam.id)
+
+    pool_count=sync_manual_exam_question_count(s,exam.id)
+    cfg.question_count=min(requested_count,pool_count);cfg.pool_size=pool_count;cfg.ai_review_pending=bool(generated)
+    cfg.last_generation_summary=f'AI-assisted subject exam: existing approved={added_existing}, AI draft={len(generated)}, requested={requested_count}, mode={generation_mode}, unit={selected_unit or "all"}, topic={topic or "all"}'
+    cfg.updated_at=now_iso();audit_event(s,'catalog_subject_ai_exam_created','exam',exam.id,cfg.last_generation_summary);s.commit()
+
+    if generated:
+        grounding='confirmed syllabus' if generation_mode=='syllabus_grounded' else 'existing Question Bank context (no confirmed syllabus)'
+        flash(f'Created “{exam_title}” with {pool_count}/{requested_count} question(s): {added_existing} existing approved + {len(generated)} newly AI-generated draft question(s), grounded by {grounding}. Review AI questions before activation.')
+    elif pool_count>=requested_count:
+        flash(f'Created “{exam_title}” with {pool_count} approved existing questions; no AI generation was needed.')
+    else:
+        flash(f'Created “{exam_title}” with {pool_count}/{requested_count} question(s). '+('; '.join(errors) if errors else 'AI could not complete the shortage.'),'error')
     return redirect(url_for('question_bank',subject=subject.name,unit=selected_unit,target_exam_id=exam.id)+'#bank-questions')
 
 
