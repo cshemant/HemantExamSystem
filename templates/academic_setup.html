@@ -1,0 +1,45 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><h1>Academic Setup</h1><p class="muted">Institution-neutral curriculum and syllabus workspace for AI-assisted exams.</p></div></div>
+
+<div class="card">
+  <div class="import-header"><div><h2>Active Institution</h2><p class="muted">Curriculum subjects, syllabi and AI-generated questions remain attached to the selected institution.</p></div>{% if ai.configured %}<span class="badge success">AI {{ ai.provider|title }} · {{ ai.model }}</span>{% else %}<span class="badge warning">AI provider not configured</span>{% endif %}</div>
+  {% if staff_role=='super_admin' %}{% if institutions %}<form method="post" class="actions"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="switch_institution"><select name="institution_id" required>{% for row in institutions %}<option value="{{ row.id }}" {% if active_institution and row.id==active_institution.id %}selected{% endif %}>{{ row.name }}</option>{% endfor %}</select><button>Switch</button></form>{% endif %}
+  <details {% if not active_institution %}open{% endif %}><summary><strong>Add institution</strong></summary><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="create_institution"><div class="grid"><div><label>Institution name</label><input name="institution_name" placeholder="Poornima University" required></div><div><label>Short name</label><input name="short_name" placeholder="PU"></div><div><label>City</label><input name="city" placeholder="Jaipur"></div><div><label>State</label><input name="state" placeholder="Rajasthan"></div><div><label>Country</label><input name="country" value="India"></div></div><button>Add Institution</button></form></details>{% else %}<p class="muted">Your curriculum workspace is fixed to the institution assigned to your staff account.</p>{% endif %}
+</div>
+
+{% if active_institution %}
+<div class="card"><h2>{{ active_institution.name }} · Programs / Curricula</h2>
+  <form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="create_program"><div class="grid"><div><label>Program</label><input name="program_name" placeholder="B.Tech CSE" required></div><div><label>Department</label><input name="department" placeholder="Computer Science & Engineering"></div><div><label>Academic year / regulation</label><input name="academic_year" placeholder="2026-27"></div></div><button>Add Program</button></form>
+  {% if programs %}<div class="mini-meta" style="margin-top:14px">Existing: {% for p in programs %}<span class="badge gray">{{ p.name }}{% if p.academic_year %} · {{ p.academic_year }}{% endif %}</span> {% endfor %}</div>{% endif %}
+</div>
+
+<div class="card"><h2>Add Subject</h2>
+  {% if programs %}<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="action" value="create_subject"><div class="grid"><div><label>Program</label><select name="program_id" required>{% for p in programs %}<option value="{{ p.id }}">{{ p.name }}{% if p.academic_year %} · {{ p.academic_year }}{% endif %}</option>{% endfor %}</select></div><div><label>Subject name</label><input name="subject_name" placeholder="Cloud Computing" required></div><div><label>Subject code</label><input name="subject_code" placeholder="CC-501"></div><div><label>Semester</label><input name="semester" placeholder="5"></div><div><label>Credits</label><input name="credits" placeholder="4"></div></div><button>Add Subject</button></form>{% else %}<p>Add a program first.</p>{% endif %}
+</div>
+
+{% for card in subject_cards %}{% set b=card.bundle %}{% set subject=b.subject %}
+<div class="card" id="curriculum-subject-{{ subject.id }}">
+  <div class="import-header"><div><h2>{{ subject.name }}{% if subject.code %} <span class="badge gray">{{ subject.code }}</span>{% endif %}</h2><p class="muted">{{ b.program.name if b.program else '' }}{% if subject.semester %} · Semester {{ subject.semester }}{% endif %} · {{ card.generated_count }} curriculum-linked bank question(s)</p></div>{% if card.document %}<span class="badge {% if card.document.status=='confirmed' %}success{% else %}warning{% endif %}">{{ card.document.status|replace('_',' ')|title }}</span>{% endif %}</div>
+
+  <details {% if not card.document %}open{% endif %}><summary><strong>Upload / replace syllabus</strong></summary>
+    <form method="post" action="{{ url_for('upload_curriculum_syllabus',subject_id=subject.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Syllabus file</label><input type="file" name="syllabus_file" accept=".pdf,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp"><div class="mini-meta">PDF, DOCX, text or image. Original file bytes are not retained after parsing.</div></div><div><label>Or paste syllabus text</label><textarea name="syllabus_text" placeholder="UNIT I ..."></textarea></div></div><button>Analyse Syllabus</button></form>
+  </details>
+
+  {% if card.document %}<div class="mini-meta" style="margin:12px 0"><strong>Latest source:</strong> {{ card.document.filename }} · parser {{ card.document.ai_provider }}{% if card.document.summary %}<br><strong>Summary:</strong> {{ card.document.summary }}{% endif %}</div>{% endif %}
+
+  {% if b.units %}<h3>Detected Units</h3>
+    {% for item in b.units %}{% set unit=item.row %}
+    <details class="curriculum-unit"><summary><strong>Unit {{ unit.unit_no }}{% if unit.title %} — {{ unit.title }}{% endif %}</strong> <span class="muted">{{ item.topics|length }} topic(s)</span></summary>
+      <form method="post" action="{{ url_for('update_curriculum_unit',unit_id=unit.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Title</label><input name="title" value="{{ unit.title }}"></div><div><label>Topics (one per line or semicolon)</label><textarea name="topics">{% for t in item.topics %}{{ t.name }}{% if not loop.last %}
+{% endif %}{% endfor %}</textarea></div></div><label>Unit summary</label><textarea name="summary">{{ unit.summary }}</textarea><label>Authoritative syllabus text for this unit</label><textarea name="raw_text" rows="6">{{ unit.raw_text }}</textarea><button class="small">Save Unit</button></form>
+    </details>{% endfor %}
+    {% if card.document and card.document.status!='confirmed' %}<form method="post" action="{{ url_for('confirm_curriculum_syllabus',subject_id=subject.id) }}" class="actions" style="margin-top:14px"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button>Confirm Syllabus</button><span class="muted">Confirm after checking the detected units/topics.</span></form>{% endif %}
+  {% endif %}
+
+  {% if card.document and card.document.status=='confirmed' %}<hr><h3>Generate AI Question Bank</h3>
+    <form method="post" action="{{ url_for('curriculum_generate_questions',subject_id=subject.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Unit</label><select name="unit" required>{% for item in b.units %}<option value="{{ item.row.unit_no }}">Unit {{ item.row.unit_no }} — {{ item.row.title }}</option>{% endfor %}</select></div><div><label>Topic focus (optional)</label><input name="topic" placeholder="Hypervisors"></div><div><label>Question count</label><input type="number" name="count" min="1" max="50" value="10"></div><div><label>Difficulty</label><select name="difficulty"><option>Easy</option><option selected>Medium</option><option>Hard</option></select></div><div><label>Question Type</label><select name="question_type"><option value="single_choice" selected>Single Choice (MCQ)</option><option value="multiple_select">Multiple Select</option><option value="true_false">True / False</option><option value="numerical">Numerical</option><option value="short_text">Short Text</option><option value="essay">Descriptive / Essay</option></select></div></div><button {% if not ai.configured %}disabled title="Configure AI_PROVIDER and API key first"{% endif %}>Generate Draft Questions</button>{% if not ai.configured %}<span class="muted"> Add OpenAI or Gemini environment variables to enable generation.</span>{% endif %}</form>
+  {% endif %}
+</div>
+{% else %}<div class="card"><p>No curriculum subjects yet.</p></div>{% endfor %}
+{% endif %}
+{% endblock %}

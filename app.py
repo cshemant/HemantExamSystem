@@ -9,6 +9,7 @@ from flask import Flask, render_template, request, redirect, url_for, session as
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.utils import secure_filename
 from sqlalchemy import create_engine, String, Integer, Boolean, Float, ForeignKey, UniqueConstraint, Text, select, func, or_, delete, inspect, text, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, scoped_session, sessionmaker
 from sqlalchemy.exc import IntegrityError
@@ -24,13 +25,14 @@ from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
 from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
+from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, AIProviderError
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.33.0'
+APP_VERSION='2.34.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -230,6 +232,10 @@ class BankQuestion(Base):
     created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
     created_at:Mapped[str]=mapped_column(String,nullable=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
+    institution_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
+    curriculum_subject_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
+    source:Mapped[str]=mapped_column(String,nullable=False,default='manual')
+    ai_review_status:Mapped[str]=mapped_column(String,nullable=False,default='not_applicable')
 
 class SubjectCatalog(Base):
     __tablename__='subject_catalog'
@@ -286,6 +292,9 @@ class ExamConfig(Base):
     practical_code_start_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     practical_code_end_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     last_generation_summary:Mapped[str]=mapped_column(String,nullable=False,default='')
+    institution_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
+    curriculum_subject_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
+    ai_review_pending:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class AttemptQuestion(Base):
@@ -326,6 +335,78 @@ class AuditLog(Base):
     prev_hash:Mapped[str]=mapped_column(String(64),nullable=False,default='')
     event_hash:Mapped[str]=mapped_column(String(64),nullable=False,default='')
 
+class AcademicInstitution(Base):
+    __tablename__='academic_institutions'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    name:Mapped[str]=mapped_column(String,unique=True,nullable=False)
+    short_name:Mapped[str]=mapped_column(String,nullable=False,default='')
+    city:Mapped[str]=mapped_column(String,nullable=False,default='')
+    state:Mapped[str]=mapped_column(String,nullable=False,default='')
+    country:Mapped[str]=mapped_column(String,nullable=False,default='India')
+    is_active:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class CurriculumProgram(Base):
+    __tablename__='curriculum_programs'
+    __table_args__=(UniqueConstraint('institution_id','name','academic_year'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    institution_id:Mapped[int]=mapped_column(ForeignKey('academic_institutions.id'),nullable=False)
+    name:Mapped[str]=mapped_column(String,nullable=False)
+    department:Mapped[str]=mapped_column(String,nullable=False,default='')
+    academic_year:Mapped[str]=mapped_column(String,nullable=False,default='')
+    is_active:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class CurriculumSubject(Base):
+    __tablename__='curriculum_subjects'
+    __table_args__=(UniqueConstraint('program_id','name','semester'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    institution_id:Mapped[int]=mapped_column(ForeignKey('academic_institutions.id'),nullable=False)
+    program_id:Mapped[int]=mapped_column(ForeignKey('curriculum_programs.id'),nullable=False)
+    name:Mapped[str]=mapped_column(String,nullable=False)
+    code:Mapped[str]=mapped_column(String,nullable=False,default='')
+    semester:Mapped[str]=mapped_column(String,nullable=False,default='')
+    credits:Mapped[str]=mapped_column(String,nullable=False,default='')
+    is_active:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class SyllabusDocument(Base):
+    __tablename__='syllabus_documents'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    curriculum_subject_id:Mapped[int]=mapped_column(ForeignKey('curriculum_subjects.id'),nullable=False)
+    filename:Mapped[str]=mapped_column(String,nullable=False,default='')
+    content_type:Mapped[str]=mapped_column(String,nullable=False,default='')
+    source_type:Mapped[str]=mapped_column(String,nullable=False,default='text')
+    extracted_text:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    summary:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    status:Mapped[str]=mapped_column(String,nullable=False,default='parsed')
+    ai_provider:Mapped[str]=mapped_column(String,nullable=False,default='')
+    created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class SyllabusUnit(Base):
+    __tablename__='syllabus_units'
+    __table_args__=(UniqueConstraint('curriculum_subject_id','unit_no'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    curriculum_subject_id:Mapped[int]=mapped_column(ForeignKey('curriculum_subjects.id'),nullable=False)
+    document_id:Mapped[int|None]=mapped_column(ForeignKey('syllabus_documents.id'),nullable=True)
+    unit_no:Mapped[str]=mapped_column(String,nullable=False)
+    title:Mapped[str]=mapped_column(String,nullable=False,default='')
+    summary:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    raw_text:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+
+class SyllabusTopic(Base):
+    __tablename__='syllabus_topics'
+    __table_args__=(UniqueConstraint('unit_id','name'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    unit_id:Mapped[int]=mapped_column(ForeignKey('syllabus_units.id'),nullable=False)
+    name:Mapped[str]=mapped_column(String,nullable=False)
+    sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+
 class InstitutionProfile(Base):
     __tablename__='institution_profile'
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
@@ -347,6 +428,7 @@ class FacultyRole(Base):
     faculty_id:Mapped[int]=mapped_column(ForeignKey('faculty_users.id'),nullable=False)
     role:Mapped[str]=mapped_column(String,nullable=False,default='faculty')
     department:Mapped[str]=mapped_column(String,nullable=False,default='')
+    institution_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class AcademicGroup(Base):
@@ -863,6 +945,14 @@ def run_schema_upgrades():
         ('practical_marks','viva_marks','FLOAT'),
         ('students','registration_no',"VARCHAR NOT NULL DEFAULT ''"),
         ('student_passkeys','device_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
+        ('bank_questions','institution_id',"INTEGER"),
+        ('bank_questions','curriculum_subject_id',"INTEGER"),
+        ('bank_questions','source',"VARCHAR NOT NULL DEFAULT 'manual'"),
+        ('bank_questions','ai_review_status',"VARCHAR NOT NULL DEFAULT 'not_applicable'"),
+        ('exam_configs','institution_id',"INTEGER"),
+        ('exam_configs','curriculum_subject_id',"INTEGER"),
+        ('exam_configs','ai_review_pending',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('faculty_roles','institution_id',"INTEGER"),
     )
     for table_name,column_name,ddl in upgrades:
         _ensure_column(table_name,column_name,ddl)
@@ -1275,6 +1365,145 @@ def current_staff_role(s=None):
     s=s or DB(); uid=web_session.get('user_id')
     row=s.scalar(select(FacultyRole).where(FacultyRole.faculty_id==uid)) if uid else None
     return row.role if row and row.role in ROLE_LABELS else 'faculty'
+
+
+
+def current_curriculum_institution(s=None):
+    """Resolve the academic institution used for curriculum/syllabus work.
+
+    Super Admin can switch between institutions in-session. Faculty are pinned to
+    the institution assigned on their FacultyRole when one exists; otherwise the
+    active session institution is used. This keeps the new curriculum layer
+    institution-neutral without changing the legacy site-branding profile.
+    """
+    s=s or DB()
+    if web_session.get('role')=='faculty':
+        uid=web_session.get('user_id')
+        role_row=s.scalar(select(FacultyRole).where(FacultyRole.faculty_id==uid)) if uid else None
+        if role_row and getattr(role_row,'institution_id',None):
+            row=s.get(AcademicInstitution,role_row.institution_id)
+            if row and row.is_active:return row
+    try:active_id=int(web_session.get('curriculum_institution_id') or 0)
+    except (TypeError,ValueError):active_id=0
+    row=s.get(AcademicInstitution,active_id) if active_id else None
+    if row and row.is_active:return row
+    row=s.scalar(select(AcademicInstitution).where(AcademicInstitution.is_active==True).order_by(AcademicInstitution.id.asc()))
+    if row:web_session['curriculum_institution_id']=row.id
+    return row
+
+
+def bank_question_institution_scope(active_institution):
+    """Return the Question Bank visibility boundary for the selected institution.
+
+    Global/preloaded legacy questions remain reusable everywhere; institution-linked
+    questions are visible only inside their own institution.
+    """
+    if not active_institution:
+        return None
+    return or_(BankQuestion.institution_id.is_(None),BankQuestion.institution_id==active_institution.id)
+
+
+def curriculum_subject_bundle(s,subject_id):
+    subject=s.get(CurriculumSubject,subject_id)
+    if not subject or not subject.is_active:return None
+    active_institution=current_curriculum_institution(s)
+    if active_institution and subject.institution_id!=active_institution.id:
+        return None
+    institution=s.get(AcademicInstitution,subject.institution_id)
+    program=s.get(CurriculumProgram,subject.program_id)
+    units=s.scalars(select(SyllabusUnit).where(SyllabusUnit.curriculum_subject_id==subject.id).order_by(SyllabusUnit.sort_order,SyllabusUnit.id)).all()
+    unit_rows=[]
+    for unit in units:
+        topics=s.scalars(select(SyllabusTopic).where(SyllabusTopic.unit_id==unit.id).order_by(SyllabusTopic.sort_order,SyllabusTopic.id)).all()
+        unit_rows.append({'row':unit,'topics':topics})
+    return {'subject':subject,'institution':institution,'program':program,'units':unit_rows}
+
+
+def _find_curriculum_unit(s,subject_id,unit_value):
+    units=s.scalars(select(SyllabusUnit).where(SyllabusUnit.curriculum_subject_id==subject_id).order_by(SyllabusUnit.sort_order,SyllabusUnit.id)).all()
+    if not units:return None
+    wanted=(unit_value or '').strip().lower().replace('unit ','').replace('module ','')
+    if not wanted:return units[0] if len(units)==1 else None
+    for row in units:
+        if (row.unit_no or '').strip().lower()==wanted:return row
+        if (row.title or '').strip().lower()==wanted:return row
+        if f"unit {(row.unit_no or '').strip().lower()}"==wanted:return row
+    return None
+
+
+def _replace_syllabus_structure(s,subject_id,document_id,parsed):
+    existing_units=s.scalars(select(SyllabusUnit).where(SyllabusUnit.curriculum_subject_id==subject_id)).all()
+    for unit in existing_units:
+        s.execute(delete(SyllabusTopic).where(SyllabusTopic.unit_id==unit.id))
+        s.delete(unit)
+    s.flush()
+    created=0
+    for index,item in enumerate((parsed or {}).get('units') or [],start=1):
+        unit_no=str(item.get('unit_no') or index).strip()[:30]
+        if not unit_no:unit_no=str(index)
+        unit=SyllabusUnit(
+            curriculum_subject_id=subject_id,document_id=document_id,unit_no=unit_no,
+            title=str(item.get('title') or f'Unit {unit_no}').strip()[:250],
+            summary=str(item.get('summary') or '').strip()[:6000],raw_text=str(item.get('raw_text') or '').strip()[:60000],sort_order=index
+        )
+        s.add(unit);s.flush();created+=1
+        seen=set()
+        for topic_index,topic in enumerate(item.get('topics') or [],start=1):
+            name=' '.join(str(topic or '').split())[:500]
+            key=name.casefold()
+            if len(name)<2 or key in seen:continue
+            seen.add(key);s.add(SyllabusTopic(unit_id=unit.id,name=name,sort_order=topic_index))
+    return created
+
+
+def _generated_question_payload(item):
+    qtype=canonical_question_type(item.get('question_type'))
+    opts={k:str(item.get(f'option_{k.lower()}') or '').strip() for k in 'ABCD'}
+    answer_key=str(item.get('answer_key') or '').strip()
+    tolerance=str(item.get('answer_tolerance') or '').strip()
+    error=validate_question_definition(qtype,str(item.get('question') or '').strip(),opts,answer_key,tolerance)
+    if error:return None,error
+    legacy=answer_key[:1].upper() if qtype=='single_choice' and answer_key[:1].upper() in {'A','B','C','D'} else 'A'
+    try:marks=max(1,min(100,int(item.get('marks') or 1)))
+    except (TypeError,ValueError):marks=1
+    return {
+        'question_type':qtype,'question':str(item.get('question') or '').strip(),
+        'option_a':opts['A'],'option_b':opts['B'],'option_c':opts['C'],'option_d':opts['D'],
+        'correct_answer':legacy,'answer_key':answer_key,'answer_tolerance':tolerance,
+        'answer_case_sensitive':bool(item.get('answer_case_sensitive')),'marks':marks,
+        'difficulty':canonical_difficulty(item.get('difficulty')),'bloom_level':canonical_bloom(item.get('bloom_level')),
+        'topic':str(item.get('topic') or '').strip()[:500],'co_mapping':str(item.get('co_mapping') or '').strip()[:120],
+        'explanation':str(item.get('explanation') or '').strip()[:12000],
+    },None
+
+
+def refresh_exam_ai_review_pending(s,exam_id):
+    cfg=get_exam_config(s,exam_id,create=False)
+    if not cfg:return False
+    pending=s.scalar(
+        select(func.count()).select_from(ExamBankMap).join(BankQuestion,BankQuestion.id==ExamBankMap.bank_question_id)
+        .where(ExamBankMap.exam_id==exam_id,BankQuestion.ai_review_status=='pending')
+    ) or 0
+    cfg.ai_review_pending=bool(pending);cfg.updated_at=now_iso()
+    return bool(pending)
+
+
+def sync_bank_question_to_exam_snapshots(s,bq):
+    """Keep inactive draft exam snapshots aligned when a generated bank item is reviewed/edited."""
+    maps=s.scalars(select(ExamBankMap).where(ExamBankMap.bank_question_id==bq.id)).all()
+    touched=set()
+    for mapping in maps:
+        exam=s.get(Exam,mapping.exam_id)
+        if not exam or exam.is_active:continue
+        if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam.id)) or 0)>0:continue
+        q=s.get(Question,mapping.exam_question_id)
+        if not q:continue
+        q.question=bq.question;q.option_a=bq.option_a;q.option_b=bq.option_b;q.option_c=bq.option_c;q.option_d=bq.option_d
+        q.correct_answer=bq.correct_answer;q.question_type=canonical_question_type(bq.question_type);q.answer_key=bq.answer_key or bq.correct_answer
+        q.answer_tolerance=bq.answer_tolerance or '';q.answer_case_sensitive=bool(bq.answer_case_sensitive);q.marks=bq.marks
+        touched.add(exam.id)
+    for exam_id in touched:refresh_exam_ai_review_pending(s,exam_id)
+    return len(touched)
 
 
 def current_staff_name(s=None):
@@ -4966,6 +5195,192 @@ def delete_group(group_id):
     flash(f'{label} deleted. {member_count} student account'+(' was' if member_count==1 else 's were')+' left unassigned; practical lists and practical marks were not changed.')
     return redirect(url_for('academic_groups'))
 
+
+@app.route('/admin/academic-setup',methods=['GET','POST'])
+@staff_required
+def academic_setup():
+    s=DB()
+    if request.method=='POST':
+        action=(request.form.get('action') or '').strip()
+        if action=='create_institution':
+            if current_staff_role(s)!='super_admin':abort(403)
+            name=' '.join((request.form.get('institution_name') or '').split())
+            if not name:flash('Institution name is required.','error');return redirect(url_for('academic_setup'))
+            row=s.scalar(select(AcademicInstitution).where(func.lower(AcademicInstitution.name)==name.lower()))
+            if not row:
+                row=AcademicInstitution(name=name,short_name=(request.form.get('short_name') or '').strip() or name,city=(request.form.get('city') or '').strip(),state=(request.form.get('state') or '').strip(),country=(request.form.get('country') or 'India').strip(),is_active=True,created_by=actor_label(s),created_at=now_iso())
+                s.add(row);s.flush();audit_event(s,'academic_institution_created','academic_institution',row.id,name)
+            web_session['curriculum_institution_id']=row.id;s.commit();flash(f'{row.name} is now the active curriculum institution.');return redirect(url_for('academic_setup'))
+        if action=='switch_institution':
+            if current_staff_role(s)!='super_admin':abort(403)
+            try:institution_id=int(request.form.get('institution_id','0'))
+            except ValueError:institution_id=0
+            row=s.get(AcademicInstitution,institution_id)
+            if not row or not row.is_active:flash('Choose a valid institution.','error')
+            else:web_session['curriculum_institution_id']=row.id;flash(f'Curriculum workspace switched to {row.name}.')
+            return redirect(url_for('academic_setup'))
+        institution=current_curriculum_institution(s)
+        if not institution:
+            flash('Create an institution before adding programs or subjects.','error');return redirect(url_for('academic_setup'))
+        if action=='create_program':
+            name=' '.join((request.form.get('program_name') or '').split());academic_year=(request.form.get('academic_year') or '').strip()
+            if not name:flash('Program name is required.','error');return redirect(url_for('academic_setup'))
+            existing=s.scalar(select(CurriculumProgram).where(CurriculumProgram.institution_id==institution.id,func.lower(CurriculumProgram.name)==name.lower(),CurriculumProgram.academic_year==academic_year))
+            if existing:flash('That program/curriculum already exists.','error');return redirect(url_for('academic_setup'))
+            row=CurriculumProgram(institution_id=institution.id,name=name,department=(request.form.get('department') or '').strip(),academic_year=academic_year,is_active=True,created_by=actor_label(s),created_at=now_iso());s.add(row);s.flush();audit_event(s,'curriculum_program_created','curriculum_program',row.id,f'{institution.name} / {name} / {academic_year}');s.commit();flash('Program/curriculum added.');return redirect(url_for('academic_setup'))
+        if action=='create_subject':
+            try:program_id=int(request.form.get('program_id','0'))
+            except ValueError:program_id=0
+            program=s.get(CurriculumProgram,program_id)
+            name=' '.join((request.form.get('subject_name') or '').split())
+            if not program or program.institution_id!=institution.id or not name:flash('Choose a valid program and enter the subject name.','error');return redirect(url_for('academic_setup'))
+            semester=(request.form.get('semester') or '').strip()
+            existing=s.scalar(select(CurriculumSubject).where(CurriculumSubject.program_id==program.id,func.lower(CurriculumSubject.name)==name.lower(),CurriculumSubject.semester==semester))
+            if existing:flash('That subject already exists in this curriculum.','error');return redirect(url_for('academic_setup'))
+            row=CurriculumSubject(institution_id=institution.id,program_id=program.id,name=name,code=(request.form.get('subject_code') or '').strip(),semester=semester,credits=(request.form.get('credits') or '').strip(),is_active=True,created_by=actor_label(s),created_at=now_iso());s.add(row);s.flush()
+            catalog=s.scalar(select(SubjectCatalog).where(func.lower(SubjectCatalog.name)==name.lower()))
+            if not catalog:s.add(SubjectCatalog(name=name,category='Curriculum / Uploaded',course_semester=(f'{program.name} / Sem {semester}' if semester else program.name),is_active=True,created_by=actor_label(s),created_at=now_iso()))
+            audit_event(s,'curriculum_subject_created','curriculum_subject',row.id,f'{institution.name} / {program.name} / {name}');s.commit();flash('Subject added. Upload its syllabus next.');return redirect(url_for('academic_setup'))
+        flash('Unknown academic setup action.','error');return redirect(url_for('academic_setup'))
+    institutions=s.scalars(select(AcademicInstitution).where(AcademicInstitution.is_active==True).order_by(AcademicInstitution.name)).all()
+    institution=current_curriculum_institution(s)
+    if web_session.get('role')=='faculty' and institution:institutions=[institution]
+    programs=s.scalars(select(CurriculumProgram).where(CurriculumProgram.institution_id==institution.id,CurriculumProgram.is_active==True).order_by(CurriculumProgram.name)).all() if institution else []
+    program_ids=[p.id for p in programs]
+    subjects=s.scalars(select(CurriculumSubject).where(CurriculumSubject.program_id.in_(program_ids),CurriculumSubject.is_active==True).order_by(CurriculumSubject.name)).all() if program_ids else []
+    subject_cards=[]
+    for subject in subjects:
+        bundle=curriculum_subject_bundle(s,subject.id);doc=s.scalar(select(SyllabusDocument).where(SyllabusDocument.curriculum_subject_id==subject.id).order_by(SyllabusDocument.id.desc()))
+        generated_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.curriculum_subject_id==subject.id)) or 0
+        subject_cards.append({'bundle':bundle,'document':doc,'generated_count':generated_count})
+    return render_template('academic_setup.html',institutions=institutions,active_institution=institution,programs=programs,subject_cards=subject_cards,ai=ai_status(),staff_role=current_staff_role(s))
+
+
+@app.route('/admin/academic-setup/subject/<int:subject_id>/syllabus',methods=['POST'])
+@staff_required
+def upload_curriculum_syllabus(subject_id):
+    s=DB();bundle=curriculum_subject_bundle(s,subject_id)
+    if not bundle:abort(404)
+    file=request.files.get('syllabus_file');pasted=(request.form.get('syllabus_text') or '').strip();raw=b'';filename='pasted-syllabus.txt';content_type='text/plain';source_type='text';extracted=pasted;image=None
+    try:
+        if file and file.filename:
+            filename=secure_filename(file.filename) or 'syllabus-upload';content_type=file.mimetype or 'application/octet-stream';raw=file.read()
+            if not raw:raise ValueError('The uploaded syllabus file is empty.')
+            extracted,source_type=extract_upload_text(filename,content_type,raw)
+            if source_type=='image':image=(raw,content_type)
+            elif not extracted.strip():raise ValueError('No readable syllabus text was found in this file. If it is a scanned PDF, upload the syllabus page as an image or use a text-searchable PDF.')
+        elif not pasted:
+            raise ValueError('Upload a syllabus file or paste syllabus text.')
+        parsed=analyze_syllabus(extracted,subject_name=bundle['subject'].name,image=image)
+        if not (parsed.get('units') or []):raise ValueError('No syllabus units could be detected. Paste clearer unit/module headings or configure an AI provider.')
+    except (ValueError,AIProviderError) as exc:
+        flash(str(exc),'error');return redirect(url_for('academic_setup')+f'#curriculum-subject-{subject_id}')
+    provider=ai_status()
+    doc=SyllabusDocument(curriculum_subject_id=subject_id,filename=filename,content_type=content_type,source_type=source_type,extracted_text=extracted[:200000],summary=str(parsed.get('summary') or '')[:12000],status='review_pending',ai_provider=(provider['provider'] if provider['configured'] else 'deterministic'),created_by=actor_label(s),created_at=now_iso())
+    s.add(doc);s.flush();count=_replace_syllabus_structure(s,subject_id,doc.id,parsed);audit_event(s,'syllabus_uploaded','curriculum_subject',subject_id,f'file={filename}, source={source_type}, units={count}, parser={doc.ai_provider}');s.commit();flash(f'Syllabus parsed into {count} unit(s). Review the structure below, then confirm it.');return redirect(url_for('academic_setup')+f'#curriculum-subject-{subject_id}')
+
+
+@app.route('/admin/academic-setup/subject/<int:subject_id>/syllabus/confirm',methods=['POST'])
+@staff_required
+def confirm_curriculum_syllabus(subject_id):
+    s=DB();bundle=curriculum_subject_bundle(s,subject_id)
+    if not bundle:abort(404)
+    subject=bundle['subject']
+    doc=s.scalar(select(SyllabusDocument).where(SyllabusDocument.curriculum_subject_id==subject_id).order_by(SyllabusDocument.id.desc()))
+    if not doc:flash('Upload a syllabus first.','error');return redirect(url_for('academic_setup'))
+    doc.status='confirmed';audit_event(s,'syllabus_confirmed','curriculum_subject',subject_id,doc.filename);s.commit();flash('Syllabus confirmed and ready for AI question generation.');return redirect(url_for('academic_setup')+f'#curriculum-subject-{subject_id}')
+
+
+@app.route('/admin/academic-setup/unit/<int:unit_id>/update',methods=['POST'])
+@staff_required
+def update_curriculum_unit(unit_id):
+    s=DB();unit=s.get(SyllabusUnit,unit_id)
+    if not unit or not curriculum_subject_bundle(s,unit.curriculum_subject_id):abort(404)
+    unit.title=(request.form.get('title') or unit.title).strip()[:250];unit.summary=(request.form.get('summary') or '').strip()[:6000];unit.raw_text=(request.form.get('raw_text') or '').strip()[:60000]
+    s.execute(delete(SyllabusTopic).where(SyllabusTopic.unit_id==unit.id));topics=[]
+    for value in re.split(r'[\n;]+',request.form.get('topics','')):
+        name=' '.join(value.split())[:500]
+        if name and name.casefold() not in {x.casefold() for x in topics}:topics.append(name)
+    for idx,name in enumerate(topics,start=1):s.add(SyllabusTopic(unit_id=unit.id,name=name,sort_order=idx))
+    audit_event(s,'syllabus_unit_updated','syllabus_unit',unit.id,f'unit={unit.unit_no}, topics={len(topics)}');s.commit();flash(f'Unit {unit.unit_no} updated.');return redirect(url_for('academic_setup')+f'#curriculum-subject-{unit.curriculum_subject_id}')
+
+
+def _generate_ai_bank_questions(s,bundle,unit,topic,count,difficulty,created_by,question_types=None):
+    topics=s.scalars(select(SyllabusTopic).where(SyllabusTopic.unit_id==unit.id).order_by(SyllabusTopic.sort_order)).all()
+    result=generate_questions(institution=(bundle['institution'].name if bundle['institution'] else ''),program=(bundle['program'].name if bundle['program'] else ''),subject=bundle['subject'].name,unit_no=unit.unit_no,unit_title=unit.title,syllabus_text=unit.raw_text or unit.summary,topics=[t.name for t in topics],requested_topic=topic,count=count,difficulty=difficulty,question_types=(question_types or ['single_choice']))
+    created=[];errors=[];provider=ai_status()['provider']
+    course=(bundle['program'].name if bundle['program'] else '')+(f" / Sem {bundle['subject'].semester}" if bundle['subject'].semester else '')
+    for item in result.get('questions') or []:
+        payload,error=_generated_question_payload(item)
+        if error:errors.append(error);continue
+        duplicate=s.scalar(select(BankQuestion).where(BankQuestion.curriculum_subject_id==bundle['subject'].id,func.lower(BankQuestion.question)==payload['question'].lower()))
+        if duplicate:continue
+        bq=BankQuestion(subject=bundle['subject'].name,course_semester=course,unit=unit.unit_no,topic=payload['topic'] or topic,question_type=payload['question_type'],question=payload['question'],option_a=payload['option_a'],option_b=payload['option_b'],option_c=payload['option_c'],option_d=payload['option_d'],correct_answer=payload['correct_answer'],answer_key=payload['answer_key'],answer_tolerance=payload['answer_tolerance'],answer_case_sensitive=payload['answer_case_sensitive'],marks=payload['marks'],difficulty=payload['difficulty'],bloom_level=payload['bloom_level'],co_mapping=payload['co_mapping'],po_mapping='',pso_mapping='',tags='AI generated, syllabus grounded',practice_visibility='official_only',practical_experiment_no='',explanation=payload['explanation'],status='draft',version=1,created_by=created_by,created_at=now_iso(),updated_at=now_iso(),institution_id=bundle['subject'].institution_id,curriculum_subject_id=bundle['subject'].id,source=f'ai_{provider}',ai_review_status='pending')
+        s.add(bq);s.flush();created.append(bq)
+    return created,errors
+
+
+@app.route('/admin/academic-setup/subject/<int:subject_id>/generate-questions',methods=['POST'])
+@staff_required
+def curriculum_generate_questions(subject_id):
+    s=DB();bundle=curriculum_subject_bundle(s,subject_id)
+    if not bundle:abort(404)
+    confirmed=s.scalar(select(SyllabusDocument.id).where(SyllabusDocument.curriculum_subject_id==subject_id,SyllabusDocument.status=='confirmed').order_by(SyllabusDocument.id.desc()))
+    if not confirmed:flash('Confirm the syllabus before generating official Question Bank drafts.','error');return redirect(url_for('academic_setup')+f'#curriculum-subject-{subject_id}')
+    unit=_find_curriculum_unit(s,subject_id,request.form.get('unit'))
+    if not unit:flash('Choose a syllabus unit before generating questions.','error');return redirect(url_for('academic_setup')+f'#curriculum-subject-{subject_id}')
+    try:count=max(1,min(50,int(request.form.get('count','10'))))
+    except ValueError:count=10
+    try:
+        requested_type=canonical_question_type(request.form.get('question_type') or 'single_choice')
+        created,errors=_generate_ai_bank_questions(s,bundle,unit,(request.form.get('topic') or '').strip(),count,canonical_difficulty(request.form.get('difficulty')),actor_label(s),[requested_type])
+    except AIProviderError as exc:
+        s.rollback();flash(str(exc),'error');return redirect(url_for('academic_setup')+f'#curriculum-subject-{subject_id}')
+    audit_event(s,'ai_questions_generated','curriculum_subject',subject_id,f'unit={unit.unit_no}, requested={count}, created={len(created)}, errors={len(errors)}');s.commit();flash(f'Generated {len(created)} AI question(s) as Draft. Review and approve them in Question Bank.');return redirect(url_for('question_bank',subject=bundle['subject'].name,status='draft')+'#bank-questions')
+
+
+@app.route('/admin/exams/ai-from-curriculum',methods=['POST'])
+@staff_required
+def create_ai_exam_from_curriculum():
+    s=DB()
+    try:subject_id=int(request.form.get('curriculum_subject_id','0'))
+    except ValueError:subject_id=0
+    bundle=curriculum_subject_bundle(s,subject_id)
+    if not bundle:flash('Choose a valid curriculum subject.','error');return redirect(url_for('exams'))
+    confirmed=s.scalar(select(SyllabusDocument.id).where(SyllabusDocument.curriculum_subject_id==subject_id,SyllabusDocument.status=='confirmed').order_by(SyllabusDocument.id.desc()))
+    if not confirmed:flash('Confirm this subject syllabus before creating an AI-assisted exam.','error');return redirect(url_for('exams'))
+    unit=_find_curriculum_unit(s,subject_id,request.form.get('unit'))
+    if not unit:flash('Choose a syllabus unit for AI-assisted exam creation.','error');return redirect(url_for('exams'))
+    try:count=max(1,min(50,int(request.form.get('question_count','10'))));duration=max(1,min(600,int(request.form.get('duration','30'))))
+    except ValueError:count,duration=10,30
+    topic=(request.form.get('topic') or '').strip();difficulty=canonical_difficulty(request.form.get('difficulty'))
+    title=(request.form.get('exam_title') or '').strip() or f'{bundle["subject"].name} - Unit {unit.unit_no} - Set A'
+    exam=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(exam);s.flush();cfg=get_exam_config(s,exam.id,create=True);get_exam_approval(s,exam.id,create=True)
+    cfg.subject=bundle['subject'].name;cfg.course_semester=(bundle['program'].name if bundle['program'] else '')+(f" / Sem {bundle['subject'].semester}" if bundle['subject'].semester else '');cfg.unit_weights=json.dumps({unit.unit_no:1},ensure_ascii=False);cfg.institution_id=bundle['subject'].institution_id;cfg.curriculum_subject_id=bundle['subject'].id;cfg.randomize_questions=True;cfg.shuffle_options=True
+    stmt=select(BankQuestion).where(BankQuestion.curriculum_subject_id==subject_id,BankQuestion.unit==unit.unit_no,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
+    existing=s.scalars(stmt).all()
+    if topic:
+        focused=[q for q in existing if topic.casefold() in (q.topic or '').casefold() or topic.casefold() in (q.tags or '').casefold() or topic.casefold() in (q.question or '').casefold()]
+        if focused:existing=focused
+    random.shuffle(existing);added_existing=0
+    for bq in existing[:count]:
+        if copy_bank_question_to_exam(s,bq,exam.id):added_existing+=1
+    missing=max(0,count-added_existing);generated=[];errors=[]
+    if missing:
+        if ai_status()['configured']:
+            try:
+                requested_type=canonical_question_type(request.form.get('question_type') or 'single_choice')
+                generated,errors=_generate_ai_bank_questions(s,bundle,unit,topic,missing,difficulty,actor_label(s),[requested_type])
+            except AIProviderError as exc:
+                errors=[str(exc)]
+            for bq in generated:copy_bank_question_to_exam(s,bq,exam.id)
+        else:errors=['AI provider is not configured.']
+    pool_count=sync_manual_exam_question_count(s,exam.id);cfg.question_count=min(count,pool_count);cfg.pool_size=pool_count;cfg.ai_review_pending=bool(generated);cfg.last_generation_summary=f'Curriculum exam: existing approved={added_existing}, AI draft={len(generated)}, requested={count}, unit={unit.unit_no}, topic={topic or "all"}';cfg.updated_at=now_iso();audit_event(s,'curriculum_ai_exam_created','exam',exam.id,cfg.last_generation_summary);s.commit()
+    if generated:flash(f'Created “{title}” with {pool_count} question(s). {len(generated)} AI-generated question(s) require faculty review before activation.')
+    elif pool_count>=count:flash(f'Created “{title}” using {pool_count} approved syllabus-matched Question Bank questions.')
+    else:flash(f'Created “{title}” with {pool_count}/{count} question(s). '+('; '.join(errors) if errors else 'Add or generate more questions.'),'error')
+    return redirect(url_for('question_bank',subject=bundle['subject'].name,target_exam_id=exam.id)+'#bank-questions')
+
 @app.route('/admin/question-bank',methods=['GET','POST'])
 @staff_required
 def question_bank():
@@ -4975,7 +5390,11 @@ def question_bank():
         question=request.form.get('question','').strip();qdef=question_definition_from_form(request.form)
         subject_name=request.form.get('subject','').strip()
         catalog_subject=s.scalar(select(SubjectCatalog).where(SubjectCatalog.name==subject_name,SubjectCatalog.is_active==True)) if subject_name else None
-        duplicate=s.scalar(select(BankQuestion).where(BankQuestion.subject==subject_name,func.lower(BankQuestion.question)==question.lower())) if question and subject_name else None
+        active_inst=current_curriculum_institution(s)
+        duplicate_stmt=select(BankQuestion).where(BankQuestion.subject==subject_name,func.lower(BankQuestion.question)==question.lower()) if question and subject_name else None
+        duplicate_scope=bank_question_institution_scope(active_inst)
+        if duplicate_stmt is not None and duplicate_scope is not None:duplicate_stmt=duplicate_stmt.where(duplicate_scope)
+        duplicate=s.scalar(duplicate_stmt) if duplicate_stmt is not None else None
         if qdef['error']:flash(qdef['error'],'error')
         elif not catalog_subject:flash('Choose a subject from the Subject Catalog, or add your custom subject first.','error')
         elif duplicate:flash(f'A duplicate question already exists in this subject (Question #{duplicate.id}).','error')
@@ -4989,16 +5408,20 @@ def question_bank():
             if visibility=='practical_exam' and not practical_experiment_no:
                 flash('Enter the Practical Experiment No. before saving a Practical Exam question.','error')
                 return redirect(url_for('question_bank',subject=catalog_subject.name)+'#add-bank-question')
-            opts=qdef['options']
+            opts=qdef['options'];curriculum_subject=None
+            if active_inst:curriculum_subject=s.scalar(select(CurriculumSubject).where(CurriculumSubject.institution_id==active_inst.id,func.lower(CurriculumSubject.name)==catalog_subject.name.lower(),CurriculumSubject.is_active==True).order_by(CurriculumSubject.id.desc()))
             bq=BankQuestion(subject=catalog_subject.name,course_semester=course_semester,unit=request.form.get('unit','').strip(),topic=request.form.get('topic','').strip(),question_type=qdef['question_type'],question=question,
                 option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks,
-                difficulty=canonical_difficulty(request.form.get('difficulty')),bloom_level=canonical_bloom(request.form.get('bloom_level')),co_mapping=request.form.get('co_mapping','').strip(),po_mapping=request.form.get('po_mapping','').strip(),pso_mapping=request.form.get('pso_mapping','').strip(),tags=request.form.get('tags','').strip(),practice_visibility=visibility,practical_experiment_no=practical_experiment_no,explanation=request.form.get('explanation','').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso())
+                difficulty=canonical_difficulty(request.form.get('difficulty')),bloom_level=canonical_bloom(request.form.get('bloom_level')),co_mapping=request.form.get('co_mapping','').strip(),po_mapping=request.form.get('po_mapping','').strip(),pso_mapping=request.form.get('pso_mapping','').strip(),tags=request.form.get('tags','').strip(),practice_visibility=visibility,practical_experiment_no=practical_experiment_no,explanation=request.form.get('explanation','').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso(),institution_id=(active_inst.id if active_inst else None),curriculum_subject_id=(curriculum_subject.id if curriculum_subject else None),source='manual',ai_review_status='not_applicable')
             s.add(bq);s.flush();audit_event(s,'bank_question_created','bank_question',bq.id,f'status={status}, type={qdef["question_type"]}, subject={catalog_subject.name}, category={catalog_subject.category}, visibility={visibility}, practical_experiment={practical_experiment_no}');s.commit();flash('Question added to the bank.')
             return redirect(url_for('question_bank',subject=catalog_subject.name)+'#subject-workspace')
     q=(request.args.get('q') or '').strip(); category=(request.args.get('category') or '').strip(); subject=(request.args.get('subject') or '').strip(); unit=(request.args.get('unit') or '').strip(); difficulty=(request.args.get('difficulty') or '').strip(); status=(request.args.get('status') or '').strip(); practice_visibility=normalize_practice_visibility(request.args.get('practice_visibility')) if request.args.get('practice_visibility') else ''
     catalog_rows=s.scalars(select(SubjectCatalog).where(SubjectCatalog.is_active==True).order_by(SubjectCatalog.category,SubjectCatalog.name)).all()
     catalog_map={row.name:row for row in catalog_rows}
     stmt=select(BankQuestion)
+    active_curriculum_institution=current_curriculum_institution(s)
+    institution_scope=bank_question_institution_scope(active_curriculum_institution)
+    if institution_scope is not None:stmt=stmt.where(institution_scope)
     if q: stmt=stmt.where(or_(BankQuestion.question.ilike(f'%{q}%'),BankQuestion.topic.ilike(f'%{q}%'),BankQuestion.tags.ilike(f'%{q}%')))
     if category:
         category_subjects=[row.name for row in catalog_rows if row.category==category]
@@ -5009,9 +5432,13 @@ def question_bank():
     if status: stmt=stmt.where(BankQuestion.status==status)
     if practice_visibility: stmt=stmt.where(BankQuestion.practice_visibility==practice_visibility)
     rows=s.scalars(stmt.order_by(BankQuestion.id.desc())).all()
-    units=s.scalars(select(BankQuestion.unit).where(BankQuestion.unit!='').distinct().order_by(BankQuestion.unit)).all(); exams_list=s.scalars(select(Exam).order_by(Exam.id.desc())).all()
+    units_stmt=select(BankQuestion.unit).where(BankQuestion.unit!='')
+    counts_stmt=select(BankQuestion.subject,func.count()).group_by(BankQuestion.subject)
+    if institution_scope is not None:
+        units_stmt=units_stmt.where(institution_scope);counts_stmt=counts_stmt.where(institution_scope)
+    units=s.scalars(units_stmt.distinct().order_by(BankQuestion.unit)).all(); exams_list=s.scalars(select(Exam).order_by(Exam.id.desc())).all()
     usage=dict(s.execute(select(ExamBankMap.bank_question_id,func.count(func.distinct(ExamBankMap.exam_id))).group_by(ExamBankMap.bank_question_id)).all())
-    question_counts=dict(s.execute(select(BankQuestion.subject,func.count()).group_by(BankQuestion.subject)).all())
+    question_counts=dict(s.execute(counts_stmt).all())
     preloaded_packs=preloaded_pack_statuses(s)
     preloaded_categories=sorted({p.get('category','General') for p in preloaded_packs})
     catalog_groups=subject_catalog_groups(s)
@@ -5020,19 +5447,23 @@ def question_bank():
     selected_subject_stats=None
     selected_subject_units=[]
     if selected_catalog_subject:
-        approved_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved')) or 0
-        official_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))) or 0
-        practice_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))) or 0
-        draft_count=s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,BankQuestion.status=='draft')) or 0
+        def _subject_bank_count(*extra):
+            count_stmt=select(func.count()).select_from(BankQuestion).where(BankQuestion.subject==selected_catalog_subject.name,*extra)
+            if institution_scope is not None:count_stmt=count_stmt.where(institution_scope)
+            return s.scalar(count_stmt) or 0
+        approved_count=_subject_bank_count(BankQuestion.status=='approved')
+        official_count=_subject_bank_count(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
+        practice_count=_subject_bank_count(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))
+        draft_count=_subject_bank_count(BankQuestion.status=='draft')
         selected_subject_stats={'total':approved_count+draft_count,'approved':approved_count,'official':official_count,'practice':practice_count,'draft':draft_count}
-        selected_subject_units=[str(value).strip() for value in s.scalars(
-            select(BankQuestion.unit).where(
+        selected_units_stmt=select(BankQuestion.unit).where(
                 BankQuestion.subject==selected_catalog_subject.name,
                 BankQuestion.status=='approved',
                 BankQuestion.practice_visibility.in_(['official_only','both']),
                 BankQuestion.unit!=''
-            ).distinct()
-        ).all() if str(value or '').strip()]
+            )
+        if institution_scope is not None:selected_units_stmt=selected_units_stmt.where(institution_scope)
+        selected_subject_units=[str(value).strip() for value in s.scalars(selected_units_stmt.distinct()).all() if str(value or '').strip()]
         selected_subject_units.sort(key=lambda value:(int(value) if value.isdigit() else 10**9,value.casefold()))
     target_exam_id=request.args.get('target_exam_id',type=int)
     return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,selected_subject_units=selected_subject_units,units=units,exams=exams_list,usage=usage,target_exam_id=target_exam_id,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
@@ -5322,7 +5753,7 @@ def import_question_bank():
     if not target_catalog:required.add('subject')
     if not required.issubset(set(headers)):
         flash('Question bank file is missing required columns. Download the new template and try again.','error');return redirect(redirect_url)
-    added=invalid=duplicates=0
+    added=invalid=duplicates=0;active_inst=current_curriculum_institution(s)
     for r in rows:
         question=(r.get('question') or '').strip();qtype=canonical_question_type(r.get('question_type') or 'single_choice')
         options={key:(r.get(f'option_{key.lower()}') or '').strip() for key in 'ABCD'}
@@ -5340,14 +5771,17 @@ def import_question_bank():
             subject_name=target_catalog.name;course=(r.get('course_semester') or '').strip() or target_catalog.course_semester;category=target_catalog.category
         else:
             subject_name=(r.get('subject') or 'General').strip() or 'General';course=(r.get('course_semester') or '').strip();category=(r.get('category') or '').strip() or 'Imported / Other';ensure_subject_catalog_entry(s,subject_name,category,course,actor_label(s))
-        if s.scalar(select(BankQuestion.id).where(BankQuestion.subject==subject_name,func.lower(BankQuestion.question)==question.lower())):
+        duplicate_stmt=select(BankQuestion.id).where(BankQuestion.subject==subject_name,func.lower(BankQuestion.question)==question.lower())
+        import_scope=bank_question_institution_scope(active_inst)
+        if import_scope is not None:duplicate_stmt=duplicate_stmt.where(import_scope)
+        if s.scalar(duplicate_stmt):
             duplicates+=1;continue
         legacy=answer_key.strip().upper() if qtype=='single_choice' else 'A';legacy=legacy if legacy in {'A','B','C','D'} else 'A'
         case_sensitive=str(r.get('answer_case_sensitive') or '').strip().lower() in {'1','true','yes','y','on'}
         visibility=normalize_practice_visibility(r.get('practice_visibility'));practical_experiment_no=normalize_practical_exam_no(r.get('practical_experiment_no')) if visibility=='practical_exam' else ''
         if visibility=='practical_exam' and not practical_experiment_no:
             invalid+=1;continue
-        s.add(BankQuestion(subject=subject_name,course_semester=course,unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type=qtype,question=question,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=case_sensitive,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),po_mapping=(r.get('po_mapping') or '').strip(),pso_mapping=(r.get('pso_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),practice_visibility=visibility,practical_experiment_no=practical_experiment_no,explanation=(r.get('explanation') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso()));added+=1
+        s.add(BankQuestion(subject=subject_name,course_semester=course,unit=(r.get('unit') or '').strip(),topic=(r.get('topic') or '').strip(),question_type=qtype,question=question,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=case_sensitive,marks=marks,difficulty=canonical_difficulty(r.get('difficulty')),bloom_level=canonical_bloom(r.get('bloom_level')),co_mapping=(r.get('co_mapping') or '').strip(),po_mapping=(r.get('po_mapping') or '').strip(),pso_mapping=(r.get('pso_mapping') or '').strip(),tags=(r.get('tags') or '').strip(),practice_visibility=visibility,practical_experiment_no=practical_experiment_no,explanation=(r.get('explanation') or '').strip(),status=status,version=1,created_by=actor_label(s),created_at=now_iso(),updated_at=now_iso(),institution_id=(active_inst.id if active_inst else None),curriculum_subject_id=(s.scalar(select(CurriculumSubject.id).where(CurriculumSubject.institution_id==active_inst.id,func.lower(CurriculumSubject.name)==subject_name.lower()).order_by(CurriculumSubject.id.desc())) if active_inst else None),source='import',ai_review_status='not_applicable'));added+=1
     audit_event(s,'question_bank_bulk_import','bank_question','',f'added={added}, invalid={invalid}, duplicates={duplicates}, target_subject={target_subject or "mixed"}')
     s.commit();flash(f'Imported {added} question(s).'+(f' Skipped {invalid} invalid row(s).' if invalid else '')+(f' Skipped {duplicates} duplicate(s).' if duplicates else ''));return redirect(redirect_url)
 
@@ -5392,7 +5826,9 @@ def edit_bank_question(question_id):
         q.difficulty=canonical_difficulty(request.form.get('difficulty'));q.bloom_level=canonical_bloom(request.form.get('bloom_level'));q.co_mapping=request.form.get('co_mapping','').strip();q.po_mapping=request.form.get('po_mapping','').strip();q.pso_mapping=request.form.get('pso_mapping','').strip();q.tags=request.form.get('tags','').strip();q.practice_visibility=visibility;q.practical_experiment_no=practical_experiment_no;q.explanation=request.form.get('explanation','').strip();q.version+=1;q.updated_at=now_iso()
         if can_approve_content(s):q.status=request.form.get('status','draft') if request.form.get('status') in {'draft','approved'} else 'draft'
         else:q.status='draft'
-        audit_event(s,'bank_question_edited','bank_question',q.id,f'version={q.version}, status={q.status}');s.commit();flash('Question updated. Previous version was preserved.');return redirect(url_for('edit_bank_question',question_id=q.id))
+        if (q.source or '').startswith('ai_'):q.ai_review_status='approved' if q.status=='approved' else 'pending'
+        sync_bank_question_to_exam_snapshots(s,q)
+        audit_event(s,'bank_question_edited','bank_question',q.id,f'version={q.version}, status={q.status}, source={q.source}');s.commit();flash('Question updated. Previous version was preserved.');return redirect(url_for('edit_bank_question',question_id=q.id))
     seed_subject_catalog(s); return render_template('question_bank_edit.html',question=q,question_type=canonical_question_type(q.question_type),revisions=revisions,subject_groups=subject_catalog_groups(s))
 
 @app.route('/admin/question-bank/<int:question_id>/approve',methods=['POST'])
@@ -5400,7 +5836,7 @@ def edit_bank_question(question_id):
 def approve_bank_question(question_id):
     s=DB();q=s.get(BankQuestion,question_id)
     if not q:abort(404)
-    q.status='approved';q.updated_at=now_iso();audit_event(s,'bank_question_approved','bank_question',q.id,q.subject);s.commit();flash('Question approved.');return redirect(request.referrer or url_for('question_bank'))
+    q.status='approved';q.updated_at=now_iso();q.ai_review_status='approved' if (q.source or '').startswith('ai_') else q.ai_review_status;sync_bank_question_to_exam_snapshots(s,q);audit_event(s,'bank_question_approved','bank_question',q.id,f'{q.subject}; source={q.source}');s.commit();flash('Question approved. AI review lock was cleared where applicable.');return redirect(request.referrer or url_for('question_bank'))
 
 @app.route('/admin/question-bank/add-to-exam',methods=['POST'])
 @staff_required
@@ -5424,7 +5860,9 @@ def bank_add_to_exam():
     )
     # If the exam belongs to an existing subject, prevent accidental
     # cross-subject question mixing. Questions are never copied to any other exam.
-    if cfg and (cfg.subject or '').strip():
+    if cfg and getattr(cfg,'curriculum_subject_id',None):
+        stmt=stmt.where(BankQuestion.curriculum_subject_id==cfg.curriculum_subject_id)
+    elif cfg and (cfg.subject or '').strip():
         stmt=stmt.where(BankQuestion.subject==cfg.subject.strip())
     rows=s.scalars(stmt).all();added=0
     incoming_practical=[q for q in rows if normalize_practice_visibility(q.practice_visibility)=='practical_exam']
@@ -5544,15 +5982,33 @@ def exams():
             e=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(e);s.flush();get_exam_config(s,e.id,create=True);get_exam_approval(s,e.id,create=True);audit_event(s,'exam_created','exam',e.id,title);s.commit();flash('Exam created as draft.')
     subject_exam_options=[]
     voice_subject_catalog=[]
+    curriculum_exam_options=[]
+    active_curriculum_institution=current_curriculum_institution(s)
+    if active_curriculum_institution:
+        curriculum_subjects=s.scalars(select(CurriculumSubject).where(CurriculumSubject.institution_id==active_curriculum_institution.id,CurriculumSubject.is_active==True).order_by(CurriculumSubject.name)).all()
+        for curriculum_subject in curriculum_subjects:
+            bundle=curriculum_subject_bundle(s,curriculum_subject.id)
+            doc=s.scalar(select(SyllabusDocument).where(SyllabusDocument.curriculum_subject_id==curriculum_subject.id,SyllabusDocument.status=='confirmed').order_by(SyllabusDocument.id.desc()))
+            if not bundle or not doc:continue
+            units=[]
+            for item in bundle['units']:
+                unit=item['row'];topics=[t.name for t in item['topics']]
+                units.append({'value':unit.unit_no,'label':f'Unit {unit.unit_no} - {unit.title}' if unit.title else f'Unit {unit.unit_no}','title':unit.title,'summary':unit.summary,'topics':topics})
+            curriculum_exam_options.append({'id':curriculum_subject.id,'name':curriculum_subject.name,'institution':active_curriculum_institution.name,'program':bundle['program'].name if bundle['program'] else '','semester':curriculum_subject.semester,'units':units})
     catalog_subjects=s.scalars(select(SubjectCatalog).where(SubjectCatalog.is_active==True).order_by(SubjectCatalog.name)).all()
+    exam_bank_scope=bank_question_institution_scope(active_curriculum_institution)
     for catalog_subject in catalog_subjects:
-        unit_rows=s.execute(
+        unit_count_stmt=(
             select(BankQuestion.unit,func.count(BankQuestion.id))
             .where(
                 BankQuestion.subject==catalog_subject.name,
                 BankQuestion.status=='approved',
                 BankQuestion.practice_visibility.in_(['official_only','both','practical_exam'])
             )
+        )
+        if exam_bank_scope is not None:unit_count_stmt=unit_count_stmt.where(exam_bank_scope)
+        unit_rows=s.execute(
+            unit_count_stmt
             .group_by(BankQuestion.unit)
             .order_by(BankQuestion.unit)
         ).all()
@@ -5586,7 +6042,7 @@ def exams():
         practical_experiment_no=(resolved_meta.get('experiment_no') or (getattr(cfg,'practical_experiment_no','') if cfg else '') or '')
         practical_code_start_at=(getattr(cfg,'practical_code_start_at','') or '') if cfg else ''
         practical_code_end_at=(getattr(cfg,'practical_code_end_at','') or '') if cfg else ''
-        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no,'practical_code_start_at':practical_code_start_at,'practical_code_end_at':practical_code_end_at})())
+        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no,'practical_code_start_at':practical_code_start_at,'practical_code_end_at':practical_code_end_at,'ai_review_pending':bool(getattr(cfg,'ai_review_pending',False))})())
 
     grouped={}
     for row in rows:
@@ -5595,7 +6051,8 @@ def exams():
     return render_template(
         'exams.html',exams=rows,exam_groups=exam_groups,
         subject_exam_options=subject_exam_options,catalog_subjects=catalog_subjects,
-        voice_subject_catalog=voice_subject_catalog
+        voice_subject_catalog=voice_subject_catalog,curriculum_exam_options=curriculum_exam_options,
+        active_curriculum_institution=active_curriculum_institution,ai=ai_status()
     )
 
 @app.route('/admin/exam/<int:exam_id>/edit-metadata',methods=['POST'])
@@ -5781,6 +6238,7 @@ def toggle_exam(exam_id):
     s=DB();e=s.get(Exam,exam_id)
     if e:
         if not e.is_active and (s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0)==0:flash('Add questions before activating this exam.','error');return redirect(url_for('exams'))
+        if not e.is_active and refresh_exam_ai_review_pending(s,exam_id):s.commit();flash('Review and approve all AI-generated questions before activating this exam.','error');return redirect(url_for('question_bank',target_exam_id=exam_id,status='draft')+'#bank-questions')
         if not e.is_active:
             approval=get_exam_approval(s,exam_id,create=True)
             if approval.status!='approved':
@@ -5984,7 +6442,8 @@ def exam_builder(exam_id):
         if action=='generate':
             if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)>0:flash('This exam already has attempts. The question pool is locked to protect result integrity.','error');s.rollback();return redirect(url_for('exam_builder',exam_id=exam_id))
             stmt=select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
-            if cfg.subject:stmt=stmt.where(BankQuestion.subject==cfg.subject)
+            if getattr(cfg,'curriculum_subject_id',None):stmt=stmt.where(BankQuestion.curriculum_subject_id==cfg.curriculum_subject_id)
+            elif cfg.subject:stmt=stmt.where(BankQuestion.subject==cfg.subject)
             if cfg.course_semester:stmt=stmt.where(BankQuestion.course_semester==cfg.course_semester)
             candidates=s.scalars(stmt).all()
             if unit_weights:candidates=[q for q in candidates if (q.unit or '').strip() in unit_weights]
@@ -6494,7 +6953,11 @@ def faculty_users():
         else:
             try:
                 role=request.form.get('staff_role','faculty') if request.form.get('staff_role') in {'faculty','hod','exam_controller'} else 'faculty'
-                row=Faculty(username=username,name=name,password_hash=generate_password_hash(password),is_active=True,created_at=now_iso());s.add(row);s.flush();s.add(FacultyRole(faculty_id=row.id,role=role,department=request.form.get('department','').strip(),updated_at=now_iso()));audit_event(s,'faculty_created','faculty',row.id,f'{username}, role={role}');s.commit();flash('Staff login created.')
+                row=Faculty(username=username,name=name,password_hash=generate_password_hash(password),is_active=True,created_at=now_iso());s.add(row);s.flush();
+                try:institution_id=int(request.form.get('institution_id','0') or 0)
+                except ValueError:institution_id=0
+                if institution_id and not s.get(AcademicInstitution,institution_id):institution_id=0
+                s.add(FacultyRole(faculty_id=row.id,role=role,department=request.form.get('department','').strip(),institution_id=(institution_id or None),updated_at=now_iso()));audit_event(s,'faculty_created','faculty',row.id,f'{username}, role={role}, institution={institution_id or "unassigned"}');s.commit();flash('Staff login created.')
             except IntegrityError:s.rollback();flash('That faculty username already exists.','error')
     rows=s.scalars(select(Faculty).order_by(Faculty.username)).all()
     role_map={r.faculty_id:r for r in s.scalars(select(FacultyRole)).all()}
@@ -6502,7 +6965,7 @@ def faculty_users():
     # manage another HOD, an Exam Controller, or the Super Admin account here.
     if viewer_role=='hod':
         rows=[f for f in rows if (role_map.get(f.id).role if role_map.get(f.id) else 'faculty')=='faculty']
-    return render_template('faculty.html',faculty=rows,role_map=role_map,role_labels=ROLE_LABELS,viewer_role=viewer_role)
+    institutions=s.scalars(select(AcademicInstitution).where(AcademicInstitution.is_active==True).order_by(AcademicInstitution.name)).all();institution_map={x.id:x for x in institutions};return render_template('faculty.html',faculty=rows,role_map=role_map,role_labels=ROLE_LABELS,viewer_role=viewer_role,institutions=institutions,institution_map=institution_map)
 
 @app.route('/admin/faculty/<int:faculty_id>/password',methods=['POST'])
 @staff_required
@@ -6562,10 +7025,13 @@ def update_faculty_role(faculty_id):
     if not faculty:abort(404)
     role=request.form.get('staff_role','faculty')
     if role not in {'faculty','hod','exam_controller'}:flash('Invalid staff role.','error');return redirect(url_for('faculty_users'))
+    try:institution_id=int(request.form.get('institution_id','0') or 0)
+    except ValueError:institution_id=0
+    if institution_id and not s.get(AcademicInstitution,institution_id):institution_id=0
     row=s.scalar(select(FacultyRole).where(FacultyRole.faculty_id==faculty_id))
-    if row:row.role=role;row.department=request.form.get('department','').strip();row.updated_at=now_iso()
-    else:s.add(FacultyRole(faculty_id=faculty_id,role=role,department=request.form.get('department','').strip(),updated_at=now_iso()))
-    audit_event(s,'faculty_role_updated','faculty',faculty_id,f'role={role}');s.commit();flash('Staff role updated.');return redirect(url_for('faculty_users'))
+    if row:row.role=role;row.department=request.form.get('department','').strip();row.institution_id=institution_id or None;row.updated_at=now_iso()
+    else:s.add(FacultyRole(faculty_id=faculty_id,role=role,department=request.form.get('department','').strip(),institution_id=institution_id or None,updated_at=now_iso()))
+    audit_event(s,'faculty_role_updated','faculty',faculty_id,f'role={role}, institution={institution_id or "unassigned"}');s.commit();flash('Staff role updated.');return redirect(url_for('faculty_users'))
 
 @app.route('/admin/audit')
 @admin_required

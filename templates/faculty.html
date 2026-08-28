@@ -7,17 +7,17 @@
 </div>
 
 {% if viewer_role=='super_admin' %}
-<div class="card"><h2>Create Staff Login</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Name</label><input name="name" required></div><div><label>Username</label><input name="username" required></div><div><label>Password</label><input type="password" name="password" minlength="10" required autocomplete="new-password"></div><div><label>Role</label><select name="staff_role"><option value="faculty">Faculty</option><option value="hod">HOD</option><option value="exam_controller">Exam Controller</option></select></div><div><label>Department</label><input name="department" placeholder="CSE"></div></div><button>Create Staff Login</button></form></div>
+<div class="card"><h2>Create Staff Login</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Name</label><input name="name" required></div><div><label>Username</label><input name="username" required></div><div><label>Password</label><input type="password" name="password" minlength="10" required autocomplete="new-password"></div><div><label>Role</label><select name="staff_role"><option value="faculty">Faculty</option><option value="hod">HOD</option><option value="exam_controller">Exam Controller</option></select></div><div><label>Department</label><input name="department" placeholder="CSE"></div><div><label>Institution</label><select name="institution_id"><option value="">Unassigned / global</option>{% for inst in institutions %}<option value="{{ inst.id }}">{{ inst.name }}</option>{% endfor %}</select></div></div><button>Create Staff Login</button></form></div>
 {% endif %}
 
 <div class="card"><h2>{% if viewer_role=='hod' %}Faculty Accounts{% else %}Staff Accounts{% endif %}</h2>
-<div class="table-wrap"><table><tr><th>Username</th><th>Name</th><th>Role</th><th>Department</th><th>Status</th><th>MFA</th><th>Actions</th></tr>
+<div class="table-wrap"><table><tr><th>Username</th><th>Name</th><th>Role</th><th>Department</th><th>Institution</th><th>Status</th><th>MFA</th><th>Actions</th></tr>
 {% for f in faculty %}{% set role=role_map.get(f.id) %}{% set target_role=role.role if role else 'faculty' %}
 <tr>
-  <td><strong>{{ f.username }}</strong></td><td>{{ f.name }}</td><td><span class="badge">{{ role_labels.get(target_role,'Faculty') }}</span></td><td>{{ role.department if role else '-' }}</td><td>{% if f.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge gray">Disabled</span>{% endif %}</td><td>{% if f.mfa_enabled %}<span class="badge success">Enabled</span>{% else %}<span class="badge gray">Off</span>{% endif %}</td>
+  <td><strong>{{ f.username }}</strong></td><td>{{ f.name }}</td><td><span class="badge">{{ role_labels.get(target_role,'Faculty') }}</span></td><td>{{ role.department if role else '-' }}</td><td>{{ institution_map.get(role.institution_id).name if role and role.institution_id and institution_map.get(role.institution_id) else 'Global / unassigned' }}</td><td>{% if f.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge gray">Disabled</span>{% endif %}</td><td>{% if f.mfa_enabled %}<span class="badge success">Enabled</span>{% else %}<span class="badge gray">Off</span>{% endif %}</td>
   <td><div class="actions staff-account-actions">
     {% if viewer_role=='super_admin' %}
-    <form method="post" action="{{ url_for('update_faculty_role',faculty_id=f.id) }}" class="inline-role-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><select name="staff_role"><option value="faculty" {% if target_role=='faculty' %}selected{% endif %}>Faculty</option><option value="hod" {% if target_role=='hod' %}selected{% endif %}>HOD</option><option value="exam_controller" {% if target_role=='exam_controller' %}selected{% endif %}>Exam Controller</option></select><input name="department" value="{{ role.department if role else '' }}" placeholder="Dept"><button class="btn small secondary">Update</button></form>
+    <form method="post" action="{{ url_for('update_faculty_role',faculty_id=f.id) }}" class="inline-role-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><select name="staff_role"><option value="faculty" {% if target_role=='faculty' %}selected{% endif %}>Faculty</option><option value="hod" {% if target_role=='hod' %}selected{% endif %}>HOD</option><option value="exam_controller" {% if target_role=='exam_controller' %}selected{% endif %}>Exam Controller</option></select><input name="department" value="{{ role.department if role else '' }}" placeholder="Dept"><select name="institution_id"><option value="">Global</option>{% for inst in institutions %}<option value="{{ inst.id }}" {% if role and role.institution_id==inst.id %}selected{% endif %}>{{ inst.short_name or inst.name }}</option>{% endfor %}</select><button class="btn small secondary">Update</button></form>
     <form method="post" action="{{ url_for('toggle_faculty',faculty_id=f.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">{% if f.is_active %}Disable{% else %}Enable{% endif %}</button></form>
     {% endif %}
     {% if (viewer_role=='super_admin' or (viewer_role=='hod' and target_role=='faculty')) and f.mfa_enabled %}<form method="post" action="{{ url_for('reset_faculty_mfa',faculty_id=f.id) }}" onsubmit="return confirm('Reset MFA for {{ f.username }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">Reset MFA</button></form>{% endif %}
@@ -34,6 +34,6 @@
     {% endif %}
   </div></td>
 </tr>
-{% else %}<tr><td colspan="7">No accounts are available for password management.</td></tr>{% endfor %}
+{% else %}<tr><td colspan="8">No accounts are available for password management.</td></tr>{% endfor %}
 </table></div></div>
 {% endblock %}

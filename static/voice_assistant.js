@@ -432,6 +432,37 @@
     return rows.map(r=>({label:safeText(r.name),catalog:r,value:String(r.id||'')})).filter(r=>r.label);
   }
 
+  function curriculumSubjectCandidates(){
+    const rows=Array.isArray(window.EXAM_VOICE_CURRICULUM_CATALOG)?window.EXAM_VOICE_CURRICULUM_CATALOG:[];
+    return rows.map(r=>({label:safeText(r.name),curriculum:r,value:String(r.id||'')})).filter(r=>r.label);
+  }
+
+  function extractQuestionCount(text){
+    const n=normalizeLoose(replaceNumberWords(text));
+    let m=n.match(/\b(\d{1,2})\s*(?:questions?|mcqs?|items?)\b/)||n.match(/\b(?:questions?|mcqs?)\s*(?:count|number)?\s*(?:is|to|of)?\s*(\d{1,2})\b/);
+    return m?Math.max(1,Math.min(50,Number(m[1]))):null;
+  }
+
+  function inferCurriculumQuestionType(text){
+    const n=normalizeLoose(text);
+    if(/\b(multiple\s*(?:select|selection|answer)|multi\s*select|msq)\b/.test(n))return 'multiple_select';
+    if(/\b(true\s*(?:or|\/)?\s*false|true false|t\s*f)\b/.test(n))return 'true_false';
+    if(/\b(numerical|numeric|calculation|calculate)\b/.test(n))return 'numerical';
+    if(/\b(short\s*(?:answer|text)|one\s*word)\b/.test(n))return 'short_text';
+    if(/\b(descriptive|description|essay|long\s*answer|10\s*mark)\b/.test(n))return 'essay';
+    return 'single_choice';
+  }
+
+  function curriculumTopicMatch(row,unitValue,text){
+    const units=Array.isArray(row&&row.units)?row.units:[];
+    const unit=units.find(u=>normalize(String(u.value||''))===normalize(String(unitValue||'')))||null;
+    if(!unit)return {topic:'',unit:null};
+    const candidates=(unit.topics||[]).map(t=>({label:safeText(t),value:safeText(t)})).filter(x=>x.label);
+    const ranked=rankCandidates(candidates,text);
+    const best=ranked[0];
+    return {topic:(best&&best.score>=.74?best.value:''),unit};
+  }
+
   function resolveSubject(select,text,onResolved){
     const available=subjectCandidatesFromSelect(select);
     const result=chooseCandidate(available,text);
@@ -456,39 +487,67 @@
     const n=normalizeLoose(replaceNumberWords(text));
     const explicitCreate=isCreateVerb(n)&&hasExamNoun(n);
     const naturalNeed=/\b(want|need|conduct|hold)\b/.test(n)&&hasExamNoun(n)&&!wantsView(n);
-    const shorthandCreate=hasExamNoun(n)&&!wantsView(n)&&Boolean(extractDuration(n)||/\bunit\b/.test(n))&&!/\b(activate|deactivate|approve|approval|schedule|session)\b/.test(n);
+    const shorthandCreate=hasExamNoun(n)&&!wantsView(n)&&Boolean(extractDuration(n)||extractQuestionCount(n)||/\bunit\b/.test(n))&&!/\b(activate|deactivate|approve|approval|schedule|session)\b/.test(n);
     if(!explicitCreate&&!naturalNeed&&!shorthandCreate)return false;
     if(!isRoute('exams'))return queueForRoute(text,'exams');
 
+    // Prefer the institution-specific curriculum form when the spoken subject has
+    // a confirmed syllabus. This allows an empty Question Bank to be completed by
+    // AI instead of creating a zero-question exam.
+    const curriculumForm=document.getElementById('ai-curriculum-exam-form');
+    const curriculumSelect=document.getElementById('ai-curriculum-subject');
+    const curriculumCandidates=curriculumSubjectCandidates();
+    if(curriculumForm&&curriculumSelect&&curriculumCandidates.length){
+      const resolved=chooseCandidate(curriculumCandidates,n);
+      if(resolved.match){
+        const row=resolved.match.curriculum||{};
+        curriculumSelect.value=resolved.match.value;curriculumSelect.dispatchEvent(new Event('change',{bubbles:true}));
+        const unitSelect=document.getElementById('ai-curriculum-unit');
+        const unitInfo=extractUnitInfo(n);let unitValue='';
+        const units=Array.isArray(row.units)?row.units:[];
+        if(unitInfo.specified&&!unitInfo.all){
+          const exact=units.find(u=>normalize(String(u.value||''))===normalize(String(unitInfo.value||''))||normalize(u.label||'')===`unit ${normalize(unitInfo.value)}`);
+          if(!exact){respond(`I matched ${row.name}, but Unit ${unitInfo.value} is not present in its confirmed syllabus.`,'error');return true;}
+          unitValue=String(exact.value||'');
+        }else if(units.length===1){unitValue=String(units[0].value||'');}
+        else{respond(`I matched “${row.name}”. Tell me which syllabus unit to use, for example “Unit 2”.`,'warning');return true;}
+        if(unitSelect){unitSelect.value=unitValue;unitSelect.dispatchEvent(new Event('change',{bubbles:true}));}
+        const duration=extractDuration(n)||30;const questionCount=extractQuestionCount(n)||10;
+        const diff=/\bhard\b/.test(n)?'Hard':(/\beasy\b/.test(n)?'Easy':'Medium');
+        const topicInfo=curriculumTopicMatch(row,unitValue,n);let topic=topicInfo.topic||'';
+        const explicitTopic=n.match(/\b(?:topic|on|about|from)\s+(.+?)(?=\s+(?:for\s+)?\d+\s*(?:minutes?|mins?|questions?|mcqs?)|\s+\b(?:easy|medium|hard)\b|$)/);
+        if(explicitTopic&&explicitTopic[1]&&explicitTopic[1].length<120){
+          const cleaned=explicitTopic[1].replace(/\b(unit|exam|test|quiz|paper)\b.*$/,'').trim();if(cleaned.length>2)topic=cleaned;
+        }
+        const countInput=document.getElementById('ai-curriculum-count'),durationInput=document.getElementById('ai-curriculum-duration'),topicInput=document.getElementById('ai-curriculum-topic'),difficultyInput=document.getElementById('ai-curriculum-difficulty'),typeInput=document.getElementById('ai-curriculum-question-type'),titleInput=document.getElementById('ai-curriculum-title');
+        const questionType=inferCurriculumQuestionType(n);
+        if(countInput)countInput.value=String(questionCount);if(durationInput)durationInput.value=String(duration);if(topicInput)topicInput.value=topic;if(difficultyInput)difficultyInput.value=diff;if(typeInput)typeInput.value=questionType;
+        const unitLabel=`Unit ${unitValue}`;const title=extractTitle(text,{specified:true,all:false,value:unitValue},row.name);if(titleInput)titleInput.value=title;
+        const correction=resolved.confidence<.97?'<div class="voice-smart-note">✓ Subject matched using curriculum context and typo/alias tolerance.</div>':'';
+        const summary=`${correction}<div class="voice-summary-grid"><span>Action</span><strong>Create syllabus-grounded draft exam</strong><span>Institution</span><strong>${htmlEscape(row.institution||'Active institution')}</strong><span>Subject</span><strong>${htmlEscape(row.name)}</strong><span>Unit</span><strong>${htmlEscape(unitLabel)}</strong><span>Topic</span><strong>${htmlEscape(topic||'Entire unit')}</strong><span>Questions</span><strong>${questionCount}</strong><span>Type</span><strong>${htmlEscape(questionType.replaceAll('_',' '))}</strong><span>Difficulty</span><strong>${diff}</strong><span>Duration</span><strong>${duration} minutes</strong></div><div class="voice-smart-note">Approved Question Bank items are reused first. If more are needed, AI generates syllabus-grounded draft questions and the exam cannot be activated until they are reviewed.</div>`;
+        confirm('Create this syllabus-grounded exam?',summary,()=>{writeContext({subject:row.name,unit:unitValue,examTitle:title,title,route:'exams'});setStatus('Creating exam and preparing questions…');curriculumForm.requestSubmit();},'Confirm & Create');return true;
+      }
+      if(resolved.ambiguous){showSuggestions('Which curriculum subject did you mean?',resolved.ranked.filter(r=>r.score>=MATCH_MEDIUM).slice(0,4),chosen=>{const revised=`${text} ${chosen.label}`;handleCommand(revised);});return true;}
+    }
+
+    // Legacy/manual Question Bank workflow remains available when no confirmed
+    // curriculum subject matches the request.
     const subjectSelect=document.getElementById('existing-subject-exam-subject');
     const unitSelect=document.getElementById('existing-subject-exam-unit');
-    if(!subjectSelect){respond('The existing-subject exam form is not available on this page.','error');return true;}
-
+    if(!subjectSelect){respond('No subject creation form is available on this page. Add/confirm a syllabus in Academic Setup or add approved Question Bank questions.','error');return true;}
     const finish=(subjectMatch,confidence)=>{
-      const subjectOption=subjectMatch.option;
-      if(!subjectOption)return;
+      const subjectOption=subjectMatch.option;if(!subjectOption)return;
       subjectSelect.value=subjectOption.value;subjectSelect.dispatchEvent(new Event('change',{bubbles:true}));
       const unitInfo=extractUnitInfo(n);
       if(unitInfo.specified&&!unitInfo.all&&unitSelect){
         const rankedUnits=[...unitSelect.options].filter(o=>o.value).map(o=>({label:safeText(o.textContent),option:o,value:o.value}));
         const exact=rankedUnits.find(c=>normalize(c.value)===normalize(unitInfo.value)||normalize(c.label)===`unit ${normalize(unitInfo.value)}`||normalize(c.label)===normalize(unitInfo.value));
-        if(exact)unitSelect.value=exact.option.value;
-        else{respond(`I understood Unit ${unitInfo.value}, but that unit is not available for ${subjectOption.textContent.trim()}.`,'error');return;}
+        if(exact)unitSelect.value=exact.option.value;else{respond(`I understood Unit ${unitInfo.value}, but that unit is not available for ${subjectOption.textContent.trim()}.`,'error');return;}
       }else if(unitSelect)unitSelect.value='';
-
-      const duration=extractDuration(n)||20;
-      const form=subjectSelect.closest('form');
-      const titleInput=form&&form.querySelector('[name="exam_title"]');
-      const durationInput=form&&form.querySelector('[name="duration"]');
-      const subjectName=subjectOption.textContent.trim();
-      const title=extractTitle(text,unitInfo,subjectName);
-      if(titleInput)titleInput.value=title;if(durationInput)durationInput.value=String(duration);
-      const unitLabel=unitInfo.specified&&!unitInfo.all?`Unit ${unitInfo.value}`:'All Units';
-      const correction=confidence<.97?'<div class="voice-smart-note">✓ Subject name was matched using typo/alias tolerance.</div>':'';
-      const summary=`${correction}<div class="voice-summary-grid"><span>Action</span><strong>Create draft exam</strong><span>Subject</span><strong>${htmlEscape(subjectName)}</strong><span>Unit</span><strong>${htmlEscape(unitLabel)}</strong><span>Title</span><strong>${htmlEscape(title)}</strong><span>Duration</span><strong>${duration} minutes</strong></div>`;
+      const duration=extractDuration(n)||20;const form=subjectSelect.closest('form');const titleInput=form&&form.querySelector('[name="exam_title"]');const durationInput=form&&form.querySelector('[name="duration"]');const subjectName=subjectOption.textContent.trim();const title=extractTitle(text,unitInfo,subjectName);
+      if(titleInput)titleInput.value=title;if(durationInput)durationInput.value=String(duration);const unitLabel=unitInfo.specified&&!unitInfo.all?`Unit ${unitInfo.value}`:'All Units';const correction=confidence<.97?'<div class="voice-smart-note">✓ Subject name was matched using typo/alias tolerance.</div>':'';const summary=`${correction}<div class="voice-summary-grid"><span>Action</span><strong>Create manual draft exam</strong><span>Subject</span><strong>${htmlEscape(subjectName)}</strong><span>Unit</span><strong>${htmlEscape(unitLabel)}</strong><span>Title</span><strong>${htmlEscape(title)}</strong><span>Duration</span><strong>${duration} minutes</strong></div>`;
       confirm('Create this exam?',summary,()=>{writeContext({subject:subjectName,unit:unitInfo.all?'':unitInfo.value,examTitle:title,title,route:'exams'});if(form){setStatus('Creating draft exam…');form.requestSubmit();}},'Confirm & Create');
     };
-
     resolveSubject(subjectSelect,n,finish);return true;
   }
 
@@ -654,10 +713,22 @@
 
   function activeExamCommand(text){const n=normalizeLoose(text);if(!(wantsView(n)&&/\bactive\s+exams?\b/.test(n)))return false;if(!isRoute('exams'))return queueForRoute(text,'exams');const rows=examCandidates().filter(c=>[...c.row.querySelectorAll('.badge')].some(b=>normalize(b.textContent)==='active'));if(!rows.length){respond('There are no active exams in the list.');return true;}rows.forEach(c=>{c.row.classList.add(HIGHLIGHT_CLASS);setTimeout(()=>c.row.classList.remove(HIGHLIGHT_CLASS),5000);});rows[0].row.scrollIntoView({behavior:'smooth',block:'center'});respond(`${rows.length} active exam${rows.length===1?'':'s'} highlighted.`);return true;}
 
+  function syllabusSummaryCommand(text){
+    const n=normalizeLoose(replaceNumberWords(text));
+    if(!/\b(summary|summarize|summarise|syllabus|topics?|what is in|what comes in)\b/.test(n))return false;
+    const candidates=curriculumSubjectCandidates();if(!candidates.length)return false;
+    const resolved=chooseCandidate(candidates,n);if(!resolved.match)return false;
+    const row=resolved.match.curriculum||{};const unitInfo=extractUnitInfo(n);const units=Array.isArray(row.units)?row.units:[];let unit=null;
+    if(unitInfo.specified&&!unitInfo.all)unit=units.find(u=>normalize(String(u.value||''))===normalize(String(unitInfo.value||'')));
+    if(!unit&&units.length===1)unit=units[0];
+    if(!unit){respond(`I matched ${row.name}. Mention a unit number so I can show its syllabus summary.`,'warning');return true;}
+    const topics=(unit.topics||[]).slice(0,15);const html=`<div class="voice-summary-grid"><span>Subject</span><strong>${htmlEscape(row.name)}</strong><span>Unit</span><strong>${htmlEscape(String(unit.value||''))} — ${htmlEscape(unit.title||'')}</strong><span>Summary</span><strong>${htmlEscape(unit.summary||'No summary saved.')}</strong><span>Topics</span><strong>${htmlEscape(topics.join(', ')||'No topics saved.')}</strong></div>`;confirm('Syllabus summary',html,()=>{cancelConfirm();},'Close');return true;
+  }
+
   function handleCommand(rawText,fromPending=false){
     const text=safeText(rawText);if(!text)return;const normalized=normalizeLoose(replaceNumberWords(text));if(!fromPending){setTranscript(text);inputEl.value=text;}confirmBox.hidden=true;confirmAction=null;clearSuggestions();setStatus('Understanding what you mean…');
     if(protectedCommand(normalized)){respond('For safety, voice cannot execute deletion, password, role, reset, restore, or backup operations. Use the normal admin screen for those actions.','error');return;}
-    if(createExamCommand(text))return;if(openBlueprintCommand(text))return;if(examStateCommand(text))return;if(activeExamCommand(text))return;if(studentFindCommand(text))return;if(scheduleCommand(text))return;if(blueprintCommand(text))return;if(navigationIntent(text))return;
+    if(syllabusSummaryCommand(text))return;if(createExamCommand(text))return;if(openBlueprintCommand(text))return;if(examStateCommand(text))return;if(activeExamCommand(text))return;if(studentFindCommand(text))return;if(scheduleCommand(text))return;if(blueprintCommand(text))return;if(navigationIntent(text))return;
     if(/\b(help|commands?|examples?)\b|what can you do|kya kar sakte/.test(normalized)){openPanel();helpBox.hidden=false;setStatus('You can speak naturally; these are examples, not fixed commands.');return;}
     respond('I understood the words, but I am not confident enough to change anything. Try rephrasing naturally or include the subject/exam you mean.','warning');
   }

@@ -1,6 +1,37 @@
 {% extends 'base.html' %}{% block content %}
-<script>window.EXAM_VOICE_SUBJECT_CATALOG={{ (voice_subject_catalog or [])|tojson }};</script>
+<script>window.EXAM_VOICE_SUBJECT_CATALOG={{ (voice_subject_catalog or [])|tojson }};window.EXAM_VOICE_CURRICULUM_CATALOG={{ (curriculum_exam_options or [])|tojson }};</script>
 <div class="page-head"><h1>Exams</h1></div>
+<div class="card" id="ai-curriculum-exam-card">
+  <div class="import-header"><div><h2>AI-Assisted Exam from Syllabus</h2><p class="muted">Uses the confirmed syllabus for the active institution. Existing approved questions are reused first; AI generates only the missing questions.</p></div><a class="btn secondary small" href="{{ url_for('academic_setup') }}">Academic Setup</a></div>
+  {% if active_curriculum_institution %}<p><span class="badge success">{{ active_curriculum_institution.name }}</span> {% if ai.configured %}<span class="badge">AI: {{ ai.provider|title }} · {{ ai.model }}</span>{% else %}<span class="badge warning">AI provider not configured</span>{% endif %}</p>{% endif %}
+  {% if curriculum_exam_options %}
+  <form method="post" action="{{ url_for('create_ai_exam_from_curriculum') }}" id="ai-curriculum-exam-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="grid">
+      <div><label>Curriculum Subject</label><select name="curriculum_subject_id" id="ai-curriculum-subject" required><option value="">Choose subject...</option>{% for subject in curriculum_exam_options %}<option value="{{ subject.id }}" data-units='{{ subject.units|tojson }}'>{{ subject.name }}{% if subject.program %} · {{ subject.program }}{% endif %}</option>{% endfor %}</select></div>
+      <div><label>Unit</label><select name="unit" id="ai-curriculum-unit" required><option value="">Choose unit...</option></select></div>
+      <div><label>Topic focus (optional)</label><input name="topic" id="ai-curriculum-topic" placeholder="e.g. Hypervisors or VM migration"></div>
+      <div><label>Questions</label><input name="question_count" id="ai-curriculum-count" type="number" min="1" max="50" value="10" required></div>
+      <div><label>Difficulty</label><select name="difficulty" id="ai-curriculum-difficulty"><option>Easy</option><option selected>Medium</option><option>Hard</option></select></div>
+      <div><label>Question Type</label><select name="question_type" id="ai-curriculum-question-type"><option value="single_choice" selected>Single Choice (MCQ)</option><option value="multiple_select">Multiple Select</option><option value="true_false">True / False</option><option value="numerical">Numerical</option><option value="short_text">Short Text</option><option value="essay">Descriptive / Essay</option></select></div>
+      <div><label>Duration (minutes)</label><input name="duration" id="ai-curriculum-duration" type="number" min="1" max="600" value="30" required></div>
+      <div><label>Exam Title</label><input name="exam_title" id="ai-curriculum-title" placeholder="Auto-filled if left blank"></div>
+    </div>
+    <div id="ai-curriculum-context" class="mini-meta"></div>
+    <button>Create Draft Exam + Questions</button>
+  </form>
+  {% else %}<p>No confirmed curriculum syllabus is available yet. Open <a href="{{ url_for('academic_setup') }}">Academic Setup</a>, add an institution/program/subject and confirm its syllabus.</p>{% endif %}
+</div>
+<script>
+(function(){
+ const subject=document.getElementById('ai-curriculum-subject'),unit=document.getElementById('ai-curriculum-unit'),context=document.getElementById('ai-curriculum-context');
+ if(!subject||!unit)return;
+ function sync(){let units=[];try{units=JSON.parse(subject.options[subject.selectedIndex]?.dataset.units||'[]')}catch(_e){};unit.innerHTML='<option value="">Choose unit...</option>';units.forEach(x=>{const o=document.createElement('option');o.value=x.value;o.textContent=x.label||('Unit '+x.value);o.dataset.summary=x.summary||'';o.dataset.topics=JSON.stringify(x.topics||[]);unit.appendChild(o)});context.textContent='';}
+ function show(){const o=unit.options[unit.selectedIndex];if(!o||!o.value){context.textContent='';return;}let topics=[];try{topics=JSON.parse(o.dataset.topics||'[]')}catch(_e){};context.textContent=(o.dataset.summary||'')+(topics.length?' · Topics: '+topics.slice(0,8).join(', '):'');}
+ subject.addEventListener('change',sync);unit.addEventListener('change',show);sync();
+})();
+</script>
+
 <div class="card">
   <h2>Create Exam for Existing Subject</h2>
   <form method="post" action="{{ url_for('create_exam_for_existing_subject') }}">
@@ -89,7 +120,7 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 10v6M14 10v6"/></svg>
           </button>
           {% endif %}
-          <div><strong>{{ e.title }}</strong>{% if staff_role=='faculty' and e.approval_policy_message %}<div class="mini-meta">{{ e.approval_policy_message }}</div>{% endif %}</div>
+          <div><strong>{{ e.title }}</strong>{% if e.ai_review_pending %}<div><span class="badge warning">AI review required</span></div>{% endif %}{% if staff_role=='faculty' and e.approval_policy_message %}<div class="mini-meta">{{ e.approval_policy_message }}</div>{% endif %}</div>
         </div>
       </td><td>{{ e.duration_minutes }} min</td><td>{{ e.question_count }}</td><td>{{ e.student_question_count }}</td><td>{{ e.session_count }}</td><td>{% if e.approval_status=='approved' %}<span class="badge success">Approved</span>{% elif staff_role=='faculty' and e.self_approval_allowed %}<span class="badge success">Self-approval allowed</span>{% elif staff_role=='faculty' and e.external_approval_required %}<span class="badge warning">Approval required</span>{% elif e.approval_status=='pending' %}<span class="badge warning">Pending</span>{% elif e.approval_status=='rejected' %}<span class="badge danger-badge">Changes requested</span>{% else %}<span class="badge gray">Draft</span>{% endif %}</td><td>{% if e.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge gray">Inactive</span>{% endif %}</td><td><div class="actions"><a class="btn small" href="{{ url_for('exam_builder',exam_id=e.id) }}">Blueprint & Sessions</a><a class="btn small secondary" href="{{ url_for('questions',exam_id=e.id) }}">Questions</a>{% if e.approval_status!='approved' and (staff_role!='faculty' or e.external_approval_required) %}<form method="post" action="{{ url_for('request_exam_approval',exam_id=e.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">Request Approval</button></form>{% endif %}{% if staff_role in ['super_admin','exam_controller','hod'] and e.approval_status!='approved' %}<form method="post" action="{{ url_for('review_exam_approval',exam_id=e.id,decision='approve') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small">Approve</button></form>{% endif %}{% if e.approval_status=='approved' or staff_role!='faculty' or e.self_approval_allowed %}<form method="post" action="{{ url_for('toggle_exam',exam_id=e.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small {% if e.is_active %}secondary{% endif %}">{% if e.is_active %}Deactivate{% elif staff_role=='faculty' and e.approval_status!='approved' and e.self_approval_allowed %}Approve & Activate{% else %}Activate{% endif %}</button></form>{% endif %}</div></td></tr>
       {% endfor %}
