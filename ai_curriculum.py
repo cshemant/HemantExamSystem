@@ -138,7 +138,8 @@ def _call_openai(prompt: str, schema_name: str, schema: dict[str, Any], image: t
         raise AIProviderError("OpenAI structured output could not be parsed as JSON.") from exc
 
 
-def _gemini_output_text(data: dict[str, Any]) -> str:
+def _gemini_generate_content_output_text(data: dict[str, Any]) -> str:
+    """Extract text from the legacy GenerateContent response."""
     texts: list[str] = []
     for candidate in data.get("candidates") or []:
         content = candidate.get("content") if isinstance(candidate, dict) else None
@@ -148,11 +149,61 @@ def _gemini_output_text(data: dict[str, Any]) -> str:
     return "\n".join(texts).strip()
 
 
-def _call_gemini(prompt: str, schema_name: str, schema: dict[str, Any], image: tuple[bytes, str] | None = None) -> dict[str, Any]:
-    del schema_name  # Gemini does not require a schema name.
+def _gemini_interaction_output_text(data: dict[str, Any]) -> str:
+    """Extract the last model text from a raw Gemini Interactions response.
+
+    The SDK exposes ``interaction.output_text`` as a convenience property, but the
+    REST response contains ``steps[].content[].text``.  Keeping this extractor in
+    our provider adapter avoids an SDK dependency and works with Render's current
+    lightweight requirements.
+    """
+    texts: list[str] = []
+    for step in data.get("steps") or []:
+        if not isinstance(step, dict) or step.get("type") != "model_output":
+            continue
+        for content in step.get("content") or []:
+            if isinstance(content, dict) and content.get("type") == "text" and isinstance(content.get("text"), str):
+                texts.append(content["text"])
+    return "\n".join(texts).strip()
+
+
+def _call_gemini_interactions(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+    """Use Gemini's current Interactions structured-output API for 3.x models."""
     cfg = get_ai_config()
-    if not cfg.api_key:
-        raise AIProviderError("GEMINI_API_KEY is not configured.")
+    payload = {
+        "model": cfg.model,
+        "input": prompt,
+        "response_format": {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": schema,
+        },
+        # Question generation is stateless; do not retain interactions server-side.
+        "store": False,
+    }
+    data = _http_json(
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        payload,
+        {"x-goog-api-key": cfg.api_key},
+        timeout=120,
+    )
+    status = str(data.get("status") or "").lower()
+    if status and status not in {"completed", "incomplete"}:
+        errors = data.get("errors") or []
+        raise AIProviderError(f"Gemini interaction did not complete ({status}): {str(errors)[:800]}")
+    text = _gemini_interaction_output_text(data)
+    if not text:
+        errors = data.get("errors") or "No structured text returned."
+        raise AIProviderError(f"Gemini returned no usable structured output: {str(errors)[:800]}")
+    try:
+        return json.loads(text)
+    except Exception as exc:
+        raise AIProviderError("Gemini structured output could not be parsed as JSON.") from exc
+
+
+def _call_gemini_generate_content(prompt: str, schema: dict[str, Any], image: tuple[bytes, str] | None = None) -> dict[str, Any]:
+    """Legacy GenerateContent path retained for Gemini 2.x and image parsing."""
+    cfg = get_ai_config()
     parts: list[dict[str, Any]] = [{"text": prompt}]
     if image:
         raw, mime = image
@@ -161,15 +212,12 @@ def _call_gemini(prompt: str, schema_name: str, schema: dict[str, Any], image: t
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            # responseSchema is the older OpenAPI-style schema field and rejects
-            # JSON-Schema keywords such as additionalProperties. responseJsonSchema
-            # is the GenerateContent field intended for JSON Schema payloads.
             "responseJsonSchema": schema,
         },
     }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent"
-    data = _http_json(url, payload, {"x-goog-api-key": cfg.api_key})
-    text = _gemini_output_text(data)
+    data = _http_json(url, payload, {"x-goog-api-key": cfg.api_key}, timeout=120)
+    text = _gemini_generate_content_output_text(data)
     if not text:
         reason = data.get("promptFeedback") or "No structured text returned."
         raise AIProviderError(f"Gemini returned no usable output: {reason}")
@@ -177,6 +225,22 @@ def _call_gemini(prompt: str, schema_name: str, schema: dict[str, Any], image: t
         return json.loads(text)
     except Exception as exc:
         raise AIProviderError("Gemini structured output could not be parsed as JSON.") from exc
+
+
+def _call_gemini(prompt: str, schema_name: str, schema: dict[str, Any], image: tuple[bytes, str] | None = None) -> dict[str, Any]:
+    del schema_name  # Gemini does not require a schema name.
+    cfg = get_ai_config()
+    if not cfg.api_key:
+        raise AIProviderError("GEMINI_API_KEY is not configured.")
+
+    # Gemini 3.x structured output is documented on the Interactions API.  V110
+    # still sent 3.6 Flash through legacy GenerateContent; that could surface as
+    # a provider/server failure after the confirmation click.  Text generation
+    # now uses Interactions for all Gemini 3.x models.  Image syllabus parsing
+    # keeps the legacy multimodal route until that path is migrated separately.
+    if cfg.model.startswith("gemini-3") and image is None:
+        return _call_gemini_interactions(prompt, schema)
+    return _call_gemini_generate_content(prompt, schema, image=image)
 
 
 def structured_generate(prompt: str, schema_name: str, schema: dict[str, Any], image: tuple[bytes, str] | None = None) -> dict[str, Any]:

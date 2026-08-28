@@ -17,7 +17,7 @@ class V108StaticTests(unittest.TestCase):
             self.assertIn(f'class {model}',text)
         for route in ['/admin/academic-setup','/admin/exams/ai-from-curriculum','generate-questions']:
             self.assertIn(route,text)
-        self.assertIn("APP_VERSION='2.35.0'",text)
+        self.assertIn("APP_VERSION='2.35.1'",text)
 
     def test_ai_review_blocks_activation(self):
         text=(ROOT/'app.py').read_text(encoding='utf-8')

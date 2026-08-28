@@ -32,7 +32,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.35.0'
+APP_VERSION='2.35.1'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -6134,17 +6134,27 @@ def create_exam_for_existing_subject():
             generation_mode='syllabus_grounded'
             remaining=missing
             try:
-                for index,unit in enumerate(selected_units):
-                    units_left=len(selected_units)-index;share=max(1,(remaining+units_left-1)//units_left)
-                    made,batch_errors=_generate_ai_bank_questions(s,bundle,unit,topic,share,difficulty,actor_label(s),[requested_type])
-                    generated.extend(made);errors.extend(batch_errors);remaining=max(0,missing-len(generated))
-                    if remaining<=0:break
-            except AIProviderError as exc:errors.append(str(exc))
+                with s.begin_nested():
+                    for index,unit in enumerate(selected_units):
+                        units_left=len(selected_units)-index;share=max(1,(remaining+units_left-1)//units_left)
+                        made,batch_errors=_generate_ai_bank_questions(s,bundle,unit,topic,share,difficulty,actor_label(s),[requested_type])
+                        generated.extend(made);errors.extend(batch_errors);remaining=max(0,missing-len(generated))
+                        if remaining<=0:break
+            except AIProviderError as exc:
+                errors.append(str(exc));generated=[]
+            except Exception as exc:
+                app.logger.exception('AI syllabus-grounded exam autofill failed')
+                errors.append(f'AI generation failed safely: {type(exc).__name__}: {str(exc)[:300]}');generated=[]
         else:
             generation_mode='question_bank_context'
             try:
-                generated,errors=_generate_ai_subject_context_questions(s,subject,selected_unit,missing,difficulty,actor_label(s),[requested_type],active_inst,topic)
-            except AIProviderError as exc:errors=[str(exc)]
+                with s.begin_nested():
+                    generated,errors=_generate_ai_subject_context_questions(s,subject,selected_unit,missing,difficulty,actor_label(s),[requested_type],active_inst,topic)
+            except AIProviderError as exc:
+                errors=[str(exc)];generated=[]
+            except Exception as exc:
+                app.logger.exception('AI Question Bank-context exam autofill failed')
+                errors=[f'AI generation failed safely: {type(exc).__name__}: {str(exc)[:300]}'];generated=[]
         for bq in generated[:missing]:copy_bank_question_to_exam(s,bq,exam.id)
 
     pool_count=sync_manual_exam_question_count(s,exam.id)
