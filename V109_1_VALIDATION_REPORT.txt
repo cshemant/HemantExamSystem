@@ -1,0 +1,16 @@
+V109.1 validation
+=================
+
+PASS
+- Python syntax: app.py, ai_curriculum.py
+- JavaScript syntax: static/voice_assistant.js
+- Jinja parse: 48 templates, 0 parse errors
+- V108 + V109 targeted static tests: 9/9 passed
+- Voice parser tests: 8/8 passed, including 60 questions + 60 minutes
+- ZIP integrity: checked after packaging
+
+Baseline regression note
+------------------------
+The full legacy unittest discovery still reports the same pre-existing 4 static-test failures and 1 Flask import error seen in the unmodified V108 package. The import error is because Flask is not installed in this sandbox. These are not introduced by V109.
+
+Live AI API calls were not made because no user API key is available in this environment. Test Gemini/OpenAI behavior on staging after configuring AI_PROVIDER and the corresponding API key.

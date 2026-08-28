@@ -1,3 +1,11 @@
+## V21.1 – Dedicated Super Admin username
+
+- Added `SUPER_ADMIN_USERNAME` with backwards compatibility for `ADMIN_USERNAME`.
+- Added optional `SUPER_ADMIN_PASSWORD`, falling back to the existing `ADMIN_PASSWORD`.
+- When `SUPER_ADMIN_USERNAME` differs from legacy `admin`, the old `admin` account is automatically migrated to an active Faculty account while preserving its password hash.
+- The legacy Admin row is removed after migration so `admin` no longer retains Super Admin authority.
+- Reserved the configured Super Admin username so it cannot also be created as a normal staff account.
+
 ## V14.2 – Custom Subject Catalog
 
 - Added persistent custom subject creation with faculty-assigned categories.
@@ -49,3 +57,16 @@ Once an exam has attempts, blueprint regeneration is blocked so the question poo
 
 ## Secure-browser scope
 The integrity monitoring added here is browser-level. It records tab/full-screen exits when enabled. It does not claim to be an operating-system lockdown browser.
+
+## V79.1 - Practical Exam Attendance Visibility
+- Practical Exam attendance is now auto-awarded only for a clean, on-time submitted attempt with zero integrity violations.
+- Existing faculty Absent decisions are preserved.
+- Student Practical Marks now shows `Present · marks` / `Absent · 0` instead of a bare number/dash.
+- Opening Practical Marks repairs eligible older submitted practical attempts so attendance becomes visible without manual re-entry.
+
+## V2.35.0 / V109.1
+- Voice requests with explicit question counts now auto-fill the exam rather than creating an empty manual draft.
+- Reuses approved bank questions first and AI-generates the shortage.
+- Supports up to 100 requested questions with <=20-question provider batches and duplicate avoidance.
+- Confirmed syllabus is preferred; legacy subjects can fall back to approved Question Bank context without university-specific code.
+- Curriculum requests may target All Units.

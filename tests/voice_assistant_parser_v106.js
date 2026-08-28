@@ -11,3 +11,6 @@ ok(api.extractDuration('make a test for half an hour')===30,'half an hour = 30 m
 ok(api.extractDuration('one hour 30 minutes')===90,'mixed hour/minute duration = 90');
 ok(api.extractUnitInfo('second unit ka exam').value==='2','ordinal unit phrasing is understood');
 ok(api.isCreateVerb('exam bana do')&&api.hasExamNoun('exam bana do'),'Hinglish create intent is understood');
+
+ok(api.extractQuestionCount('create cyber security exam 60 questions for 60 minutes')===60,'60-question request is preserved');
+ok(api.extractDuration('create cyber security exam 60 questions for 60 minutes')===60,'60-minute duration is preserved');
