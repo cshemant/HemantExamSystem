@@ -66,8 +66,22 @@ def _http_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeo
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:2000]
-        raise AIProviderError(f"AI API HTTP {exc.code}: {detail}") from exc
+        detail = exc.read().decode("utf-8", errors="replace")[:12000]
+        # Provider error bodies can be very large. Surface the actionable message
+        # instead of flashing the entire JSON response into the admin UI.
+        message = detail
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict):
+                error = parsed.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    message = error["message"]
+                elif isinstance(error, str):
+                    message = error
+        except Exception:
+            pass
+        message = re.sub(r"\s+", " ", str(message)).strip()[:1200]
+        raise AIProviderError(f"AI API HTTP {exc.code}: {message}") from exc
     except Exception as exc:
         raise AIProviderError(f"AI API request failed: {exc}") from exc
     try:
@@ -147,7 +161,10 @@ def _call_gemini(prompt: str, schema_name: str, schema: dict[str, Any], image: t
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "responseSchema": schema,
+            # responseSchema is the older OpenAPI-style schema field and rejects
+            # JSON-Schema keywords such as additionalProperties. responseJsonSchema
+            # is the GenerateContent field intended for JSON Schema payloads.
+            "responseJsonSchema": schema,
         },
     }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent"
