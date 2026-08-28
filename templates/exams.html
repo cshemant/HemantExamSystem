@@ -1,4 +1,5 @@
 {% extends 'base.html' %}{% block content %}
+<script>window.EXAM_VOICE_SUBJECT_CATALOG={{ (voice_subject_catalog or [])|tojson }};</script>
 <div class="page-head"><h1>Exams</h1></div>
 <div class="card">
   <h2>Create Exam for Existing Subject</h2>
@@ -67,7 +68,7 @@
     <div class="table-wrap"><table>
       <tr><th>Title</th><th>Duration</th><th>Pool</th><th>Per Student</th><th>Batch Sessions</th><th>Approval</th><th>Status</th><th>Actions</th></tr>
       {% for e in group.exams %}
-      <tr id="exam-{{ e.id }}"><td>
+      <tr id="exam-{{ e.id }}" data-voice-exam-title="{{ e.title|e }}" data-voice-subject="{{ e.subject|e }}"><td>
         <div class="practical-register-leading">
           {% if staff_role=='super_admin' %}
           <button type="button" class="exam-edit-icon exam-edit-trigger"

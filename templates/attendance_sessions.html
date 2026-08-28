@@ -1,0 +1,44 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><h1>Attendance</h1><p class="muted">Create short classroom attendance windows tied to a batch/section and an approved network.</p></div><a class="btn secondary" href="{{ url_for('attendance_devices') }}">Student Devices</a></div>
+
+<div class="card">
+  <h2>Start Attendance Session</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="grid attendance-form-grid">
+      <div><label>Subject</label><input name="subject" placeholder="Mobile Application Development" required></div>
+      <div><label>Batch / Section</label><select name="group_id" required><option value="">Choose batch / section</option>{% for g in groups %}<option value="{{ g.id }}">{{ group_label(g) }}</option>{% endfor %}</select></div>
+      <div><label>Session Title</label><input name="title" placeholder="Optional · defaults to Subject Attendance"></div>
+      <div><label>Venue</label><input name="venue" placeholder="Room / Lab"></div>
+      <div><label>Start</label><input type="datetime-local" name="starts_at" value="{{ now_value }}"></div>
+      <div><label>Attendance Window</label><select name="duration_minutes"><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="15">15 minutes</option><option value="20">20 minutes</option><option value="30">30 minutes</option></select></div>
+      <div><label>Network Check</label><select name="network_mode" id="attendance-network-mode"><option value="lan" {% if mode=='offline' %}selected{% endif %}>Same classroom LAN / Wi-Fi</option><option value="cidr" {% if mode=='online' %}selected{% endif %}>Approved IP/CIDR network</option><option value="any">No network restriction (testing only)</option></select></div>
+      <div><label>Fingerprint / Passkey</label><select name="biometric_mode"><option value="preferred" selected>Preferred · secure fallback allowed</option><option value="required">Required · HTTPS only</option><option value="disabled">Disabled</option></select></div>
+    </div>
+    <div id="attendance-cidr-row" class="attendance-cidr-row">
+      <label>Approved CIDRs <span class="muted">(required for Approved IP/CIDR mode)</span></label>
+      <input name="allowed_cidrs" placeholder="e.g. 10.20.0.0/16, 103.42.12.0/24">
+      <p class="muted small-text">A normal browser cannot reliably read the Wi-Fi SSID. For campus Wi-Fi, use the network ranges provided by the university IT team.</p>
+    </div>
+    <div class="actions"><button type="submit">Create Attendance Session</button></div>
+  </form>
+</div>
+
+<div class="card">
+  <div class="result-toolbar"><div><h2>Attendance Sessions</h2><p class="muted">Recent sessions created by your account.</p></div></div>
+  <div class="table-wrap"><table>
+    <tr><th>Session</th><th>Batch / Section</th><th>Window</th><th>Present</th><th>Security</th><th>Action</th></tr>
+    {% for r in sessions %}{% set g=group_map.get(r.group_id) %}<tr>
+      <td><strong>{{ r.title }}</strong><div class="mini-meta">{{ r.subject }}{% if r.venue %} · {{ r.venue }}{% endif %}</div></td>
+      <td>{{ group_label(g) if g else 'Deleted group' }}</td>
+      <td>{{ r.starts_at|dt }}<div class="mini-meta">to {{ r.ends_at|dt }}</div></td>
+      <td><span class="badge success">{{ counts.get(r.id,0) }}</span></td>
+      <td><span class="badge gray">{{ r.network_mode|upper }}</span> <span class="badge gray">{{ r.biometric_mode|title }}</span></td>
+      <td><a class="btn small" href="{{ url_for('attendance_session_detail',session_id=r.id) }}">Open</a></td>
+    </tr>{% else %}<tr><td colspan="6">No attendance session has been created yet.</td></tr>{% endfor %}
+  </table></div>
+</div>
+<script>
+(function(){const mode=document.getElementById('attendance-network-mode'),row=document.getElementById('attendance-cidr-row');function sync(){row.hidden=mode.value!=='cidr';}mode.addEventListener('change',sync);sync();})();
+</script>
+{% endblock %}

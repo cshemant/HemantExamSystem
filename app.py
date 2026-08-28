@@ -1,4 +1,4 @@
-import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re, difflib
+import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re, difflib, ipaddress
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -16,7 +16,8 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font
 import qrcode
 from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from enterprise_core import QUESTION_TYPE_LABELS, canonical_question_type, normalize_answer, normalized_key, is_answer_correct, validate_question_definition
 from security_core import generate_totp_secret, verify_totp, totp_uri
@@ -29,7 +30,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.30.6'
+APP_VERSION='2.33.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -367,6 +368,55 @@ class StudentGroup(Base):
     student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
     group_id:Mapped[int]=mapped_column(ForeignKey('academic_groups.id'),nullable=False)
     assigned_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class AttendanceSession(Base):
+    __tablename__='attendance_sessions'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    owner_type:Mapped[str]=mapped_column(String,nullable=False)  # admin | faculty
+    owner_id:Mapped[int]=mapped_column(Integer,nullable=False)
+    owner_name:Mapped[str]=mapped_column(String,nullable=False,default='')
+    group_id:Mapped[int|None]=mapped_column(ForeignKey('academic_groups.id'),nullable=True)
+    subject:Mapped[str]=mapped_column(String,nullable=False,default='')
+    title:Mapped[str]=mapped_column(String,nullable=False,default='')
+    venue:Mapped[str]=mapped_column(String,nullable=False,default='')
+    starts_at:Mapped[str]=mapped_column(String,nullable=False)
+    ends_at:Mapped[str]=mapped_column(String,nullable=False)
+    network_mode:Mapped[str]=mapped_column(String,nullable=False,default='lan')  # lan | cidr | any
+    allowed_cidrs:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    biometric_mode:Mapped[str]=mapped_column(String,nullable=False,default='preferred')  # required | preferred | disabled
+    access_token:Mapped[str]=mapped_column(String,nullable=False,unique=True)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+    closed_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+
+class AttendanceRecord(Base):
+    __tablename__='attendance_records'
+    __table_args__=(UniqueConstraint('session_id','student_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    session_id:Mapped[int]=mapped_column(ForeignKey('attendance_sessions.id'),nullable=False)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    marked_at:Mapped[str]=mapped_column(String,nullable=False)
+    verification_method:Mapped[str]=mapped_column(String,nullable=False,default='network_login')
+    biometric_verified:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    network_verified:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    credential_id:Mapped[str]=mapped_column(String,nullable=False,default='')
+    client_ip:Mapped[str]=mapped_column(String,nullable=False,default='')
+    user_agent_hash:Mapped[str]=mapped_column(String(64),nullable=False,default='')
+
+
+class StudentPasskey(Base):
+    __tablename__='student_passkeys'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    credential_id:Mapped[str]=mapped_column(String,nullable=False,unique=True)
+    public_key_pem:Mapped[str]=mapped_column(Text,nullable=False)
+    sign_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    rp_id:Mapped[str]=mapped_column(String,nullable=False,default='')
+    device_hash:Mapped[str]=mapped_column(String(64),nullable=False,default='')
+    label:Mapped[str]=mapped_column(String,nullable=False,default='Phone biometric')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+    last_used_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
 
 class ExamSession(Base):
     __tablename__='exam_sessions'
@@ -812,6 +862,7 @@ def run_schema_upgrades():
         ('practical_marks','performance_marks','FLOAT'),
         ('practical_marks','viva_marks','FLOAT'),
         ('students','registration_no',"VARCHAR NOT NULL DEFAULT ''"),
+        ('student_passkeys','device_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
     for table_name,column_name,ddl in upgrades:
         _ensure_column(table_name,column_name,ddl)
@@ -1696,6 +1747,218 @@ def local_lan_ip():
         return 'SERVER-IP'
 
 
+def _b64url_encode(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b'=').decode('ascii')
+
+
+def _b64url_decode(value):
+    value=(value or '').encode('ascii') if isinstance(value,str) else bytes(value or b'')
+    return base64.urlsafe_b64decode(value+b'='*((4-len(value)%4)%4))
+
+
+def _cbor_read_length(data,offset,additional):
+    if additional < 24:return additional,offset
+    if additional==24:return data[offset],offset+1
+    if additional==25:return int.from_bytes(data[offset:offset+2],'big'),offset+2
+    if additional==26:return int.from_bytes(data[offset:offset+4],'big'),offset+4
+    if additional==27:return int.from_bytes(data[offset:offset+8],'big'),offset+8
+    raise ValueError('Unsupported CBOR length encoding.')
+
+
+def _cbor_decode_one(data,offset=0):
+    if offset>=len(data):raise ValueError('Unexpected end of CBOR data.')
+    initial=data[offset];offset+=1;major=initial>>5;additional=initial&31
+    if major in {0,1}:
+        value,offset=_cbor_read_length(data,offset,additional)
+        return (value if major==0 else -1-value),offset
+    if major in {2,3}:
+        length,offset=_cbor_read_length(data,offset,additional);raw=data[offset:offset+length];offset+=length
+        if len(raw)!=length:raise ValueError('Truncated CBOR string.')
+        return (raw if major==2 else raw.decode('utf-8')),offset
+    if major==4:
+        length,offset=_cbor_read_length(data,offset,additional);out=[]
+        for _ in range(length):item,offset=_cbor_decode_one(data,offset);out.append(item)
+        return out,offset
+    if major==5:
+        length,offset=_cbor_read_length(data,offset,additional);out={}
+        for _ in range(length):
+            key,offset=_cbor_decode_one(data,offset);value,offset=_cbor_decode_one(data,offset);out[key]=value
+        return out,offset
+    if major==7:
+        if additional==20:return False,offset
+        if additional==21:return True,offset
+        if additional in {22,23}:return None,offset
+    raise ValueError('Unsupported CBOR value.')
+
+
+def _webauthn_rp_id():
+    host=(request.host.split(':',1)[0] or '').strip().lower()
+    return host.strip('[]')
+
+
+def _webauthn_origin():
+    return request.host_url.rstrip('/')
+
+
+def _webauthn_secure_context():
+    host=_webauthn_rp_id()
+    return bool(request.is_secure or host in {'localhost','127.0.0.1','::1'})
+
+
+def _attendance_client_ip():
+    # Offline/LAN mode trusts only the direct peer so students cannot spoof a
+    # campus address with X-Forwarded-For. Online mode may sit behind the
+    # configured reverse proxy/CDN, where the first forwarded address is the
+    # original client address.
+    if APP_MODE=='online':
+        forwarded=(request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+        if forwarded:return forwarded[:120]
+    return (request.remote_addr or '').strip()[:120]
+
+
+def _attendance_network_check(row):
+    mode=(row.network_mode or 'lan').strip().lower();ip_text=_attendance_client_ip()
+    if mode=='any':return True,'Network restriction disabled'
+    try:client=ipaddress.ip_address(ip_text)
+    except ValueError:return False,'Client network address could not be verified.'
+    if client.is_loopback:return True,'Local server'
+    if mode=='lan':
+        if APP_MODE!='offline':return False,'LAN-only attendance must be used from the offline campus server.'
+        server_ip=local_lan_ip()
+        try:
+            server=ipaddress.ip_address(server_ip)
+            prefix=24 if server.version==4 else 64
+            network=ipaddress.ip_network(f'{server}/{prefix}',strict=False)
+            return (client in network),(f'Approved classroom LAN {network}' if client in network else f'Connect to the classroom LAN ({network}).')
+        except ValueError:return False,'The classroom LAN could not be identified.'
+    if mode=='cidr':
+        raw=(row.allowed_cidrs or '').strip();items=[x for x in re.split(r'[\s,;]+',raw) if x]
+        for item in items:
+            try:
+                if client in ipaddress.ip_network(item,strict=False):return True,f'Approved network {item}'
+            except ValueError:continue
+        return False,'Connect to an approved campus/classroom network.'
+    return False,'Unknown attendance network policy.'
+
+
+def attendance_session_access(s,session_id):
+    row=s.get(AttendanceSession,session_id)
+    if not row:abort(404)
+    if current_staff_role(s)=='super_admin':return row
+    owner_type,owner_id,_=current_practical_owner(s)
+    if row.owner_type!=owner_type or row.owner_id!=owner_id:abort(403)
+    return row
+
+
+def attendance_session_stmt(s):
+    stmt=select(AttendanceSession).order_by(AttendanceSession.id.desc())
+    if current_staff_role(s)!='super_admin':
+        owner_type,owner_id,_=current_practical_owner(s);stmt=stmt.where(AttendanceSession.owner_type==owner_type,AttendanceSession.owner_id==owner_id)
+    return stmt
+
+
+def attendance_student_allowed(s,row,student_id):
+    membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student_id))
+    return bool(membership and membership.group_id==row.group_id)
+
+
+def attendance_state(row):
+    now=now_dt()
+    try:start=parse_dt(row.starts_at);end=parse_dt(row.ends_at)
+    except Exception:return 'invalid'
+    if row.closed_at:return 'closed'
+    if now<start:return 'upcoming'
+    if now>end:return 'ended'
+    return 'active'
+
+
+def attendance_student_url(row):
+    path=url_for('student_attendance_session',session_id=row.id,token=row.access_token)
+    if APP_MODE=='online':return request.url_root.rstrip('/')+path
+    return f"http://{local_lan_ip()}:{int(os.getenv('PORT','8080'))}{path}"
+
+
+def _attendance_public_key_from_cose(cose):
+    kty=cose.get(1);alg=int(cose.get(3,0) or 0)
+    if kty==2:
+        if cose.get(-1)!=1:raise ValueError('Only P-256 passkeys are supported.')
+        x=cose.get(-2);y=cose.get(-3)
+        if not isinstance(x,(bytes,bytearray)) or not isinstance(y,(bytes,bytearray)):raise ValueError('Invalid EC passkey key.')
+        key=ec.EllipticCurvePublicNumbers(int.from_bytes(x,'big'),int.from_bytes(y,'big'),ec.SECP256R1()).public_key()
+    elif kty==3:
+        n=cose.get(-1);e=cose.get(-2)
+        if not isinstance(n,(bytes,bytearray)) or not isinstance(e,(bytes,bytearray)):raise ValueError('Invalid RSA passkey key.')
+        key=rsa.RSAPublicNumbers(int.from_bytes(e,'big'),int.from_bytes(n,'big')).public_key()
+    else:raise ValueError('Unsupported passkey key type.')
+    return key.public_bytes(serialization.Encoding.PEM,serialization.PublicFormat.SubjectPublicKeyInfo).decode('ascii'),alg
+
+
+def _verify_webauthn_client_data(encoded,expected_type,expected_challenge):
+    raw=_b64url_decode(encoded);payload=json.loads(raw.decode('utf-8'))
+    if payload.get('type')!=expected_type:raise ValueError('Unexpected passkey operation.')
+    if not secrets.compare_digest(str(payload.get('challenge') or ''),str(expected_challenge or '')):raise ValueError('Passkey challenge did not match.')
+    if payload.get('origin')!=_webauthn_origin():raise ValueError('Passkey origin did not match this site.')
+    return raw,payload
+
+
+def _register_student_passkey(s,student,payload):
+    expected=web_session.pop('_passkey_register_challenge',None);rp_id=web_session.pop('_passkey_register_rp',None)
+    if not expected or rp_id!=_webauthn_rp_id():raise ValueError('Passkey registration expired. Start again.')
+    client_raw,_=_verify_webauthn_client_data(payload.get('clientDataJSON'),'webauthn.create',expected)
+    att_raw=_b64url_decode(payload.get('attestationObject'));att,_=_cbor_decode_one(att_raw,0)
+    auth_data=att.get('authData') if isinstance(att,dict) else None
+    if not isinstance(auth_data,(bytes,bytearray)) or len(auth_data)<55:raise ValueError('Invalid passkey registration data.')
+    if auth_data[:32]!=hashlib.sha256(rp_id.encode('utf-8')).digest():raise ValueError('Passkey site identity did not match.')
+    flags=auth_data[32]
+    if not (flags&0x01) or not (flags&0x04) or not (flags&0x40):raise ValueError('Fingerprint/device verification was not completed.')
+    offset=37+16;cred_len=int.from_bytes(auth_data[offset:offset+2],'big');offset+=2;cred_id=bytes(auth_data[offset:offset+cred_len]);offset+=cred_len
+    if not cred_id:raise ValueError('Passkey credential ID is missing.')
+    cose,_=_cbor_decode_one(auth_data,offset);pem,_alg=_attendance_public_key_from_cose(cose)
+    cred_b64=_b64url_encode(cred_id)
+    supplied=(payload.get('rawId') or payload.get('id') or '').strip()
+    if supplied and not secrets.compare_digest(cred_b64,supplied):raise ValueError('Passkey credential ID did not match.')
+    existing=s.scalar(select(StudentPasskey).where(StudentPasskey.credential_id==cred_b64))
+    if existing and existing.student_id!=student.id:raise ValueError('This passkey is already registered to another student.')
+    existing_for_student=s.scalar(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id).order_by(StudentPasskey.id.asc()).limit(1))
+    if existing_for_student and (not existing or existing_for_student.id!=existing.id):raise ValueError('One attendance device is already registered. Ask faculty to reset it before registering another phone.')
+    sign_count=int.from_bytes(auth_data[33:37],'big');device_hash=current_student_device_hash()
+    if existing:
+        existing.public_key_pem=pem;existing.sign_count=sign_count;existing.rp_id=rp_id;existing.device_hash=device_hash;existing.last_used_at=now_iso()
+        row=existing
+    else:
+        row=StudentPasskey(student_id=student.id,credential_id=cred_b64,public_key_pem=pem,sign_count=sign_count,rp_id=rp_id,device_hash=device_hash,label=(payload.get('label') or 'Phone biometric')[:80],created_at=now_iso(),last_used_at='');s.add(row)
+    audit_event(s,'student_passkey_registered','student',student.id,f'rp_id={rp_id}');s.commit();return row
+
+
+def _verify_student_passkey_assertion(s,student,payload,expected_challenge):
+    cred_id=(payload.get('rawId') or payload.get('id') or '').strip();rp_id=_webauthn_rp_id()
+    row=s.scalar(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.credential_id==cred_id,StudentPasskey.rp_id==rp_id))
+    if not row:raise ValueError('This biometric/passkey is not registered for your account on this site.')
+    if row.device_hash and not secrets.compare_digest(row.device_hash,current_student_device_hash()):raise ValueError('This attendance passkey is registered to another browser/device. Ask faculty to reset the registered device.')
+    client_raw,_=_verify_webauthn_client_data(payload.get('clientDataJSON'),'webauthn.get',expected_challenge)
+    auth_data=_b64url_decode(payload.get('authenticatorData'));signature=_b64url_decode(payload.get('signature'))
+    if len(auth_data)<37 or auth_data[:32]!=hashlib.sha256(rp_id.encode('utf-8')).digest():raise ValueError('Passkey site identity did not match.')
+    flags=auth_data[32]
+    if not (flags&0x01) or not (flags&0x04):raise ValueError('Fingerprint/device verification was not completed.')
+    signed=auth_data+hashlib.sha256(client_raw).digest();key=serialization.load_pem_public_key(row.public_key_pem.encode('ascii'))
+    if isinstance(key,ec.EllipticCurvePublicKey):key.verify(signature,signed,ec.ECDSA(hashes.SHA256()))
+    elif isinstance(key,rsa.RSAPublicKey):key.verify(signature,signed,padding.PKCS1v15(),hashes.SHA256())
+    else:raise ValueError('Unsupported passkey public key.')
+    new_count=int.from_bytes(auth_data[33:37],'big')
+    if row.sign_count and new_count and new_count<=row.sign_count:raise ValueError('Passkey counter check failed. Re-register this device.')
+    if new_count:row.sign_count=new_count
+    row.last_used_at=now_iso();return row
+
+
+def _attendance_create_record(s,row,student,method,biometric=False,credential_id=''):
+    existing=s.scalar(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id,AttendanceRecord.student_id==student.id))
+    if existing:return existing,False
+    network_ok,_=_attendance_network_check(row)
+    if not network_ok:raise ValueError('Your device is not on the approved attendance network.')
+    rec=AttendanceRecord(session_id=row.id,student_id=student.id,marked_at=now_iso(),verification_method=method,biometric_verified=bool(biometric),network_verified=True,credential_id=credential_id or '',client_ip=_attendance_client_ip(),user_agent_hash=hashlib.sha256((request.headers.get('User-Agent') or '').encode('utf-8')).hexdigest()[:32])
+    s.add(rec);audit_event(s,'attendance_marked','attendance_session',row.id,f'student={student.roll_no}, method={method}, biometric={int(bool(biometric))}');s.commit();return rec,True
+
+
 def qr_data_uri(text):
     img=qrcode.make(text);buf=io.BytesIO();img.save(buf,format='PNG')
     return 'data:image/png;base64,'+base64.b64encode(buf.getvalue()).decode('ascii')
@@ -1966,7 +2229,13 @@ def security_headers(response):
     response.headers['X-Frame-Options']='SAMEORIGIN' if secure_exam_frame else 'DENY'
     response.headers.setdefault('Referrer-Policy','same-origin')
     scanner_page=request.endpoint=='practical_register_detail'
-    response.headers.setdefault('Permissions-Policy',('camera=(self), microphone=(), geolocation=(), payment=(), usb=()' if scanner_page else 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'))
+    # V106: the Admin Assistant uses browser speech recognition on authenticated
+    # staff pages. Keep microphone access disabled everywhere else (especially
+    # student/exam pages), while allowing same-origin microphone access for staff.
+    voice_staff_page=web_session.get('role') in {'admin','faculty'} and request.endpoint not in {'take_exam','submitted'}
+    camera_policy='camera=(self)' if scanner_page else 'camera=()'
+    microphone_policy='microphone=(self)' if voice_staff_page else 'microphone=()'
+    response.headers.setdefault('Permissions-Policy',f'{camera_policy}, {microphone_policy}, geolocation=(), payment=(), usb=()')
     if scanner_page:
         response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; worker-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; connect-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     elif secure_exam_frame:
@@ -2051,7 +2320,11 @@ def practical_required(fn):
 def student_required(fn):
     @wraps(fn)
     def inner(*a,**kw):
-        if web_session.get('role')!='student': return redirect(url_for('home'))
+        if web_session.get('role')!='student':
+            if request.method=='GET' and request.path.startswith('/student/'):
+                target=request.full_path.rstrip('?')
+                if target.startswith('/student/') and len(target)<1200:web_session['_post_login_next']=target
+            return redirect(url_for('home'))
         return fn(*a,**kw)
     return inner
 
@@ -2505,10 +2778,10 @@ def home():
                     audit_event(s,'student_login_blocked_ip_roll_switch','user',row.id,f'exam_id={ip_exam.id if ip_exam else 0}')
                     s.commit();clear_student_session_for_ip_conflict()
                     return render_template('login.html',login_page=True),409
-                csrf=web_session.get('_csrf_token');device_token=web_session.get('_student_device_token') or secrets.token_urlsafe(24);web_session.clear();web_session['_csrf_token']=csrf;web_session['_student_device_token']=device_token
+                csrf=web_session.get('_csrf_token');device_token=web_session.get('_student_device_token') or secrets.token_urlsafe(24);post_login_next=web_session.get('_post_login_next','');web_session.clear();web_session['_csrf_token']=csrf;web_session['_student_device_token']=device_token
                 web_session.update(role='student',user_id=row.id,username=row.roll_no,_last_activity=int(time.time()))
                 audit_event(s,'student_login','user',row.id,'student')
-                s.commit();return redirect(url_for('student_dashboard'))
+                s.commit();return redirect(post_login_next if isinstance(post_login_next,str) and post_login_next.startswith('/student/') else url_for('student_dashboard'))
             if bool(getattr(row,'mfa_enabled',False)) and (getattr(row,'mfa_secret','') or '').strip():
                 return begin_staff_mfa(row,role)
             return complete_staff_session(s,row,role)
@@ -2609,7 +2882,8 @@ def admin_dashboard():
         'questions':s.scalar(select(func.count()).select_from(Question)) or 0,
         'bank_questions':s.scalar(select(func.count()).select_from(BankQuestion)) or 0,
         'attempts':s.scalar(select(func.count()).select_from(Attempt)) or 0,
-        'approved':s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.status=='approved')) or 0
+        'approved':s.scalar(select(func.count()).select_from(BankQuestion).where(BankQuestion.status=='approved')) or 0,
+        'attendance_sessions':s.scalar(select(func.count()).select_from(AttendanceSession)) or 0
     }
     if current_staff_role(s) in PRACTICAL_ROLES:
         stats['practical_registers']=len(s.scalars(practical_register_stmt(s)).all())
@@ -2667,6 +2941,196 @@ def _component_mark(value, label, maximum):
     if mark < 0 or mark > maximum:
         raise ValueError(f'{label} marks must be between 0 and {maximum}.')
     return mark
+
+
+@app.route('/admin/attendance',methods=['GET','POST'])
+@staff_required
+def attendance_sessions():
+    s=DB();owner_type,owner_id,owner_name=current_practical_owner(s);groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all()
+    if request.method=='POST':
+        group_id=request.form.get('group_id',type=int);group=s.get(AcademicGroup,group_id) if group_id else None
+        subject=(request.form.get('subject') or '').strip();title=(request.form.get('title') or '').strip() or (subject+' Attendance' if subject else 'Class Attendance');venue=(request.form.get('venue') or '').strip()[:120]
+        network_mode=(request.form.get('network_mode') or ('lan' if APP_MODE=='offline' else 'cidr')).strip().lower();biometric_mode=(request.form.get('biometric_mode') or 'preferred').strip().lower();allowed_cidrs=(request.form.get('allowed_cidrs') or '').strip()
+        if not group:flash('Choose the batch / section for this attendance session.','error');return redirect(url_for('attendance_sessions'))
+        if not subject:flash('Subject is required.','error');return redirect(url_for('attendance_sessions'))
+        if network_mode not in {'lan','cidr','any'}:network_mode='lan' if APP_MODE=='offline' else 'cidr'
+        if biometric_mode not in {'required','preferred','disabled'}:biometric_mode='preferred'
+        if network_mode=='cidr' and not allowed_cidrs:flash('Enter at least one approved network CIDR, for example 10.20.0.0/16.','error');return redirect(url_for('attendance_sessions'))
+        start_raw=(request.form.get('starts_at') or '').strip();duration=max(1,min(180,request.form.get('duration_minutes',type=int) or 10))
+        try:start=parse_dt(start_raw) if start_raw else now_dt()
+        except Exception:flash('Start date/time is invalid.','error');return redirect(url_for('attendance_sessions'))
+        end=start+timedelta(minutes=duration)
+        row=AttendanceSession(owner_type=owner_type,owner_id=owner_id,owner_name=owner_name,group_id=group.id,subject=subject,title=title,venue=venue,starts_at=start.isoformat(timespec='seconds'),ends_at=end.isoformat(timespec='seconds'),network_mode=network_mode,allowed_cidrs=allowed_cidrs,biometric_mode=biometric_mode,access_token=secrets.token_urlsafe(24),created_at=now_iso(),closed_at='')
+        s.add(row);s.flush();audit_event(s,'attendance_session_created','attendance_session',row.id,f'group={group_label(group)}, subject={subject}, network={network_mode}, biometric={biometric_mode}');s.commit();flash('Attendance session created.');return redirect(url_for('attendance_session_detail',session_id=row.id))
+    rows=s.scalars(attendance_session_stmt(s)).all();group_map={g.id:g for g in s.scalars(select(AcademicGroup)).all()};counts=dict(s.execute(select(AttendanceRecord.session_id,func.count()).group_by(AttendanceRecord.session_id)).all())
+    return render_template('attendance_sessions.html',sessions=rows,groups=groups,group_map=group_map,counts=counts,group_label=group_label,mode=APP_MODE,now_value=now_dt().strftime('%Y-%m-%dT%H:%M'))
+
+
+@app.route('/admin/attendance/devices')
+@staff_required
+def attendance_devices():
+    s=DB();students=s.scalars(select(Student).order_by(Student.roll_no)).all();keys=s.scalars(select(StudentPasskey).order_by(StudentPasskey.id.desc())).all();by_student={}
+    for key in keys:by_student.setdefault(key.student_id,[]).append(key)
+    return render_template('attendance_devices.html',students=students,by_student=by_student)
+
+
+@app.route('/admin/attendance/devices/<int:student_id>/reset',methods=['POST'])
+@staff_required
+def attendance_device_reset(student_id):
+    s=DB();student=s.get(Student,student_id)
+    if not student:abort(404)
+    keys=s.scalars(select(StudentPasskey).where(StudentPasskey.student_id==student.id)).all();count=len(keys)
+    for key in keys:s.delete(key)
+    audit_event(s,'student_passkeys_reset','student',student.id,f'count={count}, roll={student.roll_no}');s.commit();flash(f'Removed {count} registered passkey'+('' if count==1 else 's')+f' for {student.roll_no}. The student can register a new device on HTTPS.')
+    return redirect(url_for('attendance_devices'))
+
+
+@app.route('/admin/attendance/<int:session_id>')
+@staff_required
+def attendance_session_detail(session_id):
+    s=DB();row=attendance_session_access(s,session_id);group=s.get(AcademicGroup,row.group_id);members=s.execute(select(Student,StudentGroup).join(StudentGroup,StudentGroup.student_id==Student.id).where(StudentGroup.group_id==row.group_id).order_by(Student.roll_no)).all();records=s.scalars(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id).order_by(AttendanceRecord.marked_at)).all();record_map={r.student_id:r for r in records};url=attendance_student_url(row)
+    return render_template('attendance_session_detail.html',session=row,group=group,members=members,record_map=record_map,records=records,group_label=group_label,student_url=url,qr_uri=qr_data_uri(url),state=attendance_state(row),secure_biometric=bool(APP_MODE=='online'),mode=APP_MODE)
+
+
+@app.route('/admin/attendance/<int:session_id>/close',methods=['POST'])
+@staff_required
+def attendance_session_close(session_id):
+    s=DB();row=attendance_session_access(s,session_id)
+    if not row.closed_at:row.closed_at=now_iso();audit_event(s,'attendance_session_closed','attendance_session',row.id,'');s.commit();flash('Attendance session closed.')
+    return redirect(url_for('attendance_session_detail',session_id=row.id))
+
+
+@app.route('/admin/attendance/<int:session_id>/reopen',methods=['POST'])
+@staff_required
+def attendance_session_reopen(session_id):
+    s=DB();row=attendance_session_access(s,session_id)
+    if parse_dt(row.ends_at)<=now_dt():flash('This session has already ended. Create a new attendance session instead.','error')
+    else:row.closed_at='';audit_event(s,'attendance_session_reopened','attendance_session',row.id,'');s.commit();flash('Attendance session reopened.')
+    return redirect(url_for('attendance_session_detail',session_id=row.id))
+
+
+@app.route('/admin/attendance/<int:session_id>/manual',methods=['POST'])
+@staff_required
+def attendance_session_manual(session_id):
+    s=DB();row=attendance_session_access(s,session_id);student_id=request.form.get('student_id',type=int);action=(request.form.get('action') or 'present').strip().lower();student=s.get(Student,student_id) if student_id else None
+    if not student or not attendance_student_allowed(s,row,student.id):flash('Student does not belong to this attendance batch/section.','error');return redirect(url_for('attendance_session_detail',session_id=row.id))
+    rec=s.scalar(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id,AttendanceRecord.student_id==student.id))
+    if action=='clear':
+        if rec:s.delete(rec);audit_event(s,'attendance_manual_cleared','attendance_session',row.id,f'student={student.roll_no}');s.commit();flash(f'Attendance cleared for {student.roll_no}.')
+    elif not rec:
+        rec=AttendanceRecord(session_id=row.id,student_id=student.id,marked_at=now_iso(),verification_method='faculty_manual',biometric_verified=False,network_verified=False,credential_id='',client_ip='',user_agent_hash='');s.add(rec);audit_event(s,'attendance_manual_marked','attendance_session',row.id,f'student={student.roll_no}');s.commit();flash(f'{student.roll_no} marked present manually.')
+    else:flash(f'{student.roll_no} is already marked present.')
+    return redirect(url_for('attendance_session_detail',session_id=row.id))
+
+
+@app.route('/admin/attendance/<int:session_id>/export.csv')
+@staff_required
+def attendance_session_export(session_id):
+    s=DB();row=attendance_session_access(s,session_id);group=s.get(AcademicGroup,row.group_id);students=s.execute(select(Student).join(StudentGroup,StudentGroup.student_id==Student.id).where(StudentGroup.group_id==row.group_id).order_by(Student.roll_no)).scalars().all();records={r.student_id:r for r in s.scalars(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id)).all()};buf=io.StringIO();w=csv.writer(buf);w.writerow(['Roll No','Registration No','Student Name','Status','Marked At','Verification','Biometric','Network Verified'])
+    for st in students:
+        rec=records.get(st.id);w.writerow([st.roll_no,st.registration_no,st.name,'Present' if rec else 'Absent',rec.marked_at if rec else '',rec.verification_method if rec else '', 'Yes' if rec and rec.biometric_verified else 'No','Yes' if rec and rec.network_verified else 'No'])
+    raw=io.BytesIO(buf.getvalue().encode('utf-8-sig'));raw.seek(0);name=re.sub(r'[^A-Za-z0-9._-]+','_',f'attendance_{row.subject}_{group.section if group else row.group_id}_{display_dt(row.starts_at).date()}.csv')
+    return send_file(raw,mimetype='text/csv',as_attachment=True,download_name=name)
+
+
+@app.route('/student/attendance')
+@student_required
+def student_attendance():
+    s=DB();student=s.get(Student,web_session['user_id']);membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student.id));rows=[]
+    if membership:
+        sessions=s.scalars(select(AttendanceSession).where(AttendanceSession.group_id==membership.group_id).order_by(AttendanceSession.id.desc()).limit(30)).all();records={r.session_id:r for r in s.scalars(select(AttendanceRecord).where(AttendanceRecord.student_id==student.id,AttendanceRecord.session_id.in_([x.id for x in sessions]))).all()} if sessions else {}
+        for row in sessions:
+            state=attendance_state(row)
+            if state in {'active','upcoming'} or row.id in records:rows.append({'session':row,'state':state,'record':records.get(row.id)})
+    return render_template('student_attendance.html',student=student,rows=rows)
+
+
+@app.route('/student/attendance/<int:session_id>')
+@student_required
+def student_attendance_session(session_id):
+    s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id)
+    if not row or not attendance_student_allowed(s,row,student.id):abort(404)
+    token=(request.args.get('token') or '').strip();token_ok=bool(token and secrets.compare_digest(token,row.access_token));record=s.scalar(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id,AttendanceRecord.student_id==student.id));network_ok,network_message=_attendance_network_check(row);rp_id=_webauthn_rp_id();passkeys=s.scalars(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id).order_by(StudentPasskey.id.desc())).all();secure=_webauthn_secure_context();state=attendance_state(row)
+    return render_template('student_attendance_session.html',student=student,session=row,token=token,token_ok=token_ok,record=record,network_ok=network_ok,network_message=network_message,passkeys=passkeys,secure_biometric=secure,state=state)
+
+
+@app.route('/student/passkeys/register/options',methods=['POST'])
+@student_required
+def student_passkey_register_options():
+    if not _webauthn_secure_context():return jsonify(error='Fingerprint/passkey registration requires HTTPS (localhost is allowed for testing).'),400
+    s=DB();student=s.get(Student,web_session['user_id']);payload=request.get_json(silent=True) or {};session_id=int(payload.get('session_id') or 0);token=(payload.get('token') or '').strip();attendance_row=s.get(AttendanceSession,session_id) if session_id else None
+    if not attendance_row or not attendance_student_allowed(s,attendance_row,student.id) or not token or not secrets.compare_digest(token,attendance_row.access_token):return jsonify(error='Open the current attendance QR/link before registering a device.'),403
+    if attendance_state(attendance_row)!='active':return jsonify(error='Device registration is available only while the attendance session is active.'),400
+    network_ok,network_message=_attendance_network_check(attendance_row)
+    if not network_ok:return jsonify(error=network_message),403
+    challenge=_b64url_encode(secrets.token_bytes(32));rp_id=_webauthn_rp_id();existing=s.scalars(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id)).all()
+    if existing:return jsonify(error='An attendance device is already registered. Ask faculty to reset it before registering another phone.'),409
+    web_session['_passkey_register_challenge']=challenge;web_session['_passkey_register_rp']=rp_id;web_session['_passkey_register_attendance_session']=attendance_row.id
+    return jsonify(publicKey={'challenge':challenge,'rp':{'name':get_institution(s).short_name or 'Exam System','id':rp_id},'user':{'id':_b64url_encode(str(student.id).encode()),'name':student.roll_no,'displayName':student.name},'pubKeyCredParams':[{'type':'public-key','alg':-7},{'type':'public-key','alg':-257}],'authenticatorSelection':{'authenticatorAttachment':'platform','residentKey':'preferred','userVerification':'required'},'timeout':60000,'attestation':'none','excludeCredentials':[]})
+
+
+@app.route('/student/passkeys/register/complete',methods=['POST'])
+@student_required
+def student_passkey_register_complete():
+    try:
+        s=DB();student=s.get(Student,web_session['user_id']);payload=request.get_json(silent=True) or {};attendance_session_id=web_session.get('_passkey_register_attendance_session');attendance_row=s.get(AttendanceSession,int(attendance_session_id or 0)) if attendance_session_id else None
+        if not attendance_row or not attendance_student_allowed(s,attendance_row,student.id) or attendance_state(attendance_row)!='active':raise ValueError('Attendance session expired before device registration completed.')
+        network_ok,_network_message=_attendance_network_check(attendance_row)
+        if not network_ok:raise ValueError('Stay connected to the approved attendance network while registering your device.')
+        row=_register_student_passkey(s,student,payload);web_session.pop('_passkey_register_attendance_session',None);return jsonify(ok=True,message='Fingerprint/passkey registered.',credential_id=row.credential_id)
+    except Exception as exc:
+        return jsonify(error=str(exc) if isinstance(exc,ValueError) else 'Passkey registration could not be verified.'),400
+
+
+@app.route('/student/passkeys/<int:passkey_id>/delete',methods=['POST'])
+@student_required
+def student_passkey_delete(passkey_id):
+    s=DB();student=s.get(Student,web_session['user_id']);row=s.get(StudentPasskey,passkey_id)
+    if row and row.student_id==student.id:audit_event(s,'student_passkey_removed','student',student.id,f'credential={row.credential_id[:12]}');s.delete(row);s.commit();flash('Registered biometric/passkey removed.')
+    return redirect(url_for('student_attendance'))
+
+
+@app.route('/student/attendance/<int:session_id>/auth/options',methods=['POST'])
+@student_required
+def student_attendance_auth_options(session_id):
+    if not _webauthn_secure_context():return jsonify(error='Fingerprint/passkey verification requires HTTPS on this device.'),400
+    s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id);payload=request.get_json(silent=True) or {};token=(payload.get('token') or '').strip()
+    if not row or not attendance_student_allowed(s,row,student.id) or not token or not secrets.compare_digest(token,row.access_token):return jsonify(error='Attendance link is invalid or expired.'),403
+    if attendance_state(row)!='active':return jsonify(error='This attendance session is not active.'),400
+    network_ok,message=_attendance_network_check(row)
+    if not network_ok:return jsonify(error=message),403
+    rp_id=_webauthn_rp_id();keys=s.scalars(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id)).all()
+    if not keys:return jsonify(error='Register your fingerprint/passkey on this device first.'),400
+    challenge=_b64url_encode(secrets.token_bytes(32));web_session['_attendance_auth_challenge']=challenge;web_session['_attendance_auth_session']=row.id
+    return jsonify(publicKey={'challenge':challenge,'rpId':rp_id,'allowCredentials':[{'type':'public-key','id':k.credential_id} for k in keys],'userVerification':'required','timeout':60000})
+
+
+@app.route('/student/attendance/<int:session_id>/auth/complete',methods=['POST'])
+@student_required
+def student_attendance_auth_complete(session_id):
+    try:
+        s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id);payload=request.get_json(silent=True) or {};token=(payload.get('token') or '').strip();challenge=web_session.pop('_attendance_auth_challenge',None);expected_session=web_session.pop('_attendance_auth_session',None)
+        if not row or not attendance_student_allowed(s,row,student.id) or expected_session!=row.id or not challenge:raise ValueError('Biometric verification expired. Start again.')
+        if not token or not secrets.compare_digest(token,row.access_token):raise ValueError('Attendance link is invalid or expired.')
+        if attendance_state(row)!='active':raise ValueError('This attendance session is not active.')
+        key=_verify_student_passkey_assertion(s,student,payload,challenge);rec,created=_attendance_create_record(s,row,student,'passkey',True,key.credential_id);return jsonify(ok=True,created=created,message='Attendance marked successfully.',marked_at=rec.marked_at)
+    except Exception as exc:
+        return jsonify(error=str(exc) if isinstance(exc,ValueError) else 'Biometric verification failed.'),400
+
+
+@app.route('/student/attendance/<int:session_id>/mark',methods=['POST'])
+@student_required
+def student_attendance_mark(session_id):
+    s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id);token=(request.form.get('token') or '').strip()
+    if not row or not attendance_student_allowed(s,row,student.id):abort(404)
+    if not token or not secrets.compare_digest(token,row.access_token):flash('Attendance link is invalid or expired.','error');return redirect(url_for('student_attendance'))
+    if attendance_state(row)!='active':flash('This attendance session is not active.','error');return redirect(url_for('student_attendance_session',session_id=row.id,token=token))
+    secure=_webauthn_secure_context();rp_id=_webauthn_rp_id();has_key=bool(s.scalar(select(StudentPasskey.id).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id).limit(1)))
+    if row.biometric_mode=='required':flash('Fingerprint/passkey verification is required for this attendance session.','error');return redirect(url_for('student_attendance_session',session_id=row.id,token=token))
+    if row.biometric_mode=='preferred' and secure and has_key:flash('Please use Verify fingerprint / passkey to mark attendance.','error');return redirect(url_for('student_attendance_session',session_id=row.id,token=token))
+    try:rec,created=_attendance_create_record(s,row,student,'network_login_fallback',False,'');flash('Attendance marked.' if created else 'Your attendance was already marked.')
+    except ValueError as exc:flash(str(exc),'error')
+    return redirect(url_for('student_attendance_session',session_id=row.id,token=token))
 
 
 @app.route('/admin/theory-classes',methods=['GET','POST'])
@@ -4488,13 +4952,16 @@ def delete_group(group_id):
     label=group_label(row)
     member_count=s.scalar(select(func.count()).select_from(StudentGroup).where(StudentGroup.group_id==row.id)) or 0
     session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.group_id==row.id)) or 0
+    attendance_count=s.scalar(select(func.count()).select_from(AttendanceSession).where(AttendanceSession.group_id==row.id)) or 0
     # Student accounts remain intact and become Unassigned. Exam records remain
     # intact; only sessions that explicitly target this deleted group are removed.
     # PracticalRegister / PracticalStudent / PracticalMark are intentionally not
     # referenced here, so lab lists and marks are preserved unchanged.
+    # Keep historical attendance sessions/reports even when a batch label is removed.
+    for attendance_row in s.scalars(select(AttendanceSession).where(AttendanceSession.group_id==row.id)).all():attendance_row.group_id=None
     s.execute(delete(StudentGroup).where(StudentGroup.group_id==row.id))
     s.execute(delete(ExamSession).where(ExamSession.group_id==row.id))
-    audit_event(s,'academic_group_deleted','group',row.id,f'{label}; students_unassigned={member_count}; exam_sessions_removed={session_count}; practical_data_preserved=1')
+    audit_event(s,'academic_group_deleted','group',row.id,f'{label}; students_unassigned={member_count}; exam_sessions_removed={session_count}; attendance_sessions_preserved={attendance_count}; practical_data_preserved=1')
     s.delete(row);s.commit()
     flash(f'{label} deleted. {member_count} student account'+(' was' if member_count==1 else 's were')+' left unassigned; practical lists and practical marks were not changed.')
     return redirect(url_for('academic_groups'))
@@ -5076,6 +5543,7 @@ def exams():
         if title:
             e=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(e);s.flush();get_exam_config(s,e.id,create=True);get_exam_approval(s,e.id,create=True);audit_event(s,'exam_created','exam',e.id,title);s.commit();flash('Exam created as draft.')
     subject_exam_options=[]
+    voice_subject_catalog=[]
     catalog_subjects=s.scalars(select(SubjectCatalog).where(SubjectCatalog.is_active==True).order_by(SubjectCatalog.name)).all()
     for catalog_subject in catalog_subjects:
         unit_rows=s.execute(
@@ -5089,9 +5557,16 @@ def exams():
             .order_by(BankQuestion.unit)
         ).all()
         approved_count=sum(int(count or 0) for _unit,count in unit_rows)
+        units=[(unit or '').strip() for unit,count in unit_rows if (unit or '').strip() and int(count or 0)>0]
+        voice_subject_catalog.append({
+            'id':catalog_subject.id,
+            'name':catalog_subject.name,
+            'course_semester':catalog_subject.course_semester or '',
+            'approved_count':approved_count,
+            'units':units,
+        })
         if not approved_count:
             continue
-        units=[(unit or '').strip() for unit,count in unit_rows if (unit or '').strip() and int(count or 0)>0]
         subject_exam_options.append({
             'id':catalog_subject.id,
             'name':catalog_subject.name,
@@ -5119,7 +5594,8 @@ def exams():
     exam_groups=[{'subject':subject,'exams':grouped[subject]} for subject in sorted(grouped,key=lambda name:(name in {'General','Mixed Subjects'},name.casefold()))]
     return render_template(
         'exams.html',exams=rows,exam_groups=exam_groups,
-        subject_exam_options=subject_exam_options,catalog_subjects=catalog_subjects
+        subject_exam_options=subject_exam_options,catalog_subjects=catalog_subjects,
+        voice_subject_catalog=voice_subject_catalog
     )
 
 @app.route('/admin/exam/<int:exam_id>/edit-metadata',methods=['POST'])
@@ -6543,7 +7019,15 @@ def student_dashboard():
         for unit_label in sorted(grouped[subject],key=student_exam_unit_sort_key):
             units.append({'label':unit_label,'exams':grouped[subject][unit_label]})
         exam_groups.append({'subject':subject,'units':units})
-    return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups,auto_refresh_at_epoch=min(auto_refresh_epochs) if auto_refresh_epochs else None,server_now_epoch=int(dashboard_now.timestamp()))
+    membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==st.id));attendance_rows=[]
+    if membership:
+        active_att=s.scalars(select(AttendanceSession).where(AttendanceSession.group_id==membership.group_id,AttendanceSession.closed_at=='').order_by(AttendanceSession.id.desc()).limit(10)).all()
+        attendance_records={r.session_id:r for r in s.scalars(select(AttendanceRecord).where(AttendanceRecord.student_id==st.id,AttendanceRecord.session_id.in_([x.id for x in active_att]))).all()} if active_att else {}
+        for arow in active_att:
+            astate=attendance_state(arow)
+            if astate in {'active','upcoming'}:
+                attendance_rows.append({'session':arow,'state':astate,'record':attendance_records.get(arow.id)})
+    return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups,attendance_rows=attendance_rows,auto_refresh_at_epoch=min(auto_refresh_epochs) if auto_refresh_epochs else None,server_now_epoch=int(dashboard_now.timestamp()))
 
 
 @app.route('/student/practical-code',methods=['GET','POST'])

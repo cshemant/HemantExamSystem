@@ -1,0 +1,7 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><h1>My Attendance</h1><p class="muted">Open an active classroom session and verify your presence.</p></div></div>
+{% for item in rows %}{% set r=item.session %}<div class="card attendance-student-card">
+  <div><h2>{{ r.subject }}</h2><p class="muted">{{ r.title }}{% if r.venue %} · {{ r.venue }}{% endif %}</p><div class="mini-meta">{{ r.starts_at|dt }} – {{ r.ends_at|dt }}</div></div>
+  <div class="actions">{% if item.record %}<span class="badge success">✓ Attendance marked</span>{% elif item.state=='active' %}<a class="btn" href="{{ url_for('student_attendance_session',session_id=r.id,token=r.access_token) }}">Mark Attendance</a>{% else %}<span class="badge warning">Upcoming</span>{% endif %}</div>
+</div>{% else %}<div class="card">No active or upcoming attendance session is assigned to your batch/section.</div>{% endfor %}
+{% endblock %}

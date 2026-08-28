@@ -1,0 +1,7 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><h1>Attendance Devices</h1><p class="muted">Passkeys prove device-user verification without storing fingerprints or biometric templates.</p></div><a class="btn secondary" href="{{ url_for('attendance_sessions') }}">Attendance</a></div>
+<div class="integrity-banner">Resetting a device removes only its attendance passkey. It does not delete the student account, exam device locks, marks or attendance history.</div>
+<div class="card"><div class="table-wrap"><table><tr><th>Roll No</th><th>Student</th><th>Registered Passkeys</th><th>Last Used</th><th>Action</th></tr>
+{% for st in students %}{% set keys=by_student.get(st.id,[]) %}<tr><td>{{ st.roll_no }}</td><td>{{ st.name }}</td><td>{{ keys|length }}{% if keys %}<div class="mini-meta">{{ keys[0].rp_id }}</div>{% endif %}</td><td>{{ keys[0].last_used_at|dt if keys and keys[0].last_used_at else '-' }}</td><td>{% if keys %}<form method="post" action="{{ url_for('attendance_device_reset',student_id=st.id) }}" onsubmit="return confirm('Remove all attendance passkeys for {{ st.roll_no }}?');"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn tiny danger" type="submit">Reset Device</button></form>{% else %}<span class="badge gray">None</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5">No students found.</td></tr>{% endfor %}
+</table></div></div>
+{% endblock %}

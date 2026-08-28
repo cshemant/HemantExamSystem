@@ -1,0 +1,34 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><h1>{{ session.title }}</h1><p class="muted">{{ session.subject }} · {{ group_label(group) if group else 'Batch removed' }}{% if session.venue %} · {{ session.venue }}{% endif %}</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('attendance_sessions') }}">All Sessions</a><a class="btn secondary" href="{{ url_for('attendance_session_export',session_id=session.id) }}">Export CSV</a></div></div>
+
+<div class="grid attendance-detail-grid">
+  <div class="card soft">
+    <div class="attendance-state-row"><span class="badge {{ 'success' if state=='active' else 'warning' if state=='upcoming' else 'gray' }}">{{ state|upper }}</span><strong>{{ records|length }} present / {{ members|length }} students</strong></div>
+    <div class="readiness-list">
+      <div><span>Starts</span><strong>{{ session.starts_at|dt }}</strong></div><div><span>Ends</span><strong>{{ session.ends_at|dt }}</strong></div>
+      <div><span>Network</span><strong>{{ 'Same classroom LAN' if session.network_mode=='lan' else 'Approved CIDR' if session.network_mode=='cidr' else 'No restriction' }}</strong></div>
+      <div><span>Biometric</span><strong>{{ session.biometric_mode|title }}</strong></div>
+    </div>
+    <div class="actions attendance-session-actions">
+      {% if state=='active' or state=='upcoming' %}<form method="post" action="{{ url_for('attendance_session_close',session_id=session.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger" type="submit">Close Attendance</button></form>{% elif state=='closed' %}<form method="post" action="{{ url_for('attendance_session_reopen',session_id=session.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Reopen</button></form>{% endif %}
+    </div>
+  </div>
+  <div class="card qr-card">
+    <h2>Student Attendance QR</h2><img src="{{ qr_uri }}" alt="Attendance QR code"><div class="access-url attendance-url">{{ student_url }}</div>
+    <button class="btn secondary" type="button" onclick="navigator.clipboard&&navigator.clipboard.writeText('{{ student_url|e }}')">Copy Attendance Link</button>
+  </div>
+</div>
+
+{% if mode=='offline' and session.biometric_mode!='disabled' %}
+<div class="integrity-banner">Fingerprint/passkey verification requires HTTPS on student phones. On the offline <code>http://192.168.x.x</code> LAN URL, the system will use the approved-network + authenticated-student fallback unless biometric is set to Required. Use HTTPS for mandatory fingerprint verification.</div>
+{% endif %}
+{% if session.network_mode=='any' %}<div class="integrity-banner active">Network restriction is disabled for this session. Use this only for testing.</div>{% endif %}
+
+<div class="card">
+  <h2>Live Attendance</h2>
+  <div class="table-wrap"><table><tr><th>Roll No</th><th>Name</th><th>Status</th><th>Marked At</th><th>Verification</th></tr>
+    {% for st,membership in members %}{% set rec=record_map.get(st.id) %}<tr><td>{{ st.roll_no }}</td><td>{{ st.name }}</td><td>{% if rec %}<span class="badge success">Present</span>{% else %}<span class="badge gray">Not marked</span>{% endif %}</td><td>{{ rec.marked_at|dt if rec else '-' }}</td><td><div class="attendance-verification-cell">{% if rec %}<span>{{ 'Fingerprint / Passkey' if rec.biometric_verified else 'Faculty manual' if rec.verification_method=='faculty_manual' else 'Network + Login' }}</span>{% else %}<span>-</span>{% endif %}<form method="post" action="{{ url_for('attendance_session_manual',session_id=session.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="student_id" value="{{ st.id }}"><input type="hidden" name="action" value="{{ 'clear' if rec else 'present' }}"><button class="btn tiny secondary" type="submit">{{ 'Clear' if rec else 'Mark Present' }}</button></form></div></td></tr>{% else %}<tr><td colspan="5">No students are assigned to this batch/section.</td></tr>{% endfor %}
+  </table></div>
+</div>
+{% if state=='active' %}<script>setTimeout(()=>{if(document.visibilityState==='visible')location.reload();},15000);</script>{% endif %}
+{% endblock %}

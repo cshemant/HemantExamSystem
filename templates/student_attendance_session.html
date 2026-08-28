@@ -1,0 +1,40 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><h1>{{ session.subject }}</h1><p class="muted">{{ session.title }}{% if session.venue %} · {{ session.venue }}{% endif %}</p></div></div>
+
+<div class="card attendance-check-card">
+  {% if record %}
+    <div class="attendance-success"><div class="attendance-success-icon">✓</div><h2>Attendance marked</h2><p>Your attendance was recorded at <strong>{{ record.marked_at|dt }}</strong>.</p><span class="badge success">{{ 'Fingerprint / Passkey verified' if record.biometric_verified else 'Approved network + login verified' }}</span></div>
+  {% else %}
+    <div class="readiness-list">
+      <div><span>Session</span><strong>{{ state|title }}</strong></div><div><span>Network check</span><strong class="{{ 'attendance-ok' if network_ok else 'attendance-bad' }}">{{ 'Passed' if network_ok else 'Failed' }}</strong></div><div><span>Fingerprint / Passkey</span><strong>{{ session.biometric_mode|title }}</strong></div>
+    </div>
+    {% if not token_ok %}<div class="integrity-banner active">Open the current attendance QR/link provided by your faculty member. This link is missing the session token.</div>{% endif %}
+    {% if not network_ok %}<div class="integrity-banner active">{{ network_message }}</div>{% endif %}
+    {% if state!='active' %}<div class="integrity-banner">Attendance cannot be marked because this session is {{ state }}.</div>{% endif %}
+
+    {% if session.biometric_mode!='disabled' %}
+      <div class="attendance-biometric-box">
+        <h2>Fingerprint / Device Verification</h2>
+        {% if secure_biometric %}
+          <p class="muted">Your fingerprint/Face ID stays on your phone. The server stores only a passkey public credential.</p>
+          {% if passkeys %}<button id="attendance-verify-passkey" type="button" {% if not token_ok or not network_ok or state!='active' %}disabled{% endif %}>Verify fingerprint / passkey</button>{% else %}<button id="attendance-register-passkey" type="button">Register fingerprint / passkey</button><p class="mini-meta">Register once on this device, then verify attendance.</p>{% endif %}
+        {% else %}
+          <div class="integrity-banner">Fingerprint/passkeys are blocked by the browser on this HTTP LAN address. HTTPS is required. {% if session.biometric_mode=='preferred' %}The secure network + login fallback is available below.{% else %}Ask the faculty member to use an HTTPS attendance link or change the session biometric setting.{% endif %}</div>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    {% if session.biometric_mode=='disabled' or (session.biometric_mode=='preferred' and (not secure_biometric or not passkeys)) %}
+      <form method="post" action="{{ url_for('student_attendance_mark',session_id=session.id) }}" class="attendance-fallback-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="token" value="{{ token }}">
+        <button type="submit" {% if not token_ok or not network_ok or state!='active' %}disabled{% endif %}>Mark Attendance</button>
+        <p class="muted small-text">Fallback verification uses your authenticated student account, the attendance token, the approved network and the attendance time window.</p>
+      </form>
+    {% endif %}
+    <div id="attendance-client-message" class="flash" hidden></div>
+  {% endif %}
+</div>
+{% if not record and session.biometric_mode!='disabled' %}
+<script>window.ATTENDANCE_CONFIG={{ {'sessionId':session.id,'token':token,'csrf':csrf_token}|tojson }};</script><script src="{{ url_for('static',filename='attendance.js') }}?v={{ app_version }}"></script>
+{% endif %}
+{% endblock %}
