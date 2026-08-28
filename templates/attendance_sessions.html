@@ -1,5 +1,5 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div><h1>Attendance</h1><p class="muted">Create short classroom attendance windows tied to a batch/section and an approved network.</p></div><a class="btn secondary" href="{{ url_for('attendance_devices') }}">Student Devices</a></div>
+<div class="page-head"><div><h1>Attendance</h1></div><a class="btn secondary" href="{{ url_for('attendance_devices') }}">Student Devices</a></div>
 
 <div class="card">
   <h2>Start Attendance Session</h2>
@@ -18,7 +18,6 @@
     <div id="attendance-cidr-row" class="attendance-cidr-row">
       <label>Approved CIDRs <span class="muted">(required for Approved IP/CIDR mode)</span></label>
       <input name="allowed_cidrs" placeholder="e.g. 10.20.0.0/16, 103.42.12.0/24">
-      <p class="muted small-text">A normal browser cannot reliably read the Wi-Fi SSID. For campus Wi-Fi, use the network ranges provided by the university IT team.</p>
     </div>
     <div class="actions"><button type="submit">Create Attendance Session</button></div>
   </form>
