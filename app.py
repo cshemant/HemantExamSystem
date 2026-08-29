@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 from urllib.parse import urlparse
 
-from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request
+from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -2999,7 +2999,16 @@ def security_headers(response):
     response.headers.setdefault('Cache-Control','no-store' if request.path.startswith('/admin') or request.path.startswith('/student') else 'no-cache')
     return response
 
+@app.route('/google44472b29f10e2933.html')
+def google_site_verification():
+    return send_from_directory(
+        app.root_path,
+        'google44472b29f10e2933.html'
+    )
+
+
 @app.route('/robots.txt')
+
 def robots_txt():
     # Keep a real robots.txt file in the project for transparent deployment,
     # while still blocking every non-canonical host (staging, Render origin,
