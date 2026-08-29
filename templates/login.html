@@ -1,19 +1,69 @@
 {% extends 'base.html' %}{% block content %}
-<section class="login-shell"><div class="container login-grid">
+<section class="login-shell" aria-labelledby="exam-system-title"><div class="container login-grid">
   <div class="intro-card">
     <div class="intro-main">
-      <div class="eyebrow">Secure examination workflow</div>
-      <h1>Simple exams. Offline or online.</h1>
-            <div class="intro-pills"><span>Question Bank</span><span>Exam Blueprint</span><span>Randomized Papers</span><span>Autosave</span><span>Resume</span><span>Automatic Scoring</span></div>
+      <div class="eyebrow">Online exam system for colleges &amp; universities</div>
+      <h1 id="exam-system-title">Secure online and offline exam system</h1>
+      <p>Create, schedule and conduct assessments with question banks, randomized papers, autosave, automatic scoring, attendance and practical evaluation tools.</p>
+      <div class="intro-pills"><span>Question Bank</span><span>Exam Blueprint</span><span>Randomized Papers</span><span>Autosave</span><span>Resume</span><span>Automatic Scoring</span></div>
+      <a class="intro-learn-link" href="#exam-system-features">Explore exam system features <span aria-hidden="true">↓</span></a>
     </div>
     <div class="offline-download-box">
       <div class="offline-download-copy"><strong>Need an Internet-independent exam?</strong><span>Offline V{{ app_version }} · Windows · LAN ready</span></div>
       <a class="offline-download-btn" href="{{ url_for('offline_download') }}">Download Offline V{{ app_version }}</a>
     </div>
   </div>
-  <div class="login-cards">
+  <div class="login-cards" id="exam-login">
     <div class="login-card"><h2>Student Login</h2><p class="muted" style="margin-bottom:16px">Use the credentials provided by your faculty.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="login_type" value="student"><label>Roll Number</label><input name="roll_no" autocomplete="username" required><label>Password</label><input name="password" type="password" autocomplete="current-password" required><button>Login as Student</button></form></div>
     <div class="login-card"><h3>Faculty / Admin Login</h3><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="login_type" value="admin"><div class="grid"><div><label>Username</label><input name="username" autocomplete="username" required></div><div><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div></div><button>Login as Faculty / Admin</button></form></div>
   </div>
 </div></section>
+
+<section class="public-seo-section" id="exam-system-features" aria-labelledby="features-title">
+  <div class="container">
+    <div class="public-section-heading">
+      <div class="eyebrow">College exam management</div>
+      <h2 id="features-title">One exam system for the complete assessment workflow</h2>
+      <p>Learn with Hemant Exam System helps faculty manage the work around an examination—not only the final test screen. It supports question preparation, exam delivery, evaluation, attendance and practical assessment in one workflow.</p>
+    </div>
+    <div class="public-feature-grid">
+      <article class="public-feature-card"><span class="public-feature-number">01</span><h3>Build better question banks</h3><p>Organize questions by subject, unit and difficulty, prepare exam blueprints, review questions and reuse approved content across assessments.</p></article>
+      <article class="public-feature-card"><span class="public-feature-number">02</span><h3>Conduct secure online exams</h3><p>Schedule assessments, randomize questions and options, use autosave and resume, and apply exam integrity controls for controlled student attempts.</p></article>
+      <article class="public-feature-card"><span class="public-feature-number">03</span><h3>Evaluate faster</h3><p>Use automatic scoring where appropriate, review submitted answers, track results and analytics, and support practical marks and viva workflows.</p></article>
+      <article class="public-feature-card"><span class="public-feature-number">04</span><h3>Keep an offline option</h3><p>Run an internet-independent Windows and LAN-ready exam setup when connectivity is unreliable or a local examination environment is preferred.</p></article>
+    </div>
+  </div>
+</section>
+
+<section class="public-seo-section public-seo-soft" aria-labelledby="workflow-title">
+  <div class="container public-workflow-layout">
+    <div class="public-section-heading">
+      <div class="eyebrow">Designed for real classrooms</div>
+      <h2 id="workflow-title">From question creation to results</h2>
+      <p>The platform is designed for colleges, universities, faculty members and students who need a practical online examination system without separating every academic task into a different tool.</p>
+    </div>
+    <ol class="public-workflow-list">
+      <li><strong>Create</strong><span>Set up subjects, units, question banks and exam rules.</span></li>
+      <li><strong>Schedule</strong><span>Choose the exam window, duration and student access conditions.</span></li>
+      <li><strong>Conduct</strong><span>Deliver the exam with randomized papers, autosave and integrity controls.</span></li>
+      <li><strong>Evaluate</strong><span>Score objective answers automatically and review results, attendance or practical performance.</span></li>
+    </ol>
+  </div>
+</section>
+
+<section class="public-seo-section" aria-labelledby="faq-title">
+  <div class="container public-faq-layout">
+    <div class="public-section-heading">
+      <div class="eyebrow">Exam system FAQ</div>
+      <h2 id="faq-title">Common questions</h2>
+      <p>Key information for faculty and institutions evaluating the platform.</p>
+    </div>
+    <div class="public-faq-list">
+      <details open><summary>What is Learn with Hemant Exam System?</summary><p>It is an exam management platform for creating, scheduling, conducting and evaluating college assessments, with separate workflows for faculty, administrators and students.</p></details>
+      <details><summary>Can the exam system work without the internet?</summary><p>Yes. In addition to the online browser-based system, an offline Windows package is available for LAN-ready, internet-independent examinations.</p></details>
+      <details><summary>Does it support randomized questions and automatic scoring?</summary><p>Yes. The system includes randomized exam papers and automatic scoring for supported question types, while still allowing faculty review where manual evaluation is required.</p></details>
+      <details><summary>Is it only for theory exams?</summary><p>No. The application also includes practical assessment, viva and marks workflows, attendance features and other tools built around day-to-day academic assessment.</p></details>
+    </div>
+  </div>
+</section>
 {% endblock %}

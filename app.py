@@ -51,6 +51,13 @@ PRACTICAL_SYNC_BATCH_SIZE=max(5,min(50,int(os.getenv('PRACTICAL_SYNC_BATCH_SIZE'
 INTEGRATION_API_KEY=os.getenv('INTEGRATION_API_KEY','').strip()
 EXAM_PACKAGE_SIGNING_KEY=os.getenv('EXAM_PACKAGE_SIGNING_KEY','').strip()
 
+# Public SEO is intentionally pinned to the production hostname. This keeps
+# staging/onrender/local copies from competing with the canonical site in
+# search results while leaving all application routes and authentication logic
+# unchanged.
+SEO_CANONICAL_ORIGIN=(os.getenv('SEO_CANONICAL_ORIGIN','https://exam.learnwithhemant.com').strip() or 'https://exam.learnwithhemant.com').rstrip('/')
+SEO_CANONICAL_HOST=(urlparse(SEO_CANONICAL_ORIGIN).hostname or 'exam.learnwithhemant.com').lower()
+
 # Classroom attendance presence proof.  The projected QR rotates frequently,
 # but a student only needs to scan a valid QR once.  A successful scan (or the
 # matching six-digit room code) issues a short-lived, student-bound completion
@@ -1859,6 +1866,18 @@ def can_approve_exams(s=None): return current_staff_role(s) in APPROVER_ROLES
 
 def can_approve_content(s=None): return current_staff_role(s) in APPROVER_ROLES
 
+def can_approve_bank_question(s,q):
+    """Return whether the current staff member may approve this bank question.
+
+    Privileged content approvers may approve any question in their active
+    institution. Ordinary faculty may approve only questions they created
+    themselves, which keeps the review workflow convenient without allowing one
+    faculty member to approve another faculty member's draft content.
+    """
+    role=current_staff_role(s)
+    if role in APPROVER_ROLES:return True
+    return bool(role=='faculty' and q and (q.created_by or '')==actor_label(s))
+
 
 def current_practical_owner(s=None):
     """Return the account identity that owns practical registers."""
@@ -2858,6 +2877,71 @@ def csrf_and_session_setup():
         if not supplied or not secrets.compare_digest(str(supplied),str(web_session.get('_csrf_token',''))):
             abort(400,'Security token validation failed. Refresh the page and try again.')
 
+def is_public_seo_host():
+    """Return True only for the canonical production hostname."""
+    host=(request.host.split(':',1)[0] if request.host else '').strip().lower()
+    return APP_MODE=='online' and host==SEO_CANONICAL_HOST
+
+def home_seo_context():
+    canonical=f'{SEO_CANONICAL_ORIGIN}/'
+    logo=f"{SEO_CANONICAL_ORIGIN}{url_for('static',filename='brand-logo.png')}"
+    description=(
+        'Secure online exam system for colleges with question banks, randomized papers, autosave, '
+        'automatic scoring, attendance and practical assessment tools.'
+    )
+    schema={
+        '@context':'https://schema.org',
+        '@graph':[
+            {
+                '@type':'WebSite',
+                '@id':f'{canonical}#website',
+                'url':canonical,
+                'name':'Learn with Hemant Exam System',
+                'alternateName':['LWH Exam System','Exam Learn with Hemant'],
+                'description':description,
+                'inLanguage':'en-IN',
+            },
+            {
+                '@type':'Organization',
+                '@id':f'{canonical}#organization',
+                'name':'Learn with Hemant',
+                'url':canonical,
+                'logo':logo,
+                'description':'Learning and assessment tools for computer science education.',
+            },
+            {
+                '@type':'WebApplication',
+                '@id':f'{canonical}#application',
+                'name':'Learn with Hemant Exam System',
+                'url':canonical,
+                'applicationCategory':'EducationalApplication',
+                'operatingSystem':'Web; Windows offline package',
+                'browserRequirements':'Requires a modern web browser for online mode.',
+                'description':description,
+                'publisher':{'@id':f'{canonical}#organization'},
+                'featureList':[
+                    'Question bank management',
+                    'Randomized exam papers',
+                    'Scheduled online examinations',
+                    'Autosave and resume',
+                    'Automatic scoring',
+                    'Practical assessment and marks',
+                    'Class attendance tools',
+                    'Offline LAN-ready examination mode',
+                ],
+            },
+        ],
+    }
+    return {
+        'seo_index':is_public_seo_host(),
+        'seo_title':'Online Exam System for Colleges & Faculty | Learn with Hemant',
+        'seo_description':description,
+        'seo_canonical_url':canonical,
+        'seo_og_type':'website',
+        'seo_og_image':logo,
+        'seo_schema':schema,
+    }
+
 @app.context_processor
 def globals_for_templates():
     practical_code_available=False
@@ -2879,6 +2963,13 @@ def offline_first_run_guard():
 @app.after_request
 def security_headers(response):
     response.headers.setdefault('X-Content-Type-Options','nosniff')
+    # Only the canonical production homepage is intended as a search landing
+    # page. Private/authenticated routes, local builds, staging and Render's
+    # service hostname should not become competing or low-value search results.
+    endpoint=request.endpoint or ''
+    public_home=endpoint=='home' and request.method=='GET' and is_public_seo_host()
+    if endpoint not in {'static','robots_txt','sitemap_xml'} and not public_home:
+        response.headers.setdefault('X-Robots-Tag','noindex, nofollow')
     # Every page remains non-frameable except the authenticated secure exam
     # document loaded by our own PIN-verification shell.  That single route is
     # same-origin only, so external sites still cannot embed the application.
@@ -2906,6 +2997,54 @@ def security_headers(response):
     response.headers.setdefault('Cross-Origin-Resource-Policy','same-origin')
     if APP_MODE=='online' and request.is_secure: response.headers.setdefault('Strict-Transport-Security','max-age=31536000; includeSubDomains')
     response.headers.setdefault('Cache-Control','no-store' if request.path.startswith('/admin') or request.path.startswith('/student') else 'no-cache')
+    return response
+
+@app.route('/robots.txt')
+def robots_txt():
+    # Keep a real robots.txt file in the project for transparent deployment,
+    # while still blocking every non-canonical host (staging, Render origin,
+    # localhost/offline) from search-engine crawling.
+    if not is_public_seo_host():
+        body='User-agent: *\nDisallow: /\n'
+    else:
+        robots_path=RESOURCE_DIR/'robots.txt'
+        try:
+            body=robots_path.read_text(encoding='utf-8')
+        except OSError:
+            # Fail safely if a deployment accidentally omits the file.
+            body=(
+                'User-agent: *\n'
+                'Allow: /\n'
+                'Disallow: /admin\n'
+                'Disallow: /student\n'
+                'Disallow: /api/\n'
+                f'Sitemap: {SEO_CANONICAL_ORIGIN}/sitemap.xml\n'
+            )
+    response=app.response_class(body,mimetype='text/plain')
+    response.headers['Cache-Control']='public, max-age=3600'
+    return response
+
+@app.route('/sitemap.xml')
+def sitemap_xml():
+    # The physical sitemap.xml is intentionally served only on the canonical
+    # production hostname. Staging/local hosts must not become indexable copies.
+    if not is_public_seo_host():
+        abort(404)
+    sitemap_path=RESOURCE_DIR/'sitemap.xml'
+    try:
+        body=sitemap_path.read_text(encoding='utf-8')
+    except OSError:
+        canonical=f'{SEO_CANONICAL_ORIGIN}/'
+        body=(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+            '  <url>\n'
+            f'    <loc>{canonical}</loc>\n'
+            '  </url>\n'
+            '</urlset>\n'
+        )
+    response=app.response_class(body,mimetype='application/xml')
+    response.headers['Cache-Control']='public, max-age=3600'
     return response
 
 @app.route('/setup',methods=['GET','POST'])
@@ -3422,7 +3561,7 @@ def home():
         locked,remaining=auth_is_locked(s,throttle_key)
         if locked:
             flash(f'Too many failed sign-in attempts. Try again in {max(1,math.ceil(remaining/60))} minute(s).','error')
-            return render_template('login.html',login_page=True),429
+            return render_template('login.html',login_page=True,**home_seo_context()),429
         row=None;role='student'
         if typ=='admin':
             row=s.scalar(select(Admin).where(Admin.username==username));role='admin'
@@ -3437,7 +3576,7 @@ def home():
                 if not ip_ok:
                     audit_event(s,'student_login_blocked_ip_roll_switch','user',row.id,f'exam_id={ip_exam.id if ip_exam else 0}')
                     s.commit();clear_student_session_for_ip_conflict()
-                    return render_template('login.html',login_page=True),409
+                    return render_template('login.html',login_page=True,**home_seo_context()),409
                 csrf=web_session.get('_csrf_token');device_token=web_session.get('_student_device_token') or secrets.token_urlsafe(24);post_login_next=web_session.get('_post_login_next','');web_session.clear();web_session['_csrf_token']=csrf;web_session['_student_device_token']=device_token
                 web_session.update(role='student',user_id=row.id,username=row.roll_no,_last_activity=int(time.time()))
                 audit_event(s,'student_login','user',row.id,'student')
@@ -3447,7 +3586,7 @@ def home():
             return complete_staff_session(s,row,role)
         record_auth_failure(s,throttle_key)
         flash('Invalid login credentials.','error')
-    return render_template('login.html',login_page=True)
+    return render_template('login.html',login_page=True,**home_seo_context())
 
 @app.route('/mfa-verify',methods=['GET','POST'])
 def mfa_verify():
@@ -6071,7 +6210,8 @@ def question_bank():
         selected_subject_units=[str(value).strip() for value in s.scalars(selected_units_stmt.distinct()).all() if str(value or '').strip()]
         selected_subject_units.sort(key=lambda value:(int(value) if value.isdigit() else 10**9,value.casefold()))
     target_exam_id=request.args.get('target_exam_id',type=int)
-    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,selected_subject_units=selected_subject_units,units=units,exams=exams_list,usage=usage,target_exam_id=target_exam_id,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
+    approvable_question_ids={row.id for row in rows if row.status!='approved' and can_approve_bank_question(s,row)}
+    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,selected_subject_units=selected_subject_units,units=units,exams=exams_list,usage=usage,target_exam_id=target_exam_id,approvable_question_ids=approvable_question_ids,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
 
 @app.route('/admin/question-bank/subjects',methods=['POST'])
 @staff_required
@@ -6437,11 +6577,54 @@ def edit_bank_question(question_id):
     seed_subject_catalog(s); return render_template('question_bank_edit.html',question=q,question_type=canonical_question_type(q.question_type),revisions=revisions,subject_groups=subject_catalog_groups(s))
 
 @app.route('/admin/question-bank/<int:question_id>/approve',methods=['POST'])
-@approver_required
+@staff_required
 def approve_bank_question(question_id):
     s=DB();q=s.get(BankQuestion,question_id)
     if not q:abort(404)
+    active_inst=current_curriculum_institution(s);scope=bank_question_institution_scope(active_inst)
+    if scope is not None and not s.scalar(select(BankQuestion.id).where(BankQuestion.id==q.id,scope)):
+        abort(403)
+    if not can_approve_bank_question(s,q):abort(403)
+    if q.status=='approved':
+        flash('Question is already approved.')
+        return redirect(request.referrer or url_for('question_bank'))
     q.status='approved';q.updated_at=now_iso();q.ai_review_status='approved' if (q.source or '').startswith('ai_') else q.ai_review_status;sync_bank_question_to_exam_snapshots(s,q);audit_event(s,'bank_question_approved','bank_question',q.id,f'{q.subject}; source={q.source}');s.commit();flash('Question approved. AI review lock was cleared where applicable.');return redirect(request.referrer or url_for('question_bank'))
+
+@app.route('/admin/question-bank/bulk-approve',methods=['POST'])
+@staff_required
+def bulk_approve_bank_questions():
+    ids=[]
+    for value in request.form.getlist('question_ids'):
+        try:ids.append(int(value))
+        except (TypeError,ValueError):pass
+    ids=list(dict.fromkeys(ids))
+    if not ids:
+        flash('Select at least one draft question to approve.','error')
+        return redirect(request.referrer or url_for('question_bank'))
+
+    s=DB();stmt=select(BankQuestion).where(BankQuestion.id.in_(ids))
+    active_inst=current_curriculum_institution(s);scope=bank_question_institution_scope(active_inst)
+    if scope is not None:stmt=stmt.where(scope)
+    rows=list(s.scalars(stmt).all())
+    eligible=[q for q in rows if q.status!='approved' and can_approve_bank_question(s,q)]
+    if not eligible:
+        flash('None of the selected draft questions can be approved by this account.','error')
+        return redirect(request.referrer or url_for('question_bank'))
+
+    approved_ids=[]
+    for q in eligible:
+        q.status='approved';q.updated_at=now_iso()
+        if (q.source or '').startswith('ai_'):q.ai_review_status='approved'
+        approved_ids.append(q.id)
+    s.flush()
+    for q in eligible:sync_bank_question_to_exam_snapshots(s,q)
+    audit_event(s,'bank_questions_bulk_approved','bank_question',','.join(str(x) for x in approved_ids[:100]),f'approved={len(approved_ids)}; selected={len(ids)}; actor={actor_label(s)}')
+    s.commit()
+    skipped=max(0,len(ids)-len(approved_ids))
+    message=f'Approved {len(approved_ids)} selected question(s). AI review locks were cleared where applicable.'
+    if skipped:message+=f' {skipped} selected item(s) were already approved, outside the active institution, or not approvable by this account.'
+    flash(message)
+    return redirect(request.referrer or url_for('question_bank'))
 
 @app.route('/admin/question-bank/add-to-exam',methods=['POST'])
 @staff_required
