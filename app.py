@@ -1859,6 +1859,18 @@ def can_approve_exams(s=None): return current_staff_role(s) in APPROVER_ROLES
 
 def can_approve_content(s=None): return current_staff_role(s) in APPROVER_ROLES
 
+def can_approve_bank_question(s,q):
+    """Return whether the current staff member may approve this bank question.
+
+    Privileged content approvers may approve any question in their active
+    institution. Ordinary faculty may approve only questions they created
+    themselves, which keeps the review workflow convenient without allowing one
+    faculty member to approve another faculty member's draft content.
+    """
+    role=current_staff_role(s)
+    if role in APPROVER_ROLES:return True
+    return bool(role=='faculty' and q and (q.created_by or '')==actor_label(s))
+
 
 def current_practical_owner(s=None):
     """Return the account identity that owns practical registers."""
@@ -6071,7 +6083,8 @@ def question_bank():
         selected_subject_units=[str(value).strip() for value in s.scalars(selected_units_stmt.distinct()).all() if str(value or '').strip()]
         selected_subject_units.sort(key=lambda value:(int(value) if value.isdigit() else 10**9,value.casefold()))
     target_exam_id=request.args.get('target_exam_id',type=int)
-    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,selected_subject_units=selected_subject_units,units=units,exams=exams_list,usage=usage,target_exam_id=target_exam_id,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
+    approvable_question_ids={row.id for row in rows if row.status!='approved' and can_approve_bank_question(s,row)}
+    return render_template('question_bank.html',questions=rows,subjects=catalog_rows,subject_groups=catalog_groups,catalog_categories=catalog_categories,catalog_map=catalog_map,question_counts=question_counts,selected_catalog_subject=selected_catalog_subject,selected_subject_stats=selected_subject_stats,selected_subject_units=selected_subject_units,units=units,exams=exams_list,usage=usage,target_exam_id=target_exam_id,approvable_question_ids=approvable_question_ids,filters={'q':q,'category':category,'subject':subject,'unit':unit,'difficulty':difficulty,'status':status,'practice_visibility':practice_visibility},preloaded_packs=preloaded_packs,preloaded_categories=preloaded_categories)
 
 @app.route('/admin/question-bank/subjects',methods=['POST'])
 @staff_required
@@ -6437,11 +6450,54 @@ def edit_bank_question(question_id):
     seed_subject_catalog(s); return render_template('question_bank_edit.html',question=q,question_type=canonical_question_type(q.question_type),revisions=revisions,subject_groups=subject_catalog_groups(s))
 
 @app.route('/admin/question-bank/<int:question_id>/approve',methods=['POST'])
-@approver_required
+@staff_required
 def approve_bank_question(question_id):
     s=DB();q=s.get(BankQuestion,question_id)
     if not q:abort(404)
+    active_inst=current_curriculum_institution(s);scope=bank_question_institution_scope(active_inst)
+    if scope is not None and not s.scalar(select(BankQuestion.id).where(BankQuestion.id==q.id,scope)):
+        abort(403)
+    if not can_approve_bank_question(s,q):abort(403)
+    if q.status=='approved':
+        flash('Question is already approved.')
+        return redirect(request.referrer or url_for('question_bank'))
     q.status='approved';q.updated_at=now_iso();q.ai_review_status='approved' if (q.source or '').startswith('ai_') else q.ai_review_status;sync_bank_question_to_exam_snapshots(s,q);audit_event(s,'bank_question_approved','bank_question',q.id,f'{q.subject}; source={q.source}');s.commit();flash('Question approved. AI review lock was cleared where applicable.');return redirect(request.referrer or url_for('question_bank'))
+
+@app.route('/admin/question-bank/bulk-approve',methods=['POST'])
+@staff_required
+def bulk_approve_bank_questions():
+    ids=[]
+    for value in request.form.getlist('question_ids'):
+        try:ids.append(int(value))
+        except (TypeError,ValueError):pass
+    ids=list(dict.fromkeys(ids))
+    if not ids:
+        flash('Select at least one draft question to approve.','error')
+        return redirect(request.referrer or url_for('question_bank'))
+
+    s=DB();stmt=select(BankQuestion).where(BankQuestion.id.in_(ids))
+    active_inst=current_curriculum_institution(s);scope=bank_question_institution_scope(active_inst)
+    if scope is not None:stmt=stmt.where(scope)
+    rows=list(s.scalars(stmt).all())
+    eligible=[q for q in rows if q.status!='approved' and can_approve_bank_question(s,q)]
+    if not eligible:
+        flash('None of the selected draft questions can be approved by this account.','error')
+        return redirect(request.referrer or url_for('question_bank'))
+
+    approved_ids=[]
+    for q in eligible:
+        q.status='approved';q.updated_at=now_iso()
+        if (q.source or '').startswith('ai_'):q.ai_review_status='approved'
+        approved_ids.append(q.id)
+    s.flush()
+    for q in eligible:sync_bank_question_to_exam_snapshots(s,q)
+    audit_event(s,'bank_questions_bulk_approved','bank_question',','.join(str(x) for x in approved_ids[:100]),f'approved={len(approved_ids)}; selected={len(ids)}; actor={actor_label(s)}')
+    s.commit()
+    skipped=max(0,len(ids)-len(approved_ids))
+    message=f'Approved {len(approved_ids)} selected question(s). AI review locks were cleared where applicable.'
+    if skipped:message+=f' {skipped} selected item(s) were already approved, outside the active institution, or not approvable by this account.'
+    flash(message)
+    return redirect(request.referrer or url_for('question_bank'))
 
 @app.route('/admin/question-bank/add-to-exam',methods=['POST'])
 @staff_required
