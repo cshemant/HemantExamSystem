@@ -1,0 +1,84 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head placement-head"><div><h1>Placement Readiness</h1><p>Connect classroom evidence, practice, practical coding and external skill evidence into one placement-focused view.</p></div></div>
+
+<div class="card placement-filter-card">
+  <form method="get" class="placement-filter-form">
+    <div><label>Batch / Section</label><select name="group_id" onchange="this.form.submit()"><option value="">Choose batch / section</option>{% for g in groups %}<option value="{{ g.id }}" {% if selected_group and selected_group.id==g.id %}selected{% endif %}>{{ g.program }} · Sem {{ g.semester }} · Section {{ g.section }}{% if g.academic_year %} · {{ g.academic_year }}{% endif %}</option>{% endfor %}</select></div>
+    <div class="placement-context"><span class="badge gray">{{ academic_institution.name if academic_institution else 'Institution-neutral' }}</span><span class="badge {{ 'success' if ai.configured else 'warning' }}">AI {{ 'ready' if ai.configured else 'not configured' }}</span></div>
+  </form>
+</div>
+
+<div class="grid placement-stat-grid">
+  <div class="stat-card"><strong>{{ snapshot.students|length }}</strong><span>Students</span></div>
+  <div class="stat-card"><strong>{{ snapshot.measured_students }}</strong><span>Measured Students</span></div>
+  <div class="stat-card"><strong>{{ snapshot.average }}%</strong><span>Average Readiness</span></div>
+  <div class="stat-card"><strong>{{ snapshot.at_risk }}</strong><span>Need Attention (&lt;60%)</span></div>
+</div>
+
+<div class="placement-two-col">
+  <div class="card">
+    <div class="import-header"><div><h2>Skill Readiness</h2><p class="mini-meta">Based on exam answers, practice, practical coding and imported evidence.</p></div></div>
+    <div class="placement-skill-list">
+      {% for row in snapshot.skills %}
+      <div class="placement-skill-row"><div><strong>{{ row.skill.name }}</strong><span>{{ row.students }} measured</span></div><div class="placement-progress"><span style="width:{{ row.score or 0 }}%"></span></div><strong>{% if row.score is not none %}{{ row.score }}%{% else %}—{% endif %}</strong></div>
+      {% else %}<div class="empty-state">Choose a batch / section to see placement readiness.</div>{% endfor %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Priority Gaps</h2>
+    {% if snapshot.gaps %}<div class="placement-gap-list">{% for row in snapshot.gaps %}<div><span>{{ row.skill.name }}</span><strong>{{ row.score }}%</strong></div>{% endfor %}</div>{% else %}<div class="empty-state">No measured skill gaps yet.</div>{% endif %}
+    {% if selected_group %}
+    <form method="post" action="{{ url_for('assign_placement_remedial') }}" class="placement-remedial-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="group_id" value="{{ selected_group.id }}">
+      <div class="grid"><div><label>Assign below</label><select name="threshold"><option>60</option><option selected>65</option><option>70</option><option>75</option></select></div><div><label>Questions / plan</label><select name="question_count"><option>5</option><option selected>10</option><option>15</option><option>20</option></select></div></div>
+      <button class="btn secondary">Assign Improvement Plans</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card placement-mock-card">
+  <div class="import-header"><div><h2>Company Drive Simulator</h2><p class="mini-meta">Creates an original skills-based mock. It does not copy or claim an official employer paper.</p></div></div>
+  <form method="post" action="{{ url_for('create_placement_mock') }}" class="placement-mock-form" id="placement-mock-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="grid">
+      <div><label>Employer / Drive Name</label><input name="company_name" placeholder="e.g. TCS, Infosys, Product Drive" required></div>
+      <div><label>Preparation Profile</label><select name="profile_key">{% for p in profiles %}<option value="{{ p.key }}">{{ p.label }}</option>{% endfor %}</select></div>
+      <div><label>Batch / Section</label><select name="group_id"><option value="">No batch assignment yet</option>{% for g in groups %}<option value="{{ g.id }}" {% if selected_group and selected_group.id==g.id %}selected{% endif %}>{{ g.program }} · Sem {{ g.semester }} · {{ g.section }}</option>{% endfor %}</select></div>
+      <div><label>Questions</label><input type="number" name="question_count" min="10" max="100" value="50"></div>
+      <div><label>Duration (minutes)</label><input type="number" name="duration_minutes" min="10" max="240" value="60"></div>
+      <div><label>Difficulty</label><select name="difficulty"><option>Easy</option><option selected>Medium</option><option>Hard</option></select></div>
+    </div>
+    <button>Create Placement Mock</button>
+  </form>
+</div>
+
+<div class="placement-two-col">
+  <div class="card">
+    <h2>Curriculum ↔ Placement Gap</h2>
+    <p class="mini-meta">A heuristic coverage signal from confirmed syllabus topics; it is not a formal accreditation judgement.</p>
+    <div class="table-wrap"><table><tr><th>Skill</th><th>Signal</th><th>Keyword hits</th></tr>{% for row in coverage %}<tr><td>{{ row.skill.name }}</td><td><span class="badge {% if row.status=='Gap signal' %}warning{% elif row.status=='Strong signal' %}success{% else %}gray{% endif %}">{{ row.status }}</span></td><td>{{ row.hits }}</td></tr>{% else %}<tr><td colspan="3">Upload and confirm curriculum syllabi to see coverage signals.</td></tr>{% endfor %}</table></div>
+  </div>
+  <div class="card">
+    <h2>Import External Skill Evidence</h2>
+    <p class="mini-meta">Use a normalized CSV export from coding platforms, certification systems or placement tools.</p>
+    <form method="post" enctype="multipart/form-data" action="{{ url_for('import_placement_evidence') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>CSV file</label><input type="file" name="file" accept=".csv,text/csv" required><button>Import Evidence</button>
+    </form>
+    <div class="code-note">Columns: <strong>roll_no, provider, skill, score, max_score, evidence_label</strong></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="import-header"><div><h2>Student Readiness</h2></div></div>
+  <div class="table-wrap"><table><tr><th>Roll No</th><th>Student</th><th>Readiness</th><th>Evidence Coverage</th><th>Priority Gap</th><th></th></tr>
+  {% for item in snapshot.students %}<tr><td>{{ item.student.roll_no }}</td><td><strong>{{ item.student.name }}</strong></td><td>{{ item.profile.readiness }}%</td><td>{{ item.profile.coverage }}%</td><td>{% if item.profile.weakest %}{{ item.profile.weakest[0].skill.name }} · {{ item.profile.weakest[0].score }}%{% else %}Not measured{% endif %}</td><td><a class="btn secondary small" href="{{ url_for('admin_student_skill_passport',student_id=item.student.id) }}">Skill Passport</a></td></tr>{% else %}<tr><td colspan="6">Choose a batch / section with students.</td></tr>{% endfor %}
+  </table></div>
+</div>
+
+<div class="card">
+  <h2>Recent Placement Mocks</h2>
+  <div class="table-wrap"><table><tr><th>Mock</th><th>Employer</th><th>Questions</th><th>Status</th><th></th></tr>{% for item in recent %}<tr><td>{{ item.exam.title }}</td><td>{{ item.map.company_name }}</td><td>{{ item.sections|sum(attribute='requested') }}</td><td>{% if item.exam.is_active %}<span class="badge success">Active</span>{% else %}<span class="badge gray">Draft</span>{% endif %}</td><td><a class="btn secondary small" href="{{ url_for('exam_builder',exam_id=item.exam.id) }}">Open</a></td></tr>{% else %}<tr><td colspan="5">No placement mocks yet.</td></tr>{% endfor %}</table></div>
+</div>
+{% endblock %}

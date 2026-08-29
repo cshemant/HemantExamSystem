@@ -25,14 +25,14 @@ from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
 from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
-from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, generate_subject_context_questions, AIProviderError
+from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, generate_subject_context_questions, generate_placement_questions, AIProviderError
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.37.0'
+APP_VERSION='2.38.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -414,6 +414,57 @@ class SyllabusTopic(Base):
     unit_id:Mapped[int]=mapped_column(ForeignKey('syllabus_units.id'),nullable=False)
     name:Mapped[str]=mapped_column(String,nullable=False)
     sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+
+class PlacementSkill(Base):
+    __tablename__='placement_skills'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    institution_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
+    name:Mapped[str]=mapped_column(String,nullable=False)
+    category:Mapped[str]=mapped_column(String,nullable=False,default='Technical')
+    description:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    keywords:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    target_percentage:Mapped[int]=mapped_column(Integer,nullable=False,default=70)
+    is_active:Mapped[bool]=mapped_column(Boolean,nullable=False,default=True)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class PlacementExternalEvidence(Base):
+    __tablename__='placement_external_evidence'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    skill_id:Mapped[int]=mapped_column(ForeignKey('placement_skills.id'),nullable=False)
+    provider:Mapped[str]=mapped_column(String,nullable=False,default='External')
+    evidence_label:Mapped[str]=mapped_column(String,nullable=False,default='')
+    score:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
+    max_score:Mapped[float]=mapped_column(Float,nullable=False,default=100.0)
+    recorded_at:Mapped[str]=mapped_column(String,nullable=False)
+    created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
+
+class PlacementRemedialPlan(Base):
+    __tablename__='placement_remedial_plans'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    skill_id:Mapped[int]=mapped_column(ForeignKey('placement_skills.id'),nullable=False)
+    assigned_count:Mapped[int]=mapped_column(Integer,nullable=False,default=10)
+    target_percentage:Mapped[int]=mapped_column(Integer,nullable=False,default=70)
+    status:Mapped[str]=mapped_column(String,nullable=False,default='assigned')
+    last_score:Mapped[int|None]=mapped_column(Integer,nullable=True)
+    last_attempt_id:Mapped[int|None]=mapped_column(Integer,nullable=True)
+    created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+    completed_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class PlacementExamMap(Base):
+    __tablename__='placement_exam_map'
+    __table_args__=(UniqueConstraint('exam_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
+    institution_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
+    company_name:Mapped[str]=mapped_column(String,nullable=False,default='General Placement')
+    profile_key:Mapped[str]=mapped_column(String,nullable=False,default='balanced')
+    sections_json:Mapped[str]=mapped_column(Text,nullable=False,default='[]')
+    group_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
+    created_by:Mapped[str]=mapped_column(String,nullable=False,default='admin')
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class InstitutionProfile(Base):
     __tablename__='institution_profile'
@@ -1514,6 +1565,254 @@ def sync_bank_question_to_exam_snapshots(s,bq):
     return len(touched)
 
 
+
+PLACEMENT_DEFAULT_SKILLS=[
+    {'name':'Quantitative Aptitude','category':'Aptitude','description':'Arithmetic, percentages, ratio, profit/loss, time-work, speed-distance, probability and quantitative problem solving.','keywords':'quantitative,aptitude,percentage,percentages,ratio,profit,loss,time work,time and work,speed distance,average,probability,number system,arithmetic'},
+    {'name':'Logical Reasoning','category':'Aptitude','description':'Logical reasoning, analytical puzzles, series, syllogisms, coding-decoding and pattern recognition.','keywords':'logical reasoning,reasoning,puzzle,series,syllogism,coding decoding,coding-decoding,blood relation,direction sense,pattern'},
+    {'name':'Verbal Ability','category':'Communication','description':'English grammar, vocabulary, comprehension and workplace communication.','keywords':'verbal,english,grammar,vocabulary,reading comprehension,comprehension,communication,sentence correction'},
+    {'name':'Data Structures & Algorithms','category':'Technical','description':'Arrays, linked lists, stacks, queues, trees, graphs, searching, sorting, complexity and dynamic programming.','keywords':'data structure,data structures,dsa,algorithm,algorithms,array,linked list,stack,queue,tree,graph,sorting,searching,dynamic programming,complexity,big o'},
+    {'name':'DBMS & SQL','category':'Technical','description':'Relational databases, SQL, joins, normalization, transactions, indexing and database design.','keywords':'dbms,database,sql,join,joins,normalization,transaction,index,indexing,rdbms,relational database'},
+    {'name':'OOP & Java','category':'Technical','description':'Object-oriented programming concepts and Java fundamentals used in placement interviews.','keywords':'oop,object oriented,object-oriented,java,inheritance,polymorphism,encapsulation,abstraction,class,interface'},
+    {'name':'Operating Systems','category':'Technical','description':'Processes, threads, scheduling, synchronization, deadlocks, memory and file systems.','keywords':'operating system,operating systems,process,thread,scheduling,deadlock,semaphore,memory management,paging,file system'},
+    {'name':'Computer Networks','category':'Technical','description':'Networking fundamentals, OSI/TCP-IP, routing, addressing and common Internet protocols.','keywords':'computer network,computer networks,networking,tcp,udp,ip address,osi,routing,subnet,http,dns,protocol'},
+    {'name':'Cloud Computing','category':'Technical','description':'Cloud models, virtualization, containers and foundational cloud architecture.','keywords':'cloud computing,cloud,virtualization,hypervisor,virtual machine,container,iaas,paas,saas,aws,azure'},
+    {'name':'Cyber Security','category':'Technical','description':'Security fundamentals, common attacks, cryptography, authentication and secure networking.','keywords':'cyber security,cybersecurity,security,cryptography,malware,attack,vulnerability,firewall,authentication,encryption'},
+    {'name':'Programming & Coding','category':'Coding','description':'Programming logic, implementation, debugging and practical coding/problem-solving ability.','keywords':'programming,coding,source code,code,python,c++,c language,java program,debugging,problem solving,implementation'},
+]
+
+PLACEMENT_PROFILES={
+    'balanced':{'label':'Balanced Campus Mock','mix':{'Quantitative Aptitude':15,'Logical Reasoning':15,'Verbal Ability':10,'Data Structures & Algorithms':20,'DBMS & SQL':10,'OOP & Java':10,'Operating Systems':10,'Computer Networks':10}},
+    'services':{'label':'IT Services Mock','mix':{'Quantitative Aptitude':20,'Logical Reasoning':20,'Verbal Ability':15,'Programming & Coding':15,'DBMS & SQL':10,'OOP & Java':10,'Operating Systems':10}},
+    'product':{'label':'Product Engineering Mock','mix':{'Data Structures & Algorithms':30,'Programming & Coding':20,'DBMS & SQL':10,'OOP & Java':10,'Operating Systems':10,'Computer Networks':10,'Quantitative Aptitude':10}},
+    'cloud_data':{'label':'Cloud / Data Roles Mock','mix':{'Programming & Coding':15,'DBMS & SQL':20,'Cloud Computing':20,'Computer Networks':10,'Cyber Security':10,'Quantitative Aptitude':10,'Logical Reasoning':15}},
+}
+
+
+def seed_placement_skills(s):
+    """Seed a provider-neutral placement skill vocabulary once.
+
+    The rows are global (institution_id NULL), so every institution starts with
+    the same reusable vocabulary while still being free to add institution-owned
+    skills later.
+    """
+    existing={str(x or '').casefold() for x in s.scalars(select(PlacementSkill.name).where(PlacementSkill.institution_id.is_(None))).all()}
+    for item in PLACEMENT_DEFAULT_SKILLS:
+        if item['name'].casefold() in existing:continue
+        s.add(PlacementSkill(institution_id=None,name=item['name'],category=item['category'],description=item['description'],keywords=item['keywords'],target_percentage=70,is_active=True,created_at=now_iso()))
+
+
+def placement_skills_for_institution(s,institution=None):
+    stmt=select(PlacementSkill).where(PlacementSkill.is_active==True)
+    if institution:
+        stmt=stmt.where(or_(PlacementSkill.institution_id.is_(None),PlacementSkill.institution_id==institution.id))
+    else:
+        stmt=stmt.where(PlacementSkill.institution_id.is_(None))
+    rows=list(s.scalars(stmt.order_by(PlacementSkill.category,PlacementSkill.id)).all())
+    # Prefer institution-owned overrides with the same name.
+    by_name={}
+    for row in rows:
+        key=row.name.casefold()
+        if key not in by_name or row.institution_id is not None:by_name[key]=row
+    return list(by_name.values())
+
+
+def _placement_skill_terms(skill):
+    values=[skill.name]
+    values.extend(x.strip() for x in (skill.keywords or '').split(',') if x.strip())
+    return sorted({x.casefold() for x in values if x},key=len,reverse=True)
+
+
+def infer_placement_skill(skills,subject='',topic='',tags='',question=''):
+    haystack=' '.join(str(x or '') for x in [subject,topic,tags,question]).casefold()
+    best=None;best_score=0
+    for skill in skills:
+        score=0
+        for term in _placement_skill_terms(skill):
+            if term and term in haystack:score+=max(1,min(5,len(term.split())))
+        if score>best_score:best=skill;best_score=score
+    return best
+
+
+def _placement_stat_add(stats,skill,earned,maximum,source):
+    if not skill or maximum is None:return
+    try:earned=float(earned or 0);maximum=float(maximum or 0)
+    except Exception:return
+    if maximum<=0:return
+    row=stats.setdefault(skill.id,{'skill':skill,'earned':0.0,'max':0.0,'evidence':0,'sources':set()})
+    row['earned']+=max(0.0,min(earned,maximum));row['max']+=maximum;row['evidence']+=1;row['sources'].add(source)
+
+
+def placement_student_profile(s,student_id,institution=None):
+    """Build an evidence-based placement skill profile from existing system data."""
+    skills=placement_skills_for_institution(s,institution);skill_by_id={x.id:x for x in skills};stats={}
+    attempts=list(s.scalars(select(Attempt).where(Attempt.student_id==student_id,Attempt.status=='submitted',Attempt.grading_status=='complete')).all())
+    for attempt in attempts:
+        cfg=get_exam_config(s,attempt.exam_id,create=False);fallback_subject=(cfg.subject if cfg else '')
+        answers=list(s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all())
+        for ans in answers:
+            q=s.get(Question,ans.question_id)
+            if not q:continue
+            mapping=s.scalar(select(ExamBankMap).where(ExamBankMap.exam_question_id==q.id));bank=s.get(BankQuestion,mapping.bank_question_id) if mapping else None
+            skill=infer_placement_skill(skills,bank.subject if bank else fallback_subject,bank.topic if bank else '',bank.tags if bank else '',bank.question if bank else q.question)
+            if not skill:continue
+            if canonical_question_type(q.question_type)=='essay':
+                if ans.manual_score is None:continue
+                earned=max(0,min(int(ans.manual_score),q.marks))
+            else:earned=q.marks if is_answer_correct(q,answer_record_value(ans)) else 0
+            _placement_stat_add(stats,skill,earned,q.marks,'Exam')
+    practice=list(s.scalars(select(PracticeAttempt).where(PracticeAttempt.student_id==student_id,PracticeAttempt.status=='submitted')).all())
+    for attempt in practice:
+        for item in safe_json_load(attempt.answers_json,[]):
+            if item.get('is_manual'):continue
+            skill=infer_placement_skill(skills,item.get('subject',''),item.get('topic',''),'placement' if str(attempt.subject).startswith('Placement') else '',item.get('question',''))
+            if skill:_placement_stat_add(stats,skill,item.get('earned',0),item.get('marks',1),'Practice')
+    for ev in s.scalars(select(PlacementExternalEvidence).where(PlacementExternalEvidence.student_id==student_id)).all():
+        skill=skill_by_id.get(ev.skill_id)
+        if skill:_placement_stat_add(stats,skill,ev.score,ev.max_score,ev.provider or 'External')
+    # Practical-code marks are verified implementation evidence.
+    code_rows=list(s.scalars(select(PracticalCodeSubmission).where(PracticalCodeSubmission.student_id==student_id)).all())
+    coding=next((x for x in skills if x.name=='Programming & Coding'),None)
+    for row in code_rows:_placement_stat_add(stats,coding,row.performance_marks,10,'Practical Code')
+    return _placement_finalize_profile(skills,stats)
+
+
+def _placement_finalize_profile(skills,stats):
+    rows=[];weighted=[]
+    for skill in skills:
+        st=stats.get(skill.id);score=round(100*st['earned']/st['max']) if st and st['max'] else None
+        if score is not None:weighted.append(score)
+        rows.append({'skill':skill,'score':score,'evidence':st['evidence'] if st else 0,'sources':', '.join(sorted(st['sources'])) if st else '','status':('Strong' if score is not None and score>=80 else 'Ready' if score is not None and score>=skill.target_percentage else 'Improve' if score is not None else 'Not measured')})
+    readiness=round(sum(weighted)/len(weighted)) if weighted else 0
+    measured=sum(1 for x in rows if x['score'] is not None);coverage=round(100*measured/len(rows)) if rows else 0
+    weakest=sorted([x for x in rows if x['score'] is not None],key=lambda x:(x['score'],x['skill'].name))[:5]
+    return {'rows':rows,'readiness':readiness,'measured':measured,'coverage':coverage,'weakest':weakest,'evidence_count':sum(x['evidence'] for x in rows)}
+
+
+def placement_group_snapshot(s,group_id,institution=None):
+    """Bulk placement analytics for one cohort.
+
+    This avoids one database query per student/answer so a placement dashboard can
+    handle a full batch on a small Render instance without turning into an N+1
+    query storm.
+    """
+    memberships=list(s.scalars(select(StudentGroup).where(StudentGroup.group_id==group_id)).all()) if group_id else []
+    student_ids=[m.student_id for m in memberships]
+    students=list(s.scalars(select(Student).where(Student.id.in_(student_ids)).order_by(Student.roll_no)).all()) if student_ids else []
+    skills=placement_skills_for_institution(s,institution);skill_by_id={x.id:x for x in skills}
+    stats_by_student={sid:{} for sid in student_ids}
+
+    attempts=list(s.scalars(select(Attempt).where(Attempt.student_id.in_(student_ids),Attempt.status=='submitted',Attempt.grading_status=='complete')).all()) if student_ids else []
+    attempt_student={a.id:a.student_id for a in attempts};attempt_ids=list(attempt_student)
+    answers=list(s.scalars(select(Answer).where(Answer.attempt_id.in_(attempt_ids))).all()) if attempt_ids else []
+    qids={a.question_id for a in answers};questions={q.id:q for q in s.scalars(select(Question).where(Question.id.in_(qids))).all()} if qids else {}
+    mappings={m.exam_question_id:m.bank_question_id for m in s.scalars(select(ExamBankMap).where(ExamBankMap.exam_question_id.in_(qids))).all()} if qids else {}
+    bank_ids=set(mappings.values());banks={b.id:b for b in s.scalars(select(BankQuestion).where(BankQuestion.id.in_(bank_ids))).all()} if bank_ids else {}
+    exam_ids={a.exam_id for a in attempts};cfgs={c.exam_id:c for c in s.scalars(select(ExamConfig).where(ExamConfig.exam_id.in_(exam_ids))).all()} if exam_ids else {}
+    attempt_exam={a.id:a.exam_id for a in attempts}
+    for ans in answers:
+        sid=attempt_student.get(ans.attempt_id);q=questions.get(ans.question_id)
+        if not sid or not q:continue
+        bank=banks.get(mappings.get(q.id));cfg=cfgs.get(attempt_exam.get(ans.attempt_id));fallback_subject=cfg.subject if cfg else ''
+        skill=infer_placement_skill(skills,bank.subject if bank else fallback_subject,bank.topic if bank else '',bank.tags if bank else '',bank.question if bank else q.question)
+        if not skill:continue
+        if canonical_question_type(q.question_type)=='essay':
+            if ans.manual_score is None:continue
+            earned=max(0,min(int(ans.manual_score),q.marks))
+        else:earned=q.marks if is_answer_correct(q,answer_record_value(ans)) else 0
+        _placement_stat_add(stats_by_student[sid],skill,earned,q.marks,'Exam')
+
+    practice=list(s.scalars(select(PracticeAttempt).where(PracticeAttempt.student_id.in_(student_ids),PracticeAttempt.status=='submitted')).all()) if student_ids else []
+    for attempt in practice:
+        for item in safe_json_load(attempt.answers_json,[]):
+            if item.get('is_manual'):continue
+            skill=infer_placement_skill(skills,item.get('subject',''),item.get('topic',''),'placement' if str(attempt.subject).startswith('Placement') else '',item.get('question',''))
+            if skill:_placement_stat_add(stats_by_student[attempt.student_id],skill,item.get('earned',0),item.get('marks',1),'Practice')
+
+    external=list(s.scalars(select(PlacementExternalEvidence).where(PlacementExternalEvidence.student_id.in_(student_ids))).all()) if student_ids else []
+    for ev in external:
+        skill=skill_by_id.get(ev.skill_id)
+        if skill:_placement_stat_add(stats_by_student[ev.student_id],skill,ev.score,ev.max_score,ev.provider or 'External')
+    coding=next((x for x in skills if x.name=='Programming & Coding'),None)
+    code_rows=list(s.scalars(select(PracticalCodeSubmission).where(PracticalCodeSubmission.student_id.in_(student_ids))).all()) if student_ids else []
+    for row in code_rows:_placement_stat_add(stats_by_student[row.student_id],coding,row.performance_marks,10,'Practical Code')
+
+    skill_rows={skill.id:{'skill':skill,'scores':[]} for skill in skills};student_rows=[]
+    for student in students:
+        profile=_placement_finalize_profile(skills,stats_by_student.get(student.id,{}));student_rows.append({'student':student,'profile':profile})
+        for row in profile['rows']:
+            if row['score'] is not None:skill_rows[row['skill'].id]['scores'].append(row['score'])
+    aggregate=[]
+    for item in skill_rows.values():
+        scores=item['scores'];aggregate.append({'skill':item['skill'],'score':round(sum(scores)/len(scores)) if scores else None,'students':len(scores)})
+    measured_profiles=[x['profile']['readiness'] for x in student_rows if x['profile']['measured']]
+    avg=round(sum(measured_profiles)/len(measured_profiles)) if measured_profiles else 0
+    at_risk=sum(1 for x in student_rows if x['profile']['measured'] and x['profile']['readiness']<60)
+    gaps=sorted([x for x in aggregate if x['score'] is not None],key=lambda x:(x['score'],x['skill'].name))[:5]
+    return {'students':student_rows,'skills':aggregate,'average':avg,'at_risk':at_risk,'measured_students':len(measured_profiles),'gaps':gaps}
+
+
+def curriculum_placement_gap(s,institution,skills):
+    if not institution:return []
+    subjects=list(s.scalars(select(CurriculumSubject).where(CurriculumSubject.institution_id==institution.id,CurriculumSubject.is_active==True)).all())
+    corpus=[]
+    for subject in subjects:
+        units=list(s.scalars(select(SyllabusUnit).where(SyllabusUnit.curriculum_subject_id==subject.id)).all())
+        for unit in units:
+            topics=list(s.scalars(select(SyllabusTopic.name).where(SyllabusTopic.unit_id==unit.id)).all())
+            corpus.append((subject.name+' '+unit.title+' '+unit.summary+' '+unit.raw_text+' '+' '.join(topics)).casefold())
+    joined='\n'.join(corpus)
+    rows=[]
+    for skill in skills:
+        hits=sum(1 for term in _placement_skill_terms(skill) if len(term)>=3 and term in joined)
+        status='Strong signal' if hits>=3 else 'Partial signal' if hits>=1 else 'Gap signal'
+        rows.append({'skill':skill,'hits':hits,'status':status})
+    return rows
+
+
+def _placement_profile_sections(profile_key,total,skills):
+    profile=PLACEMENT_PROFILES.get(profile_key) or PLACEMENT_PROFILES['balanced'];mix=profile['mix'];skill_map={x.name:x for x in skills};items=[];used=0
+    names=list(mix)
+    for idx,name in enumerate(names):
+        skill=skill_map.get(name)
+        if not skill:continue
+        if idx==len(names)-1:count=max(0,total-used)
+        else:count=max(1,round(total*mix[name]/100));used+=count
+        items.append({'skill':skill,'count':count})
+    # Correct rounding without changing the profile ordering.
+    current=sum(x['count'] for x in items)
+    while current>total and items:
+        candidate=max((x for x in items if x['count']>1),key=lambda x:x['count'],default=None)
+        if not candidate:break
+        candidate['count']-=1;current-=1
+    while current<total and items:
+        items[current%len(items)]['count']+=1;current+=1
+    return profile,items
+
+
+def _placement_existing_questions(s,skills,skill,institution):
+    stmt=select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
+    scope=bank_question_institution_scope(institution)
+    if scope is not None:stmt=stmt.where(scope)
+    rows=list(s.scalars(stmt).all());return [q for q in rows if infer_placement_skill(skills,q.subject,q.topic,q.tags,q.question) and infer_placement_skill(skills,q.subject,q.topic,q.tags,q.question).id==skill.id]
+
+
+def _create_placement_generated_questions(s,institution,company_name,skill,count,difficulty,created_by,avoid_questions=None):
+    provider=ai_status()['provider'];created=[];errors=[];calls=0;requested=max(0,min(100,int(count or 0)));avoid=list(avoid_questions or [])
+    while len(created)<requested and calls<8:
+        calls+=1;batch=min(20,requested-len(created))
+        result=generate_placement_questions(institution=(institution.name if institution else ''),company_name=company_name,skill_name=skill.name,skill_description=skill.description,count=batch,difficulty=difficulty,avoid_questions=avoid+[x.question for x in created])
+        added=0
+        for item in result.get('questions') or []:
+            payload,error=_generated_question_payload(item)
+            if error:errors.append(error);continue
+            duplicate=s.scalar(select(BankQuestion).where(func.lower(BankQuestion.question)==payload['question'].lower()))
+            if duplicate:continue
+            bq=BankQuestion(subject='Placement Readiness',course_semester='',unit=company_name[:120],topic=skill.name,question_type=payload['question_type'],question=payload['question'],option_a=payload['option_a'],option_b=payload['option_b'],option_c=payload['option_c'],option_d=payload['option_d'],correct_answer=payload['correct_answer'],answer_key=payload['answer_key'],answer_tolerance=payload['answer_tolerance'],answer_case_sensitive=payload['answer_case_sensitive'],marks=payload['marks'],difficulty=payload['difficulty'],bloom_level=payload['bloom_level'],co_mapping='',po_mapping='',pso_mapping='',tags=f'placement,{skill.name},{company_name}',practice_visibility='both',practical_experiment_no='',explanation=payload['explanation'],status='draft',version=1,created_by=created_by,created_at=now_iso(),updated_at=now_iso(),institution_id=(institution.id if institution else None),curriculum_subject_id=None,source=f'ai_{provider}_placement',ai_review_status='pending')
+            s.add(bq);s.flush();created.append(bq);added+=1
+            if len(created)>=requested:break
+        if added==0:errors.append('AI did not return additional unique placement questions in the last batch.');break
+    return created,errors
+
 def current_staff_name(s=None):
     """Return the human name for the currently signed-in staff account.
 
@@ -2515,6 +2814,7 @@ def init_db():
     s=DB()
     try:
         seed_subject_catalog(s)
+        seed_placement_skills(s)
         if APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP:
             ensure_super_admin_identity(s)
             get_institution(s,create=True)
@@ -7223,6 +7523,160 @@ def analytics():
     overall,exam_rows,group_rows,unit_rows,co_rows,po_rows,pso_rows=institutional_analytics_data(s);return render_template('analytics.html',rows=rows,overall=overall,exam_rows=exam_rows,group_rows=group_rows,unit_rows=unit_rows,co_rows=co_rows,po_rows=po_rows,pso_rows=pso_rows)
 
 
+@app.route('/admin/placements')
+@staff_required
+def placement_command_center():
+    s=DB();institution=current_curriculum_institution(s);skills=placement_skills_for_institution(s,institution)
+    groups=list(s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.department,AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all())
+    try:group_id=int(request.args.get('group_id') or (groups[0].id if groups else 0))
+    except (TypeError,ValueError):group_id=groups[0].id if groups else 0
+    group=s.get(AcademicGroup,group_id) if group_id else None
+    if group and not group.is_active:group=None;group_id=0
+    snapshot=placement_group_snapshot(s,group_id,institution) if group_id else {'students':[],'skills':[],'average':0,'at_risk':0,'measured_students':0,'gaps':[]}
+    coverage=curriculum_placement_gap(s,institution,skills)
+    recent_maps=list(s.scalars(select(PlacementExamMap).order_by(PlacementExamMap.id.desc()).limit(8)).all())
+    recent=[]
+    for row in recent_maps:
+        exam=s.get(Exam,row.exam_id)
+        if not exam:continue
+        recent.append({'map':row,'exam':exam,'sections':safe_json_load(row.sections_json,[])})
+    profiles=[{'key':key,'label':value['label']} for key,value in PLACEMENT_PROFILES.items()]
+    return render_template('placement_dashboard.html',academic_institution=institution,groups=groups,selected_group=group,snapshot=snapshot,coverage=coverage,skills=skills,profiles=profiles,recent=recent,ai=ai_status())
+
+
+@app.route('/admin/placements/mock',methods=['POST'])
+@staff_required
+def create_placement_mock():
+    s=DB();institution=current_curriculum_institution(s);skills=placement_skills_for_institution(s,institution)
+    company=(request.form.get('company_name') or 'Campus Placement').strip()[:120]
+    profile_key=(request.form.get('profile_key') or 'balanced').strip()
+    if profile_key not in PLACEMENT_PROFILES:profile_key='balanced'
+    try:total=max(10,min(100,int(request.form.get('question_count') or 50)))
+    except ValueError:total=50
+    try:duration=max(10,min(240,int(request.form.get('duration_minutes') or 60)))
+    except ValueError:duration=60
+    difficulty=canonical_difficulty(request.form.get('difficulty') or 'Medium')
+    try:group_id=int(request.form.get('group_id') or 0)
+    except ValueError:group_id=0
+    group=s.get(AcademicGroup,group_id) if group_id else None
+    if group_id and not group:
+        flash('Choose a valid batch / section.','error');return redirect(url_for('placement_command_center'))
+    profile,sections=_placement_profile_sections(profile_key,total,skills)
+    title=(request.form.get('exam_title') or '').strip() or f'{company} Placement Mock'
+    exam=Exam(title=title[:250],duration_minutes=duration,is_active=False,created_at=now_iso());s.add(exam);s.flush()
+    cfg=get_exam_config(s,exam.id,create=True);get_exam_approval(s,exam.id,create=True)
+    cfg.subject='Placement Readiness';cfg.course_semester='';cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.question_count=0;cfg.pool_size=0;cfg.institution_id=(institution.id if institution else None)
+    selected_bank_ids=set();generated=[];errors=[];section_summary=[]
+    for section in sections:
+        skill=section['skill'];need=section['count'];existing=_placement_existing_questions(s,skills,skill,institution)
+        existing=[q for q in existing if q.id not in selected_bank_ids];random.shuffle(existing);existing=existing[:need]
+        used=0
+        for bq in existing:
+            if copy_bank_question_to_exam(s,bq,exam.id):selected_bank_ids.add(bq.id);used+=1
+        missing=max(0,need-used);made=[]
+        if missing:
+            if ai_status()['configured']:
+                try:
+                    with s.begin_nested():made,batch_errors=_create_placement_generated_questions(s,institution,company,skill,missing,difficulty,actor_label(s),[q.question for q in existing])
+                except AIProviderError as exc:made=[];batch_errors=[str(exc)]
+                except Exception as exc:
+                    app.logger.exception('Placement mock AI generation failed');made=[];batch_errors=[f'AI generation failed safely: {type(exc).__name__}: {str(exc)[:300]}']
+                errors.extend(batch_errors);generated.extend(made)
+                for bq in made[:missing]:
+                    if copy_bank_question_to_exam(s,bq,exam.id):selected_bank_ids.add(bq.id)
+            else:errors.append(f'{skill.name}: AI provider is not configured.')
+        section_summary.append({'skill':skill.name,'requested':need,'existing':used,'generated':len(made)})
+    pool_count=sync_manual_exam_question_count(s,exam.id);cfg.question_count=min(total,pool_count);cfg.pool_size=pool_count;cfg.ai_review_pending=bool(generated);cfg.last_generation_summary=f'Placement mock {company}: profile={profile_key}, requested={total}, pool={pool_count}, AI drafts={len(generated)}';cfg.updated_at=now_iso()
+    if group:
+        s.add(ExamSession(exam_id=exam.id,group_id=group.id,scheduled_start='',scheduled_end='',venue='Placement / Training',created_at=now_iso()))
+    s.add(PlacementExamMap(exam_id=exam.id,institution_id=(institution.id if institution else None),company_name=company,profile_key=profile_key,sections_json=json.dumps(section_summary,ensure_ascii=False),group_id=(group.id if group else None),created_by=actor_label(s),created_at=now_iso()))
+    audit_event(s,'placement_mock_created','exam',exam.id,cfg.last_generation_summary);s.commit()
+    if generated:flash(f'Created “{title}” with {pool_count}/{total} questions. {len(generated)} AI-generated questions are Draft and must be reviewed before activation.')
+    elif pool_count>=total:flash(f'Created “{title}” with {pool_count} approved existing questions.')
+    else:flash(f'Created “{title}” with {pool_count}/{total} questions. '+('; '.join(errors[:4]) if errors else 'More placement questions are needed.'),'error')
+    return redirect(url_for('exam_builder',exam_id=exam.id))
+
+
+@app.route('/admin/placements/evidence/import',methods=['POST'])
+@staff_required
+def import_placement_evidence():
+    s=DB();institution=current_curriculum_institution(s);skills=placement_skills_for_institution(s,institution);skill_map={x.name.casefold():x for x in skills}
+    upload=request.files.get('file')
+    if not upload or not upload.filename:flash('Choose a CSV evidence file.','error');return redirect(url_for('placement_command_center'))
+    try:raw=upload.read().decode('utf-8-sig');rows=list(csv.DictReader(io.StringIO(raw)))
+    except Exception:flash('Could not read that CSV file.','error');return redirect(url_for('placement_command_center'))
+    added=skipped=0
+    for row in rows:
+        roll=(row.get('roll_no') or row.get('roll') or '').strip();skill_name=(row.get('skill') or '').strip();student=s.scalar(select(Student).where(Student.roll_no==roll)) if roll else None;skill=skill_map.get(skill_name.casefold())
+        if not student or not skill:skipped+=1;continue
+        try:score=float(row.get('score') or 0);max_score=float(row.get('max_score') or 100)
+        except ValueError:skipped+=1;continue
+        if max_score<=0:skipped+=1;continue
+        s.add(PlacementExternalEvidence(student_id=student.id,skill_id=skill.id,provider=(row.get('provider') or 'External').strip()[:120],evidence_label=(row.get('evidence_label') or row.get('label') or '').strip()[:250],score=score,max_score=max_score,recorded_at=(row.get('recorded_at') or now_iso()).strip()[:40],created_by=actor_label(s)));added+=1
+    audit_event(s,'placement_evidence_imported','placement','',f'added={added}, skipped={skipped}');s.commit();flash(f'Imported {added} placement evidence row(s).'+(f' Skipped {skipped} invalid/unmatched row(s).' if skipped else ''))
+    return redirect(url_for('placement_command_center'))
+
+
+@app.route('/admin/placements/assign-remedial',methods=['POST'])
+@staff_required
+def assign_placement_remedial():
+    s=DB();institution=current_curriculum_institution(s)
+    try:group_id=int(request.form.get('group_id') or 0);threshold=max(40,min(90,int(request.form.get('threshold') or 65)));count=max(5,min(30,int(request.form.get('question_count') or 10)))
+    except ValueError:flash('Invalid improvement-plan settings.','error');return redirect(url_for('placement_command_center'))
+    group=s.get(AcademicGroup,group_id)
+    if not group:flash('Choose a valid batch / section.','error');return redirect(url_for('placement_command_center'))
+    memberships=list(s.scalars(select(StudentGroup).where(StudentGroup.group_id==group.id)).all());created=0
+    for membership in memberships:
+        profile=placement_student_profile(s,membership.student_id,institution);weak=[x for x in profile['rows'] if x['score'] is not None and x['score']<threshold]
+        weak=sorted(weak,key=lambda x:x['score'])[:2]
+        for row in weak:
+            exists=s.scalar(select(PlacementRemedialPlan).where(PlacementRemedialPlan.student_id==membership.student_id,PlacementRemedialPlan.skill_id==row['skill'].id,PlacementRemedialPlan.status.in_(['assigned','in_progress','needs_retry'])))
+            if exists:continue
+            s.add(PlacementRemedialPlan(student_id=membership.student_id,skill_id=row['skill'].id,assigned_count=count,target_percentage=max(threshold,row['skill'].target_percentage),status='assigned',last_score=None,last_attempt_id=None,created_by=actor_label(s),created_at=now_iso(),completed_at=''));created+=1
+    audit_event(s,'placement_improvement_plans_assigned','group',group.id,f'created={created}, threshold={threshold}');s.commit();flash(f'Assigned {created} targeted improvement plan(s) for {group_label(group)}.')
+    return redirect(url_for('placement_command_center',group_id=group.id))
+
+
+@app.route('/admin/placement/student/<int:student_id>')
+@staff_required
+def admin_student_skill_passport(student_id):
+    s=DB();student=s.get(Student,student_id)
+    if not student:abort(404)
+    institution=current_curriculum_institution(s);profile=placement_student_profile(s,student.id,institution);skills={x.id:x for x in placement_skills_for_institution(s,institution)}
+    evidence=list(s.scalars(select(PlacementExternalEvidence).where(PlacementExternalEvidence.student_id==student.id).order_by(PlacementExternalEvidence.id.desc()).limit(30)).all())
+    plans=list(s.scalars(select(PlacementRemedialPlan).where(PlacementRemedialPlan.student_id==student.id).order_by(PlacementRemedialPlan.id.desc())).all())
+    return render_template('skill_passport.html',student=student,profile=profile,evidence=evidence,plans=plans,skill_map=skills,admin_view=True)
+
+
+@app.route('/student/skill-passport')
+@student_required
+def student_skill_passport():
+    s=DB();student=s.get(Student,web_session['user_id']);institution=None
+    membership=s.scalar(select(StudentGroup).where(StudentGroup.student_id==student.id)) if student else None
+    # Student skill evidence is global/institution-neutral unless a future tenant
+    # mapping explicitly pins the student to one AcademicInstitution.
+    profile=placement_student_profile(s,student.id,institution);skills={x.id:x for x in placement_skills_for_institution(s,institution)}
+    evidence=list(s.scalars(select(PlacementExternalEvidence).where(PlacementExternalEvidence.student_id==student.id).order_by(PlacementExternalEvidence.id.desc()).limit(30)).all())
+    plans=list(s.scalars(select(PlacementRemedialPlan).where(PlacementRemedialPlan.student_id==student.id).order_by(PlacementRemedialPlan.id.desc())).all())
+    return render_template('skill_passport.html',student=student,profile=profile,evidence=evidence,plans=plans,skill_map=skills,admin_view=False,membership=membership)
+
+
+@app.route('/student/placement-plan/<int:plan_id>/start',methods=['POST'])
+@student_required
+def start_placement_plan(plan_id):
+    s=DB();plan=s.get(PlacementRemedialPlan,plan_id)
+    if not plan or plan.student_id!=web_session['user_id']:abort(404)
+    skill=s.get(PlacementSkill,plan.skill_id)
+    if not skill:abort(404)
+    skills=placement_skills_for_institution(s,None)
+    rows=list(s.scalars(select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['practice_only','both']))).all())
+    eligible=[q for q in rows if (infer_placement_skill(skills,q.subject,q.topic,q.tags,q.question) and infer_placement_skill(skills,q.subject,q.topic,q.tags,q.question).name==skill.name) and canonical_question_type(q.question_type)!='essay']
+    if not eligible:
+        flash(f'No approved {skill.name} questions are published for practice yet. Ask your faculty to approve/publish placement questions.','error');return redirect(url_for('student_skill_passport'))
+    random.shuffle(eligible);selected=eligible[:min(plan.assigned_count,len(eligible))];attempt=_create_practice_attempt(s,plan.student_id,_practice_bank_refs(selected),'mock',f'Placement Plan · {skill.name}','','',None,max(10,len(selected)))
+    plan.status='in_progress';plan.last_attempt_id=attempt.id;s.commit();return redirect(url_for('practice_attempt',attempt_id=attempt.id))
+
+
 @app.route('/admin/institution',methods=['GET','POST'])
 @admin_required
 def institution_settings():
@@ -7718,7 +8172,13 @@ def submit_practice_attempt(attempt_id):
         bank_id=view['bank_id']
         if bank_id and not is_manual and not correct:incorrect.append(int(bank_id))
         answers.append({'ref_key':view['ref_key'],'source':view['source'],'source_id':view['source_id'],'bank_id':bank_id,'question':view['question'],'question_type':qtype,'question_type_label':view['question_type_label'],'student_answer':_practice_answer_display(view,value),'correct_answer':_practice_correct_display(view),'raw_answer':value,'is_correct':bool(correct),'is_manual':bool(is_manual),'marks':marks,'earned':earned,'subject':view['subject'],'unit':view['unit'],'topic':view['topic'],'difficulty':view['difficulty'],'co_mapping':view['co_mapping'],'explanation':view['explanation'],'options':view['display_options']})
-    attempt.score=score;attempt.total_marks=total;attempt.answers_json=json.dumps(answers,ensure_ascii=False,separators=(',',':'));attempt.incorrect_bank_ids_json=json.dumps(sorted(set(incorrect)),separators=(',',':'));attempt.status='submitted';attempt.submitted_at=now_iso();s.commit()
+    attempt.score=score;attempt.total_marks=total;attempt.answers_json=json.dumps(answers,ensure_ascii=False,separators=(',',':'));attempt.incorrect_bank_ids_json=json.dumps(sorted(set(incorrect)),separators=(',',':'));attempt.status='submitted';attempt.submitted_at=now_iso()
+    placement_plan=s.scalar(select(PlacementRemedialPlan).where(PlacementRemedialPlan.last_attempt_id==attempt.id,PlacementRemedialPlan.student_id==attempt.student_id))
+    if placement_plan:
+        pct=round(100*score/total) if total else 0;placement_plan.last_score=pct
+        if pct>=placement_plan.target_percentage:placement_plan.status='completed';placement_plan.completed_at=now_iso()
+        else:placement_plan.status='needs_retry';placement_plan.completed_at=''
+    s.commit()
     if late_submission:flash('The timed practice window had already expired, so late answer changes were not accepted.','error')
     return redirect(url_for('practice_result',attempt_id=attempt.id))
 

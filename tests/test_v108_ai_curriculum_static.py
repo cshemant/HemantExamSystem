@@ -17,7 +17,7 @@ class V108StaticTests(unittest.TestCase):
             self.assertIn(f'class {model}',text)
         for route in ['/admin/academic-setup','/admin/exams/ai-from-curriculum','generate-questions']:
             self.assertIn(route,text)
-        self.assertIn("APP_VERSION='2.35.1'",text)
+        self.assertIn("APP_VERSION='2.38.0'",text)
 
     def test_ai_review_blocks_activation(self):
         text=(ROOT/'app.py').read_text(encoding='utf-8')
@@ -29,8 +29,8 @@ class V108StaticTests(unittest.TestCase):
         exams=(ROOT/'templates'/'exams.html').read_text(encoding='utf-8')
         setup=(ROOT/'templates'/'academic_setup.html').read_text(encoding='utf-8')
         voice=(ROOT/'static'/'voice_assistant.js').read_text(encoding='utf-8')
-        self.assertIn('AI-Assisted Exam from Syllabus',exams)
-        self.assertIn('ai-curriculum-question-type',exams)
+        self.assertIn('Question count (AI auto-fill)',exams)
+        self.assertIn('auto_fill_ai',exams)
         self.assertIn('Upload / replace syllabus',setup)
         self.assertIn('Confirm Syllabus',setup)
         self.assertIn('EXAM_VOICE_CURRICULUM_CATALOG',voice)

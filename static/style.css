@@ -604,3 +604,24 @@ body.secure-exam-running .secure-exam-shell{visibility:visible!important}
 @media(max-width:980px){.attendance-form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.attendance-detail-grid{grid-template-columns:1fr}}
 @media(max-width:650px){.attendance-form-grid{grid-template-columns:1fr}.attendance-student-card,.student-attendance-item,.attendance-state-row{align-items:flex-start;flex-direction:column}.attendance-student-card .actions,.student-attendance-item>div:last-child{width:100%}.attendance-student-card .btn,.student-attendance-item .btn{width:100%}.attendance-room-code-entry{grid-template-columns:1fr}.attendance-room-code-entry button{width:100%}}
 .attendance-verification-cell{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:190px}.attendance-verification-cell form{margin:0}.attendance-verification-cell .btn{width:auto}
+
+/* V116 placement readiness */
+.placement-head{display:flex;justify-content:space-between;align-items:flex-start;gap:18px}
+.placement-head p{margin:.35rem 0 0;color:var(--muted,#64748b)}
+.placement-filter-form{display:flex;gap:18px;align-items:end;justify-content:space-between;flex-wrap:wrap}
+.placement-filter-form>div:first-child{min-width:min(520px,100%);flex:1}
+.placement-context{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding-bottom:4px}
+.placement-stat-grid{grid-template-columns:repeat(4,minmax(0,1fr));margin:18px 0}
+.placement-two-col{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(320px,.8fr);gap:18px;margin:18px 0}
+.placement-skill-list,.placement-passport-grid,.placement-plan-list{display:grid;gap:12px}
+.placement-skill-row{display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1.5fr) 64px;gap:14px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border,#e2e8f0)}
+.placement-skill-row>div:first-child{display:grid;gap:3px}.placement-skill-row span{font-size:.86rem;color:var(--muted,#64748b)}
+.placement-progress{height:10px;border-radius:999px;background:#edf2f7;overflow:hidden}.placement-progress span{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#0ea5e9);border-radius:inherit}.placement-progress.large{height:12px}
+.placement-gap-list{display:grid;gap:10px;margin:10px 0 18px}.placement-gap-list>div{display:flex;justify-content:space-between;gap:12px;padding:12px;border:1px solid var(--border,#e2e8f0);border-radius:12px}
+.placement-remedial-form{margin-top:18px}.placement-mock-card{margin-top:18px}.placement-mock-form .grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.code-note{margin-top:12px;padding:10px 12px;border-radius:10px;background:#f8fafc;color:#475569;font-size:.9rem}
+.placement-passport-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.placement-passport-skill{border:1px solid var(--border,#e2e8f0);border-radius:14px;padding:16px}.placement-passport-top,.placement-passport-meta{display:flex;justify-content:space-between;gap:12px;align-items:center}.placement-passport-top{margin-bottom:12px}.placement-passport-meta{margin-top:9px}.placement-passport-meta span{font-size:.84rem;color:var(--muted,#64748b);text-align:right}
+.placement-plan-row{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:12px 0;border-bottom:1px solid var(--border,#e2e8f0)}.placement-plan-row>div:first-child{display:grid;gap:3px}.placement-plan-row>div:last-child{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.placement-plan-row span:not(.badge){font-size:.86rem;color:var(--muted,#64748b)}
+.passport-note p{margin:.35rem 0 0;color:var(--muted,#64748b)}
+@media(max-width:900px){.placement-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.placement-two-col,.placement-passport-grid{grid-template-columns:1fr}.placement-mock-form .grid{grid-template-columns:1fr 1fr}.placement-skill-row{grid-template-columns:1fr 100px}.placement-skill-row .placement-progress{grid-column:1/-1;grid-row:2}.placement-skill-row>strong{text-align:right}}
+@media(max-width:620px){.placement-stat-grid,.placement-mock-form .grid{grid-template-columns:1fr}.placement-filter-form>div:first-child{min-width:100%}.placement-plan-row{align-items:flex-start;flex-direction:column}.placement-plan-row>div:last-child{justify-content:flex-start}.placement-passport-meta{align-items:flex-start;flex-direction:column}.placement-passport-meta span{text-align:left}}

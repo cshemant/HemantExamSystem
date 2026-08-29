@@ -254,7 +254,7 @@
           <div class="voice-help" id="voice-help-box" hidden>
             <strong>No command memorization needed</strong>
             <ul>
-              <li>“Create Cyber Security exam with 60 questions for 60 minutes.”</li><li>“Make a cloud computing test for half an hour.”</li>
+              <li>“Create Cyber Security exam with 60 questions for 60 minutes.”</li><li>“Make a cloud computing test for half an hour.”</li><li>“Create TCS placement mock with 50 questions for 60 minutes.”</li>
               <li>“Cloud Computing ka Unit 2 exam bana do 30 minute ka.”</li>
               <li>“Give every student 10 questions and turn fullscreen on.”</li>
               <li>“Kal 10 se 11 Section K ke liye Lab 204 me schedule karo.”</li>
@@ -356,7 +356,7 @@
     const routeDefs=[
       ['dashboard','Dashboard',['dashboard','home','main page']],['students','Students',['students','student list','learners']],['groups','Batches & Sections',['batches','batch','sections','groups']],
       ['practicals','Practical Marks',['practical marks','practicals','lab marks']],['theory','Theory Class',['theory class','theory classes']],['attendance','Attendance',['attendance','attendance system','mark attendance','class attendance','hajri']],['question_bank','Question Bank',['question bank','questionbank','bank questions']],
-      ['exams','Exams',['exams','exam list','tests']],['results','Results',['results','result','scores','marks']],['analytics','Analytics',['analytics','analysis']],['exam_centre','Exam Centre',['exam centre','exam center']],
+      ['exams','Exams',['exams','exam list','tests']],['results','Results',['results','result','scores','marks']],['analytics','Analytics',['analytics','analysis']],['placements','Placement Readiness',['placement','placement readiness','placement dashboard','skill passport','company drive']],['exam_centre','Exam Centre',['exam centre','exam center']],
       ['security','Security',['security','mfa']],['staff','Staff',['staff','faculty list','teachers']],['system','System',['system tools','system settings']]
     ];
     if(!wantsView(n)&&!/\b(go|take)\s+me\b/.test(n))return false;
@@ -561,6 +561,27 @@
     resolveSubject(subjectSelect,n,finish);return true;
   }
 
+  function placementMockCommand(text){
+    const n=normalizeLoose(replaceNumberWords(text));
+    if(!isCreateVerb(n)||!hasExamNoun(n)||!/(placement|campus drive|company drive|job drive)/.test(n))return false;
+    if(!isRoute('placements'))return queueForRoute(text,'placements');
+    const form=document.getElementById('placement-mock-form');if(!form){respond('The placement mock form is not available on this page.','error');return true;}
+    const count=extractQuestionCount(n)||50;const duration=extractDuration(n)||60;
+    const companyInput=form.querySelector('[name="company_name"]'),profile=form.querySelector('[name="profile_key"]'),group=form.querySelector('[name="group_id"]'),countInput=form.querySelector('[name="question_count"]'),durationInput=form.querySelector('[name="duration_minutes"]'),difficulty=form.querySelector('[name="difficulty"]');
+    let company='Campus Placement';
+    const before=n.match(/(?:prepare|create|make|generate)\s+(.+?)\s+(?:placement|campus|company)\s+(?:mock|test|exam|assessment|drive)/);
+    const after=n.match(/(?:placement|campus|company)\s+(?:mock|test|exam|assessment|drive)\s+(?:for\s+)?(.+?)(?=\s+\d+\s*(?:questions?|minutes?|mins?)|\s+section\b|$)/);
+    const rawCompany=(before&&before[1])||(after&&after[1])||'';
+    const cleaned=rawCompany.replace(/\b(the|a|an|for|my|our)\b/g,' ').replace(/\s+/g,' ').trim();if(cleaned&&cleaned.length<80)company=cleaned.replace(/\b\w/g,c=>c.toUpperCase());
+    if(companyInput)companyInput.value=company;if(countInput)countInput.value=String(Math.max(10,Math.min(100,count)));if(durationInput)durationInput.value=String(Math.max(10,Math.min(240,duration)));
+    if(profile){profile.value=/\b(product|dsa|algorithm)\b/.test(n)?'product':(/\b(cloud|data)\b/.test(n)?'cloud_data':(/\b(service|services|it services)\b/.test(n)?'services':'balanced'));}
+    if(difficulty)difficulty.value=/\bhard\b/.test(n)?'Hard':(/\beasy\b/.test(n)?'Easy':'Medium');
+    const section=n.match(/\bsection\s+([a-z0-9-]+)/);if(section&&group){const needle=`section ${section[1]}`;const option=[...group.options].find(o=>normalizeLoose(o.textContent).includes(needle));if(option)group.value=option.value;}
+    const groupLabel=group&&group.selectedIndex>=0?safeText(group.options[group.selectedIndex].textContent):'No batch assignment';const profileLabel=profile&&profile.selectedIndex>=0?safeText(profile.options[profile.selectedIndex].textContent):'Balanced Campus Mock';
+    const summary=`<div class="voice-summary-grid"><span>Action</span><strong>Create placement mock</strong><span>Employer / Drive</span><strong>${htmlEscape(company)}</strong><span>Profile</span><strong>${htmlEscape(profileLabel)}</strong><span>Batch</span><strong>${htmlEscape(groupLabel)}</strong><span>Questions</span><strong>${Math.max(10,Math.min(100,count))}</strong><span>Duration</span><strong>${Math.max(10,Math.min(240,duration))} minutes</strong><span>Difficulty</span><strong>${difficulty?difficulty.value:'Medium'}</strong></div><div class="voice-smart-note">Approved questions are reused first. AI creates only the shortage as review-pending drafts. This is a skills simulation, not an official employer paper.</div>`;
+    confirm('Create this placement mock?',summary,()=>{setStatus('Creating placement mock and preparing the question pool…');form.requestSubmit();},'Confirm & Create');return true;
+  }
+
   function getBlueprintForm(){const input=document.querySelector('input[name="question_count"]');return input?input.closest('form'):null;}
   function checkboxChange(form,name,value,label,changes){const el=form&&form.querySelector(`[name="${name}"]`);if(!el)return false;el.checked=value;changes.push(`${label}: ${value?'On':'Off'}`);return true;}
 
@@ -738,7 +759,7 @@
   function handleCommand(rawText,fromPending=false){
     const text=safeText(rawText);if(!text)return;const normalized=normalizeLoose(replaceNumberWords(text));if(!fromPending){setTranscript(text);inputEl.value=text;}confirmBox.hidden=true;confirmAction=null;clearSuggestions();setStatus('Understanding what you mean…');
     if(protectedCommand(normalized)){respond('For safety, voice cannot execute deletion, password, role, reset, restore, or backup operations. Use the normal admin screen for those actions.','error');return;}
-    if(syllabusSummaryCommand(text))return;if(createExamCommand(text))return;if(openBlueprintCommand(text))return;if(examStateCommand(text))return;if(activeExamCommand(text))return;if(studentFindCommand(text))return;if(scheduleCommand(text))return;if(blueprintCommand(text))return;if(navigationIntent(text))return;
+    if(syllabusSummaryCommand(text))return;if(placementMockCommand(text))return;if(createExamCommand(text))return;if(openBlueprintCommand(text))return;if(examStateCommand(text))return;if(activeExamCommand(text))return;if(studentFindCommand(text))return;if(scheduleCommand(text))return;if(blueprintCommand(text))return;if(navigationIntent(text))return;
     if(/\b(help|commands?|examples?)\b|what can you do|kya kar sakte/.test(normalized)){openPanel();helpBox.hidden=false;setStatus('You can speak naturally; these are examples, not fixed commands.');return;}
     respond('I understood the words, but I am not confident enough to change anything. Try rephrasing naturally or include the subject/exam you mean.','warning');
   }

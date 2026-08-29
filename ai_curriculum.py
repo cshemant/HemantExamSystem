@@ -478,3 +478,41 @@ Questions already available/generated and therefore forbidden as duplicates:
         raise AIProviderError("AI response did not contain a question list.")
     result["questions"] = questions[:count]
     return result
+
+
+def generate_placement_questions(*, institution: str, company_name: str, skill_name: str, skill_description: str, count: int, difficulty: str, avoid_questions: list[str] | None = None) -> dict[str, Any]:
+    """Generate original placement-practice questions for one skill area.
+
+    Company names are context labels only. The model is explicitly told not to
+    reproduce leaked/proprietary questions or claim an official company pattern.
+    This keeps the simulator useful across institutions and employers.
+    """
+    count = max(1, min(25, int(count)))
+    avoid = "\n".join(f"- {q}" for q in (avoid_questions or [])[-100:])
+    prompt = f"""
+Generate exactly {count} ORIGINAL placement-readiness assessment questions as JSON.
+Institution: {institution or 'Not specified'}
+Employer / mock label: {company_name or 'General campus placement'}
+Skill area: {skill_name}
+Skill scope: {skill_description}
+Difficulty: {difficulty}
+Allowed question type: single_choice
+
+Important:
+- This is a skills simulator, not an official employer paper.
+- Do not reproduce, quote, or claim to know proprietary/leaked company questions.
+- Test transferable concepts and reasoning that are appropriate for campus placements.
+- Keep each question clearly attributable to the requested skill area.
+- Set the JSON topic field to "{skill_name}".
+
+Questions already available/generated and forbidden as duplicates:
+{avoid or '- none supplied'}
+
+{_question_rules()}
+""".strip()
+    result = structured_generate(prompt, "placement_question_batch", QUESTION_SCHEMA)
+    questions = result.get("questions") if isinstance(result, dict) else None
+    if not isinstance(questions, list):
+        raise AIProviderError("AI response did not contain a placement question list.")
+    result["questions"] = questions[:count]
+    return result

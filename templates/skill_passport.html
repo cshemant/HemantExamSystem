@@ -1,0 +1,32 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head placement-head"><div><h1>Skill Passport</h1><p>{{ student.name }} · {{ student.roll_no }}</p></div>{% if admin_view %}<a class="btn secondary" href="{{ url_for('placement_command_center') }}">Placement Readiness</a>{% endif %}</div>
+
+<div class="grid placement-stat-grid">
+  <div class="stat-card"><strong>{{ profile.readiness }}%</strong><span>Measured Readiness</span></div>
+  <div class="stat-card"><strong>{{ profile.coverage }}%</strong><span>Skill Coverage</span></div>
+  <div class="stat-card"><strong>{{ profile.evidence_count }}</strong><span>Evidence Items</span></div>
+  <div class="stat-card"><strong>{{ profile.measured }}</strong><span>Measured Skills</span></div>
+</div>
+
+<div class="card">
+  <h2>Verified Skill Evidence</h2>
+  <div class="placement-passport-grid">
+    {% for row in profile.rows %}<div class="placement-passport-skill"><div class="placement-passport-top"><strong>{{ row.skill.name }}</strong><span class="badge {% if row.status=='Strong' %}success{% elif row.status=='Improve' %}warning{% else %}gray{% endif %}">{{ row.status }}</span></div><div class="placement-progress large"><span style="width:{{ row.score or 0 }}%"></span></div><div class="placement-passport-meta"><strong>{% if row.score is not none %}{{ row.score }}%{% else %}Not measured{% endif %}</strong><span>{{ row.evidence }} evidence item{{ '' if row.evidence==1 else 's' }}{% if row.sources %} · {{ row.sources }}{% endif %}</span></div></div>{% endfor %}
+  </div>
+</div>
+
+<div class="placement-two-col">
+  <div class="card">
+    <h2>Improvement Plans</h2>
+    <div class="placement-plan-list">
+      {% for plan in plans %}{% set skill=skill_map.get(plan.skill_id) %}<div class="placement-plan-row"><div><strong>{{ skill.name if skill else 'Placement Skill' }}</strong><span>{{ plan.assigned_count }} questions · target {{ plan.target_percentage }}%</span>{% if plan.last_score is not none %}<span>Last score: {{ plan.last_score }}%</span>{% endif %}</div><div><span class="badge {% if plan.status=='completed' %}success{% elif plan.status=='needs_retry' %}warning{% else %}gray{% endif %}">{{ plan.status|replace('_',' ')|title }}</span>{% if not admin_view and plan.status!='completed' %}<form method="post" action="{{ url_for('start_placement_plan',plan_id=plan.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="small">Start Practice</button></form>{% endif %}</div></div>{% else %}<div class="empty-state">No targeted improvement plan has been assigned yet.</div>{% endfor %}
+    </div>
+  </div>
+  <div class="card">
+    <h2>External Evidence</h2>
+    <div class="table-wrap"><table><tr><th>Provider</th><th>Skill</th><th>Score</th></tr>{% for item in evidence %}<tr><td>{{ item.provider }}{% if item.evidence_label %}<div class="mini-meta">{{ item.evidence_label }}</div>{% endif %}</td><td>{{ skill_map.get(item.skill_id).name if skill_map.get(item.skill_id) else 'Skill' }}</td><td>{{ item.score|round(1) }}/{{ item.max_score|round(1) }}</td></tr>{% else %}<tr><td colspan="3">No external evidence imported.</td></tr>{% endfor %}</table></div>
+  </div>
+</div>
+
+<div class="card passport-note"><strong>How to read this passport</strong><p>Scores are evidence summaries from assessments already recorded in this system plus any imported skill evidence. “Not measured” means there is not enough evidence yet; it is not a negative judgement about the student.</p></div>
+{% endblock %}

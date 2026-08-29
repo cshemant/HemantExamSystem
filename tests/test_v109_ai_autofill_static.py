@@ -8,7 +8,7 @@ class V109AIAutofillStaticTests(unittest.TestCase):
         app=(ROOT/'app.py').read_text(encoding='utf-8')
         voice=(ROOT/'static'/'voice_assistant.js').read_text(encoding='utf-8')
         exams=(ROOT/'templates'/'exams.html').read_text(encoding='utf-8')
-        self.assertIn("APP_VERSION='2.35.1'",app)
+        self.assertIn("APP_VERSION='2.38.0'",app)
         self.assertIn('min(100',app)
         self.assertIn('Math.min(100',voice)
         self.assertIn('max="100"',exams)
