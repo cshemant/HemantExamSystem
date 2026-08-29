@@ -6,7 +6,7 @@
     <div class="attendance-state-row"><span class="badge {{ 'success' if state=='active' else 'warning' if state=='upcoming' else 'gray' }}">{{ state|upper }}</span><strong>{{ records|length }} present / {{ members|length }} students</strong></div>
     <div class="readiness-list">
       <div><span>Starts</span><strong>{{ session.starts_at|dt }}</strong></div><div><span>Ends</span><strong>{{ session.ends_at|dt }}</strong></div>
-      <div><span>Network</span><strong>{{ 'Same classroom LAN' if session.network_mode=='lan' else 'Approved CIDR' if session.network_mode=='cidr' else 'No restriction' }}</strong></div>
+      <div><span>Network</span><strong>{{ 'Same Wi-Fi' if session.network_mode=='wifi' else 'Same LAN' if session.network_mode=='lan' else 'Approved CIDR' if session.network_mode=='cidr' else 'No restriction' }}</strong></div>
       <div><span>Biometric</span><strong>{{ session.biometric_mode|title }}</strong></div>
     </div>
     <div class="actions attendance-session-actions">

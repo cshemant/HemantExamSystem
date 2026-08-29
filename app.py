@@ -32,7 +32,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.35.1'
+APP_VERSION='2.36.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -463,7 +463,7 @@ class AttendanceSession(Base):
     venue:Mapped[str]=mapped_column(String,nullable=False,default='')
     starts_at:Mapped[str]=mapped_column(String,nullable=False)
     ends_at:Mapped[str]=mapped_column(String,nullable=False)
-    network_mode:Mapped[str]=mapped_column(String,nullable=False,default='lan')  # lan | cidr | any
+    network_mode:Mapped[str]=mapped_column(String,nullable=False,default='lan')  # wifi | lan | cidr | any
     allowed_cidrs:Mapped[str]=mapped_column(Text,nullable=False,default='')
     biometric_mode:Mapped[str]=mapped_column(String,nullable=False,default='preferred')  # required | preferred | disabled
     access_token:Mapped[str]=mapped_column(String,nullable=False,unique=True)
@@ -2045,14 +2045,44 @@ def _attendance_client_ip():
     return (request.remote_addr or '').strip()[:120]
 
 
+def _attendance_wifi_anchor(ip_text):
+    """Return the small network fingerprint used for Same Wi-Fi sessions.
+
+    Browsers cannot expose an SSID to a website. For the hosted/online app we
+    therefore remember the public network address seen when the faculty member
+    creates the session and keeps only a small network range: /24 for IPv4 or /64
+    for IPv6. This is deliberately tolerant of campus Wi-Fi NAT/load-balancing while
+    the QR token, student login and optional passkey provide the other checks.
+    """
+    try:
+        addr=ipaddress.ip_address((ip_text or '').strip())
+    except ValueError:
+        return ''
+    if addr.is_loopback:
+        return str(ipaddress.ip_network(f'{addr}/{32 if addr.version==4 else 128}',strict=False))
+    prefix=24 if addr.version==4 else 64
+    return str(ipaddress.ip_network(f'{addr}/{prefix}',strict=False))
+
+
 def _attendance_network_check(row):
     mode=(row.network_mode or 'lan').strip().lower();ip_text=_attendance_client_ip()
     if mode=='any':return True,'Network restriction disabled'
     try:client=ipaddress.ip_address(ip_text)
     except ValueError:return False,'Client network address could not be verified.'
     if client.is_loopback:return True,'Local server'
+    if mode=='wifi':
+        anchor=(row.allowed_cidrs or '').strip()
+        if not anchor:
+            return False,'This Wi-Fi attendance session has no network reference. Ask faculty to create a new session.'
+        try:
+            network=ipaddress.ip_network(anchor,strict=False)
+        except ValueError:
+            return False,'This Wi-Fi attendance session has an invalid network reference. Ask faculty to create a new session.'
+        if client in network:
+            return True,'Same Wi-Fi verified'
+        return False,'Connect to the same Wi-Fi used by the faculty member when attendance was started. Turn off mobile data, VPN or Private Relay and try again.'
     if mode=='lan':
-        if APP_MODE!='offline':return False,'LAN-only attendance must be used from the offline campus server.'
+        if APP_MODE!='offline':return False,'This session is set to Same LAN. LAN mode works only with the offline campus server; create a Same Wi-Fi session for the hosted website.'
         server_ip=local_lan_ip()
         try:
             server=ipaddress.ip_address(server_ip)
@@ -3179,11 +3209,15 @@ def attendance_sessions():
     if request.method=='POST':
         group_id=request.form.get('group_id',type=int);group=s.get(AcademicGroup,group_id) if group_id else None
         subject=(request.form.get('subject') or '').strip();title=(request.form.get('title') or '').strip() or (subject+' Attendance' if subject else 'Class Attendance');venue=(request.form.get('venue') or '').strip()[:120]
-        network_mode=(request.form.get('network_mode') or ('lan' if APP_MODE=='offline' else 'cidr')).strip().lower();biometric_mode=(request.form.get('biometric_mode') or 'preferred').strip().lower();allowed_cidrs=(request.form.get('allowed_cidrs') or '').strip()
+        network_mode=(request.form.get('network_mode') or ('lan' if APP_MODE=='offline' else 'wifi')).strip().lower();biometric_mode=(request.form.get('biometric_mode') or 'preferred').strip().lower();allowed_cidrs=(request.form.get('allowed_cidrs') or '').strip()
         if not group:flash('Choose the batch / section for this attendance session.','error');return redirect(url_for('attendance_sessions'))
         if not subject:flash('Subject is required.','error');return redirect(url_for('attendance_sessions'))
-        if network_mode not in {'lan','cidr','any'}:network_mode='lan' if APP_MODE=='offline' else 'cidr'
+        if network_mode not in {'wifi','lan','cidr','any'}:network_mode='lan' if APP_MODE=='offline' else 'wifi'
         if biometric_mode not in {'required','preferred','disabled'}:biometric_mode='preferred'
+        if network_mode=='wifi':
+            allowed_cidrs=_attendance_wifi_anchor(_attendance_client_ip())
+            if not allowed_cidrs:
+                flash('Your current Wi-Fi network could not be identified. Refresh the page and try again, or choose another network mode.','error');return redirect(url_for('attendance_sessions'))
         if network_mode=='cidr' and not allowed_cidrs:flash('Enter at least one approved network CIDR, for example 10.20.0.0/16.','error');return redirect(url_for('attendance_sessions'))
         start_raw=(request.form.get('starts_at') or '').strip();duration=max(1,min(180,request.form.get('duration_minutes',type=int) or 10))
         try:start=parse_dt(start_raw) if start_raw else now_dt()

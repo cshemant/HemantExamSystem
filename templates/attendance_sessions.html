@@ -12,7 +12,7 @@
       <div><label>Venue</label><input name="venue" placeholder="Room / Lab"></div>
       <div><label>Start</label><input type="datetime-local" name="starts_at" value="{{ now_value }}"></div>
       <div><label>Attendance Window</label><select name="duration_minutes"><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="15">15 minutes</option><option value="20">20 minutes</option><option value="30">30 minutes</option></select></div>
-      <div><label>Network Check</label><select name="network_mode" id="attendance-network-mode"><option value="lan" {% if mode=='offline' %}selected{% endif %}>Same classroom LAN / Wi-Fi</option><option value="cidr" {% if mode=='online' %}selected{% endif %}>Approved IP/CIDR network</option><option value="any">No network restriction (testing only)</option></select></div>
+      <div><label>Network Check</label><select name="network_mode" id="attendance-network-mode"><option value="wifi" {% if mode=='online' %}selected{% endif %}>Same Wi-Fi</option><option value="lan" {% if mode=='offline' %}selected{% endif %}>Same LAN (offline server)</option><option value="cidr">Approved IP/CIDR network</option><option value="any">No network restriction (testing only)</option></select></div>
       <div><label>Fingerprint / Passkey</label><select name="biometric_mode"><option value="preferred" selected>Preferred · secure fallback allowed</option><option value="required">Required · HTTPS only</option><option value="disabled">Disabled</option></select></div>
     </div>
     <div id="attendance-cidr-row" class="attendance-cidr-row">
