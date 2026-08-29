@@ -9,9 +9,9 @@
       <div><label>Subject</label><input name="subject" placeholder="Mobile Application Development" required></div>
       <div><label>Batch / Section</label><select name="group_id" required><option value="">Choose batch / section</option>{% for g in groups %}<option value="{{ g.id }}">{{ group_label(g) }}</option>{% endfor %}</select></div>
       <div><label>Session Title</label><input name="title" placeholder="Optional · defaults to Subject Attendance"></div>
-      <div><label>Venue</label><input name="venue" placeholder="Room / Lab"></div>
+      <div><label>Venue / Room</label><input name="venue" placeholder="e.g. Room 408A"></div>
       <div><label>Start</label><input type="datetime-local" name="starts_at" value="{{ now_value }}"></div>
-      <div><label>Attendance Window</label><select name="duration_minutes"><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="15">15 minutes</option><option value="20">20 minutes</option><option value="30">30 minutes</option></select></div>
+      <div><label>Attendance Window</label><select name="duration_minutes"><option value="3">3 minutes</option><option value="5" selected>5 minutes</option><option value="10">10 minutes</option><option value="15">15 minutes</option><option value="20">20 minutes</option><option value="30">30 minutes</option></select></div>
       <div><label>Network Check</label><select name="network_mode" id="attendance-network-mode"><option value="wifi" {% if mode=='online' %}selected{% endif %}>Same Wi-Fi</option><option value="lan" {% if mode=='offline' %}selected{% endif %}>Same LAN (offline server)</option><option value="cidr">Approved IP/CIDR network</option><option value="any">No network restriction (testing only)</option></select></div>
       <div><label>Fingerprint / Passkey</label><select name="biometric_mode"><option value="preferred" selected>Preferred · secure fallback allowed</option><option value="required">Required · HTTPS only</option><option value="disabled">Disabled</option></select></div>
     </div>

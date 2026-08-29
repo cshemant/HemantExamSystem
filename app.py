@@ -32,7 +32,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.36.0'
+APP_VERSION='2.37.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -50,6 +50,14 @@ MAX_ANSWER_LENGTH=max(100,int(os.getenv('MAX_ANSWER_LENGTH','4000')))
 PRACTICAL_SYNC_BATCH_SIZE=max(5,min(50,int(os.getenv('PRACTICAL_SYNC_BATCH_SIZE','20'))))
 INTEGRATION_API_KEY=os.getenv('INTEGRATION_API_KEY','').strip()
 EXAM_PACKAGE_SIGNING_KEY=os.getenv('EXAM_PACKAGE_SIGNING_KEY','').strip()
+
+# Classroom attendance presence proof.  The projected QR rotates frequently,
+# but a student only needs to scan a valid QR once.  A successful scan (or the
+# matching six-digit room code) issues a short-lived, student-bound completion
+# token so fingerprint/passkey verification can finish without racing the QR.
+ATTENDANCE_QR_ROTATION_SECONDS=max(20,min(120,int(os.getenv('ATTENDANCE_QR_ROTATION_SECONDS','45'))))
+ATTENDANCE_QR_OVERLAP_SECONDS=max(0,min(30,int(os.getenv('ATTENDANCE_QR_OVERLAP_SECONDS','15'))))
+ATTENDANCE_COMPLETION_SECONDS=max(60,min(300,int(os.getenv('ATTENDANCE_COMPLETION_SECONDS','120'))))
 
 # All user-facing dates/times use an explicit timezone so cloud hosts such as
 # Render (which commonly run in UTC) and offline Windows builds show the same time.
@@ -2100,6 +2108,98 @@ def _attendance_network_check(row):
     return False,'Unknown attendance network policy.'
 
 
+def _attendance_token_key(row):
+    material=f'{secret}|attendance|{row.id}|{row.access_token}'.encode('utf-8')
+    return hashlib.sha256(material).digest()
+
+
+def _attendance_qr_slot(epoch=None):
+    now_epoch=int(epoch if epoch is not None else time.time())
+    return now_epoch-(now_epoch%ATTENDANCE_QR_ROTATION_SECONDS)
+
+
+def _attendance_qr_signature(row,slot):
+    raw=f'qr|{row.id}|{int(slot)}'.encode('utf-8')
+    return _b64url_encode(hmac.new(_attendance_token_key(row),raw,hashlib.sha256).digest()[:18])
+
+
+def _attendance_qr_token(row,epoch=None):
+    slot=_attendance_qr_slot(epoch)
+    return f'{slot}.{_attendance_qr_signature(row,slot)}'
+
+
+def _attendance_room_code(row,slot=None):
+    slot=_attendance_qr_slot() if slot is None else int(slot)
+    digest=hmac.new(_attendance_token_key(row),f'code|{row.id}|{slot}'.encode('utf-8'),hashlib.sha256).digest()
+    return f'{int.from_bytes(digest[:4],"big")%1000000:06d}'
+
+
+def _attendance_validate_qr_token(row,token,epoch=None):
+    try:
+        slot_text,sig=(token or '').strip().split('.',1);slot=int(slot_text)
+    except Exception:
+        return False,'This classroom QR is invalid. Scan the current QR shown by your faculty member.'
+    now_epoch=int(epoch if epoch is not None else time.time())
+    if slot>now_epoch+5 or now_epoch>slot+ATTENDANCE_QR_ROTATION_SECONDS+ATTENDANCE_QR_OVERLAP_SECONDS:
+        return False,'This classroom QR has expired. Scan the current QR shown in the room.'
+    expected=_attendance_qr_signature(row,slot)
+    if not secrets.compare_digest(sig,expected):
+        return False,'This classroom QR could not be verified.'
+    return True,'Current classroom QR verified'
+
+
+def _attendance_validate_room_code(row,code,epoch=None):
+    clean=re.sub(r'\D+','',(code or ''))
+    if len(clean)!=6:return False
+    now_epoch=int(epoch if epoch is not None else time.time());current=_attendance_qr_slot(now_epoch)
+    for slot in (current,current-ATTENDANCE_QR_ROTATION_SECONDS):
+        if now_epoch<=slot+ATTENDANCE_QR_ROTATION_SECONDS+ATTENDANCE_QR_OVERLAP_SECONDS and secrets.compare_digest(clean,_attendance_room_code(row,slot)):
+            return True
+    return False
+
+
+def _attendance_claim_token(row,student_id,epoch=None):
+    issued=int(epoch if epoch is not None else time.time());expires=issued+ATTENDANCE_COMPLETION_SECONDS
+    raw=f'claim|{row.id}|{int(student_id)}|{issued}|{expires}'.encode('utf-8')
+    sig=_b64url_encode(hmac.new(_attendance_token_key(row),raw,hashlib.sha256).digest()[:18])
+    return f'{int(student_id)}.{issued}.{expires}.{sig}'
+
+
+def _attendance_validate_claim(row,student_id,token,epoch=None):
+    try:
+        sid_text,issued_text,expires_text,sig=(token or '').strip().split('.',3)
+        sid=int(sid_text);issued=int(issued_text);expires=int(expires_text)
+    except Exception:
+        return False,'Scan the current classroom QR or enter the current room code first.'
+    now_epoch=int(epoch if epoch is not None else time.time())
+    if sid!=int(student_id):return False,'This attendance verification belongs to another student.'
+    if issued>now_epoch+5 or expires<now_epoch:return False,'Your attendance verification window expired. Scan the current classroom QR again.'
+    if expires-issued>ATTENDANCE_COMPLETION_SECONDS+5:return False,'Attendance verification token is invalid.'
+    raw=f'claim|{row.id}|{sid}|{issued}|{expires}'.encode('utf-8')
+    expected=_b64url_encode(hmac.new(_attendance_token_key(row),raw,hashlib.sha256).digest()[:18])
+    if not secrets.compare_digest(sig,expected):return False,'Attendance verification token is invalid.'
+    if row.closed_at:return False,'This attendance session has been closed by the faculty member.'
+    return True,'Room presence verified'
+
+
+def _attendance_rotating_url(row,epoch=None):
+    scan=_attendance_qr_token(row,epoch)
+    path=url_for('student_attendance_session',session_id=row.id,scan=scan)
+    if APP_MODE=='online':return request.url_root.rstrip('/')+path
+    return f"http://{local_lan_ip()}:{int(os.getenv('PORT','8080'))}{path}"
+
+
+def _attendance_qr_display(row,epoch=None):
+    now_epoch=int(epoch if epoch is not None else time.time());slot=_attendance_qr_slot(now_epoch)
+    return {
+        'url':_attendance_rotating_url(row,now_epoch),
+        'code':_attendance_room_code(row,slot),
+        'expires_in':max(0,slot+ATTENDANCE_QR_ROTATION_SECONDS-now_epoch),
+        'rotation_seconds':ATTENDANCE_QR_ROTATION_SECONDS,
+        'completion_seconds':ATTENDANCE_COMPLETION_SECONDS,
+    }
+
+
 def attendance_session_access(s,session_id):
     row=s.get(AttendanceSession,session_id)
     if not row:abort(404)
@@ -2132,7 +2232,7 @@ def attendance_state(row):
 
 
 def attendance_student_url(row):
-    path=url_for('student_attendance_session',session_id=row.id,token=row.access_token)
+    path=url_for('student_attendance_session',session_id=row.id)
     if APP_MODE=='online':return request.url_root.rstrip('/')+path
     return f"http://{local_lan_ip()}:{int(os.getenv('PORT','8080'))}{path}"
 
@@ -2209,11 +2309,12 @@ def _verify_student_passkey_assertion(s,student,payload,expected_challenge):
     row.last_used_at=now_iso();return row
 
 
-def _attendance_create_record(s,row,student,method,biometric=False,credential_id=''):
+def _attendance_create_record(s,row,student,method,biometric=False,credential_id='',network_preverified=False):
     existing=s.scalar(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id,AttendanceRecord.student_id==student.id))
     if existing:return existing,False
-    network_ok,_=_attendance_network_check(row)
-    if not network_ok:raise ValueError('Your device is not on the approved attendance network.')
+    if not network_preverified:
+        network_ok,_=_attendance_network_check(row)
+        if not network_ok:raise ValueError('Your device is not on the approved attendance network.')
     rec=AttendanceRecord(session_id=row.id,student_id=student.id,marked_at=now_iso(),verification_method=method,biometric_verified=bool(biometric),network_verified=True,credential_id=credential_id or '',client_ip=_attendance_client_ip(),user_agent_hash=hashlib.sha256((request.headers.get('User-Agent') or '').encode('utf-8')).hexdigest()[:32])
     s.add(rec);audit_event(s,'attendance_marked','attendance_session',row.id,f'student={student.roll_no}, method={method}, biometric={int(bool(biometric))}');s.commit();return rec,True
 
@@ -3251,8 +3352,8 @@ def attendance_device_reset(student_id):
 @app.route('/admin/attendance/<int:session_id>')
 @staff_required
 def attendance_session_detail(session_id):
-    s=DB();row=attendance_session_access(s,session_id);group=s.get(AcademicGroup,row.group_id);members=s.execute(select(Student,StudentGroup).join(StudentGroup,StudentGroup.student_id==Student.id).where(StudentGroup.group_id==row.group_id).order_by(Student.roll_no)).all();records=s.scalars(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id).order_by(AttendanceRecord.marked_at)).all();record_map={r.student_id:r for r in records};url=attendance_student_url(row)
-    return render_template('attendance_session_detail.html',session=row,group=group,members=members,record_map=record_map,records=records,group_label=group_label,student_url=url,qr_uri=qr_data_uri(url),state=attendance_state(row),secure_biometric=bool(APP_MODE=='online'),mode=APP_MODE)
+    s=DB();row=attendance_session_access(s,session_id);group=s.get(AcademicGroup,row.group_id);members=s.execute(select(Student,StudentGroup).join(StudentGroup,StudentGroup.student_id==Student.id).where(StudentGroup.group_id==row.group_id).order_by(Student.roll_no)).all();records=s.scalars(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id).order_by(AttendanceRecord.marked_at)).all();record_map={r.student_id:r for r in records};qr=_attendance_qr_display(row)
+    return render_template('attendance_session_detail.html',session=row,group=group,members=members,record_map=record_map,records=records,group_label=group_label,student_url=attendance_student_url(row),qr_uri=qr_data_uri(qr['url']),room_code=qr['code'],qr_expires_in=qr['expires_in'],qr_rotation_seconds=qr['rotation_seconds'],completion_seconds=qr['completion_seconds'],state=attendance_state(row),secure_biometric=bool(APP_MODE=='online'),mode=APP_MODE)
 
 
 @app.route('/admin/attendance/<int:session_id>/close',methods=['POST'])
@@ -3313,8 +3414,40 @@ def student_attendance():
 def student_attendance_session(session_id):
     s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id)
     if not row or not attendance_student_allowed(s,row,student.id):abort(404)
-    token=(request.args.get('token') or '').strip();token_ok=bool(token and secrets.compare_digest(token,row.access_token));record=s.scalar(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id,AttendanceRecord.student_id==student.id));network_ok,network_message=_attendance_network_check(row);rp_id=_webauthn_rp_id();passkeys=s.scalars(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id).order_by(StudentPasskey.id.desc())).all();secure=_webauthn_secure_context();state=attendance_state(row)
-    return render_template('student_attendance_session.html',student=student,session=row,token=token,token_ok=token_ok,record=record,network_ok=network_ok,network_message=network_message,passkeys=passkeys,secure_biometric=secure,state=state)
+    state=attendance_state(row);record=s.scalar(select(AttendanceRecord).where(AttendanceRecord.session_id==row.id,AttendanceRecord.student_id==student.id));network_ok,network_message=_attendance_network_check(row)
+    scan=(request.args.get('scan') or '').strip();claim=(request.args.get('claim') or '').strip();presence_message=''
+    if not record and scan:
+        scan_ok,scan_message=_attendance_validate_qr_token(row,scan)
+        if state!='active':scan_ok=False;scan_message=f'Attendance cannot be verified because this session is {state}.'
+        if scan_ok and not network_ok:scan_ok=False;scan_message=''
+        if scan_ok:
+            claim=_attendance_claim_token(row,student.id)
+            return redirect(url_for('student_attendance_session',session_id=row.id,claim=claim))
+        presence_message=scan_message
+    token_ok,token_message=_attendance_validate_claim(row,student.id,claim) if claim else (False,'Scan the current classroom QR or enter the current room code first.')
+    if token_ok:
+        # The Wi-Fi/network requirement is checked when the rotating room QR or
+        # code is accepted.  The student's short completion token then remains
+        # valid while fingerprint/passkey verification finishes.
+        network_ok=True;network_message='Verified when the classroom QR / room code was accepted.'
+    elif claim and not presence_message:
+        presence_message=token_message
+    rp_id=_webauthn_rp_id();passkeys=s.scalars(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id).order_by(StudentPasskey.id.desc())).all();secure=_webauthn_secure_context()
+    return render_template('student_attendance_session.html',student=student,session=row,token=claim,token_ok=token_ok,record=record,network_ok=network_ok,network_message=network_message,presence_message=presence_message,passkeys=passkeys,secure_biometric=secure,state=state,completion_seconds=ATTENDANCE_COMPLETION_SECONDS)
+
+
+@app.route('/student/attendance/<int:session_id>/room-code',methods=['POST'])
+@student_required
+def student_attendance_room_code(session_id):
+    s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id)
+    if not row or not attendance_student_allowed(s,row,student.id):abort(404)
+    if attendance_state(row)!='active':flash('This attendance session is not active.','error');return redirect(url_for('student_attendance_session',session_id=row.id))
+    network_ok,message=_attendance_network_check(row)
+    if not network_ok:flash(message,'error');return redirect(url_for('student_attendance_session',session_id=row.id))
+    code=(request.form.get('room_code') or '').strip()
+    if not _attendance_validate_room_code(row,code):flash('Room code is incorrect or expired. Use the current code shown by your faculty member.','error');return redirect(url_for('student_attendance_session',session_id=row.id))
+    claim=_attendance_claim_token(row,student.id);audit_event(s,'attendance_room_code_verified','attendance_session',row.id,f'student={student.roll_no}');s.commit()
+    return redirect(url_for('student_attendance_session',session_id=row.id,claim=claim))
 
 
 @app.route('/student/passkeys/register/options',methods=['POST'])
@@ -3322,13 +3455,12 @@ def student_attendance_session(session_id):
 def student_passkey_register_options():
     if not _webauthn_secure_context():return jsonify(error='Fingerprint/passkey registration requires HTTPS (localhost is allowed for testing).'),400
     s=DB();student=s.get(Student,web_session['user_id']);payload=request.get_json(silent=True) or {};session_id=int(payload.get('session_id') or 0);token=(payload.get('token') or '').strip();attendance_row=s.get(AttendanceSession,session_id) if session_id else None
-    if not attendance_row or not attendance_student_allowed(s,attendance_row,student.id) or not token or not secrets.compare_digest(token,attendance_row.access_token):return jsonify(error='Open the current attendance QR/link before registering a device.'),403
-    if attendance_state(attendance_row)!='active':return jsonify(error='Device registration is available only while the attendance session is active.'),400
-    network_ok,network_message=_attendance_network_check(attendance_row)
-    if not network_ok:return jsonify(error=network_message),403
+    if not attendance_row or not attendance_student_allowed(s,attendance_row,student.id):return jsonify(error='Attendance session was not found.'),404
+    claim_ok,claim_message=_attendance_validate_claim(attendance_row,student.id,token)
+    if not claim_ok:return jsonify(error=claim_message),403
     challenge=_b64url_encode(secrets.token_bytes(32));rp_id=_webauthn_rp_id();existing=s.scalars(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id)).all()
     if existing:return jsonify(error='An attendance device is already registered. Ask faculty to reset it before registering another phone.'),409
-    web_session['_passkey_register_challenge']=challenge;web_session['_passkey_register_rp']=rp_id;web_session['_passkey_register_attendance_session']=attendance_row.id
+    web_session['_passkey_register_challenge']=challenge;web_session['_passkey_register_rp']=rp_id;web_session['_passkey_register_attendance_session']=attendance_row.id;web_session['_passkey_register_attendance_claim']=token
     return jsonify(publicKey={'challenge':challenge,'rp':{'name':get_institution(s).short_name or 'Exam System','id':rp_id},'user':{'id':_b64url_encode(str(student.id).encode()),'name':student.roll_no,'displayName':student.name},'pubKeyCredParams':[{'type':'public-key','alg':-7},{'type':'public-key','alg':-257}],'authenticatorSelection':{'authenticatorAttachment':'platform','residentKey':'preferred','userVerification':'required'},'timeout':60000,'attestation':'none','excludeCredentials':[]})
 
 
@@ -3336,11 +3468,11 @@ def student_passkey_register_options():
 @student_required
 def student_passkey_register_complete():
     try:
-        s=DB();student=s.get(Student,web_session['user_id']);payload=request.get_json(silent=True) or {};attendance_session_id=web_session.get('_passkey_register_attendance_session');attendance_row=s.get(AttendanceSession,int(attendance_session_id or 0)) if attendance_session_id else None
-        if not attendance_row or not attendance_student_allowed(s,attendance_row,student.id) or attendance_state(attendance_row)!='active':raise ValueError('Attendance session expired before device registration completed.')
-        network_ok,_network_message=_attendance_network_check(attendance_row)
-        if not network_ok:raise ValueError('Stay connected to the approved attendance network while registering your device.')
-        row=_register_student_passkey(s,student,payload);web_session.pop('_passkey_register_attendance_session',None);return jsonify(ok=True,message='Fingerprint/passkey registered.',credential_id=row.credential_id)
+        s=DB();student=s.get(Student,web_session['user_id']);payload=request.get_json(silent=True) or {};attendance_session_id=web_session.get('_passkey_register_attendance_session');claim=web_session.get('_passkey_register_attendance_claim') or '';attendance_row=s.get(AttendanceSession,int(attendance_session_id or 0)) if attendance_session_id else None
+        if not attendance_row or not attendance_student_allowed(s,attendance_row,student.id):raise ValueError('Attendance session expired before device registration completed.')
+        claim_ok,claim_message=_attendance_validate_claim(attendance_row,student.id,claim)
+        if not claim_ok:raise ValueError(claim_message)
+        row=_register_student_passkey(s,student,payload);rec,_created=_attendance_create_record(s,attendance_row,student,'passkey_registration',True,row.credential_id,network_preverified=True);web_session.pop('_passkey_register_attendance_session',None);web_session.pop('_passkey_register_attendance_claim',None);return jsonify(ok=True,message='Fingerprint/passkey registered and attendance marked.',credential_id=row.credential_id,marked_at=rec.marked_at)
     except Exception as exc:
         return jsonify(error=str(exc) if isinstance(exc,ValueError) else 'Passkey registration could not be verified.'),400
 
@@ -3358,13 +3490,12 @@ def student_passkey_delete(passkey_id):
 def student_attendance_auth_options(session_id):
     if not _webauthn_secure_context():return jsonify(error='Fingerprint/passkey verification requires HTTPS on this device.'),400
     s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id);payload=request.get_json(silent=True) or {};token=(payload.get('token') or '').strip()
-    if not row or not attendance_student_allowed(s,row,student.id) or not token or not secrets.compare_digest(token,row.access_token):return jsonify(error='Attendance link is invalid or expired.'),403
-    if attendance_state(row)!='active':return jsonify(error='This attendance session is not active.'),400
-    network_ok,message=_attendance_network_check(row)
-    if not network_ok:return jsonify(error=message),403
+    if not row or not attendance_student_allowed(s,row,student.id):return jsonify(error='Attendance session was not found.'),404
+    claim_ok,claim_message=_attendance_validate_claim(row,student.id,token)
+    if not claim_ok:return jsonify(error=claim_message),403
     rp_id=_webauthn_rp_id();keys=s.scalars(select(StudentPasskey).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id)).all()
     if not keys:return jsonify(error='Register your fingerprint/passkey on this device first.'),400
-    challenge=_b64url_encode(secrets.token_bytes(32));web_session['_attendance_auth_challenge']=challenge;web_session['_attendance_auth_session']=row.id
+    challenge=_b64url_encode(secrets.token_bytes(32));web_session['_attendance_auth_challenge']=challenge;web_session['_attendance_auth_session']=row.id;web_session['_attendance_auth_claim']=token
     return jsonify(publicKey={'challenge':challenge,'rpId':rp_id,'allowCredentials':[{'type':'public-key','id':k.credential_id} for k in keys],'userVerification':'required','timeout':60000})
 
 
@@ -3372,11 +3503,12 @@ def student_attendance_auth_options(session_id):
 @student_required
 def student_attendance_auth_complete(session_id):
     try:
-        s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id);payload=request.get_json(silent=True) or {};token=(payload.get('token') or '').strip();challenge=web_session.pop('_attendance_auth_challenge',None);expected_session=web_session.pop('_attendance_auth_session',None)
+        s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id);payload=request.get_json(silent=True) or {};token=(payload.get('token') or '').strip();challenge=web_session.pop('_attendance_auth_challenge',None);expected_session=web_session.pop('_attendance_auth_session',None);expected_claim=web_session.pop('_attendance_auth_claim',None)
         if not row or not attendance_student_allowed(s,row,student.id) or expected_session!=row.id or not challenge:raise ValueError('Biometric verification expired. Start again.')
-        if not token or not secrets.compare_digest(token,row.access_token):raise ValueError('Attendance link is invalid or expired.')
-        if attendance_state(row)!='active':raise ValueError('This attendance session is not active.')
-        key=_verify_student_passkey_assertion(s,student,payload,challenge);rec,created=_attendance_create_record(s,row,student,'passkey',True,key.credential_id);return jsonify(ok=True,created=created,message='Attendance marked successfully.',marked_at=rec.marked_at)
+        if not expected_claim or not token or not secrets.compare_digest(token,expected_claim):raise ValueError('Attendance verification expired. Scan the current classroom QR again.')
+        claim_ok,claim_message=_attendance_validate_claim(row,student.id,token)
+        if not claim_ok:raise ValueError(claim_message)
+        key=_verify_student_passkey_assertion(s,student,payload,challenge);rec,created=_attendance_create_record(s,row,student,'passkey',True,key.credential_id,network_preverified=True);return jsonify(ok=True,created=created,message='Attendance marked successfully.',marked_at=rec.marked_at)
     except Exception as exc:
         return jsonify(error=str(exc) if isinstance(exc,ValueError) else 'Biometric verification failed.'),400
 
@@ -3386,14 +3518,14 @@ def student_attendance_auth_complete(session_id):
 def student_attendance_mark(session_id):
     s=DB();student=s.get(Student,web_session['user_id']);row=s.get(AttendanceSession,session_id);token=(request.form.get('token') or '').strip()
     if not row or not attendance_student_allowed(s,row,student.id):abort(404)
-    if not token or not secrets.compare_digest(token,row.access_token):flash('Attendance link is invalid or expired.','error');return redirect(url_for('student_attendance'))
-    if attendance_state(row)!='active':flash('This attendance session is not active.','error');return redirect(url_for('student_attendance_session',session_id=row.id,token=token))
+    claim_ok,claim_message=_attendance_validate_claim(row,student.id,token)
+    if not claim_ok:flash(claim_message,'error');return redirect(url_for('student_attendance_session',session_id=row.id))
     secure=_webauthn_secure_context();rp_id=_webauthn_rp_id();has_key=bool(s.scalar(select(StudentPasskey.id).where(StudentPasskey.student_id==student.id,StudentPasskey.rp_id==rp_id).limit(1)))
-    if row.biometric_mode=='required':flash('Fingerprint/passkey verification is required for this attendance session.','error');return redirect(url_for('student_attendance_session',session_id=row.id,token=token))
-    if row.biometric_mode=='preferred' and secure and has_key:flash('Please use Verify fingerprint / passkey to mark attendance.','error');return redirect(url_for('student_attendance_session',session_id=row.id,token=token))
-    try:rec,created=_attendance_create_record(s,row,student,'network_login_fallback',False,'');flash('Attendance marked.' if created else 'Your attendance was already marked.')
+    if row.biometric_mode=='required':flash('Fingerprint/passkey verification is required for this attendance session.','error');return redirect(url_for('student_attendance_session',session_id=row.id,claim=token))
+    if row.biometric_mode=='preferred' and secure and has_key:flash('Please use Verify fingerprint / passkey to mark attendance.','error');return redirect(url_for('student_attendance_session',session_id=row.id,claim=token))
+    try:rec,created=_attendance_create_record(s,row,student,'room_presence_login_fallback',False,'',network_preverified=True);flash('Attendance marked.' if created else 'Your attendance was already marked.')
     except ValueError as exc:flash(str(exc),'error')
-    return redirect(url_for('student_attendance_session',session_id=row.id,token=token))
+    return redirect(url_for('student_attendance_session',session_id=row.id,claim=token))
 
 
 @app.route('/admin/theory-classes',methods=['GET','POST'])

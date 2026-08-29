@@ -14,8 +14,11 @@
     </div>
   </div>
   <div class="card qr-card">
-    <h2>Student Attendance QR</h2><img src="{{ qr_uri }}" alt="Attendance QR code"><div class="access-url attendance-url">{{ student_url }}</div>
-    <button class="btn secondary" type="button" onclick="navigator.clipboard&&navigator.clipboard.writeText('{{ student_url|e }}')">Copy Attendance Link</button>
+    <h2>Room Attendance QR</h2>
+    {% if session.venue %}<p class="muted"><strong>{{ session.venue }}</strong></p>{% endif %}
+    <img src="{{ qr_uri }}" alt="Current attendance QR code">
+    <div class="access-url attendance-room-code"><span>Room Code</span><strong>{{ room_code }}</strong></div>
+    <p class="mini-meta">QR/code changes every {{ qr_rotation_seconds }} seconds. Students only need a valid scan/code once, then get {{ (completion_seconds/60)|round(0,'ceil')|int }} minutes to finish fingerprint/passkey verification.</p>
   </div>
 </div>
 

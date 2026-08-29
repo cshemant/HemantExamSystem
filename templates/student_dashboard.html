@@ -6,7 +6,7 @@
 <section class="card student-attendance-banner">
   <div class="result-toolbar"><div><h2>Attendance</h2><p class="muted">Active or upcoming attendance for your batch/section.</p></div><a class="btn secondary small" href="{{ url_for('student_attendance') }}">My Attendance</a></div>
   <div class="student-attendance-list">
-  {% for item in attendance_rows %}{% set a=item.session %}<div class="student-attendance-item"><div><strong>{{ a.subject }}</strong><div class="mini-meta">{{ a.title }} · {{ a.starts_at|dt }}{% if a.venue %} · {{ a.venue }}{% endif %}</div></div><div>{% if item.record %}<span class="badge success">✓ Marked</span>{% elif item.state=='active' %}<a class="btn small" href="{{ url_for('student_attendance_session',session_id=a.id,token=a.access_token) }}">Mark Attendance</a>{% else %}<span class="badge warning">Upcoming</span>{% endif %}</div></div>{% endfor %}
+  {% for item in attendance_rows %}{% set a=item.session %}<div class="student-attendance-item"><div><strong>{{ a.subject }}</strong><div class="mini-meta">{{ a.title }} · {{ a.starts_at|dt }}{% if a.venue %} · {{ a.venue }}{% endif %}</div></div><div>{% if item.record %}<span class="badge success">✓ Marked</span>{% elif item.state=='active' %}<a class="btn small" href="{{ url_for('student_attendance_session',session_id=a.id) }}">Mark Attendance</a>{% else %}<span class="badge warning">Upcoming</span>{% endif %}</div></div>{% endfor %}
   </div>
 </section>
 {% endif %}

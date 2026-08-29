@@ -22,7 +22,8 @@ class AttendanceV107StaticTests(unittest.TestCase):
     def test_network_and_time_guards_exist(self):
         self.assertIn('def _attendance_network_check',APP)
         self.assertIn("attendance_state(row)!='active'",APP)
-        self.assertIn("secrets.compare_digest(token,row.access_token)",APP)
+        self.assertIn('def _attendance_validate_claim',APP)
+        self.assertIn('def _attendance_validate_qr_token',APP)
     def test_passkey_verification_is_server_side(self):
         self.assertIn('key.verify(signature,signed',APP)
         self.assertIn("userVerification':'required'",APP)
@@ -32,7 +33,7 @@ class AttendanceV107StaticTests(unittest.TestCase):
         self.assertIn("url_for('attendance_sessions')",BASE)
         self.assertIn("url_for('student_attendance')",BASE)
         self.assertIn('Approved CIDRs',ADMIN)
-        self.assertIn('Student Attendance QR',DETAIL)
+        self.assertIn('Room Attendance QR',DETAIL)
         self.assertIn('Verify fingerprint / passkey',STUDENT)
     def test_client_webauthn_calls_exist(self):
         self.assertIn('navigator.credentials.create',JS)
