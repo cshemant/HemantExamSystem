@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /student
+Disallow: /api/
+Disallow: /mfa-verify
+Disallow: /setup
+Disallow: /logout
+Disallow: /download/
+Sitemap: https://exam.learnwithhemant.com/sitemap.xml
