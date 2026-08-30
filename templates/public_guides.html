@@ -1,0 +1,60 @@
+{% extends 'base.html' %}{% block content %}
+<section class="public-blog-hero">
+  <div class="container public-blog-hero-grid">
+    <div>
+      <div class="eyebrow">Visual exam system guides</div>
+      <h1>See how each tool works before you use it</h1>
+      <p>These public guides explain the main faculty, admin and student workflows with simple visual maps instead of exposing private dashboards or real student data.</p>
+      <div class="public-blog-actions"><a class="btn" href="#tool-guides">Explore tools</a><a class="btn secondary" href="{{ url_for('public_updates') }}">See latest updates</a></div>
+    </div>
+    <div class="public-guide-preview" aria-label="Visual overview of the exam workflow">
+      <div class="public-guide-preview-head"><span>Exam workflow</span><span class="public-live-dot">Public guide</span></div>
+      <div class="public-mini-flow"><span>Question Bank</span><b>→</b><span>Exam</span><b>→</b><span>Result</span></div>
+      <div class="public-mini-flow"><span>Attendance</span><b>→</b><span>Practical</span><b>→</b><span>Skill View</span></div>
+      <p>Guide visuals are generated from a shared content registry, while matching public release notes automatically appear as “latest improvements.”</p>
+    </div>
+  </div>
+</section>
+
+<section class="public-guide-section" id="tool-guides">
+  <div class="container">
+    <div class="public-section-heading">
+      <div class="eyebrow">Tool library</div>
+      <h2>Choose a workflow to explore</h2>
+      <p>Each page explains who the tool is for, what the workflow looks like and what has changed recently.</p>
+    </div>
+    <div class="public-guide-card-grid">
+      {% for guide in guides %}
+      <article class="public-guide-card">
+        <div class="public-guide-card-top"><span class="public-guide-icon">{{ guide.icon }}</span><div class="public-audience-chips">{% for audience in guide.audiences %}<span>{{ audience }}</span>{% endfor %}</div></div>
+        <h3><a href="{{ url_for('public_guide',slug=guide.slug) }}">{{ guide.short_title }}</a></h3>
+        <p>{{ guide.description }}</p>
+        <div class="public-guide-card-capabilities">{% for capability in guide.capabilities[:3] %}<span>{{ capability }}</span>{% endfor %}</div>
+        <a class="public-card-link" href="{{ url_for('public_guide',slug=guide.slug) }}">View visual guide <span aria-hidden="true">→</span></a>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+{% if recent_updates %}
+<section class="public-guide-section public-guide-soft">
+  <div class="container">
+    <div class="public-section-heading public-heading-row">
+      <div><div class="eyebrow">Automatically refreshed</div><h2>Latest public improvements</h2><p>These cards are created from release notes that are explicitly marked safe for public display.</p></div>
+      <a class="btn secondary" href="{{ url_for('public_updates') }}">View all updates</a>
+    </div>
+    <div class="public-update-grid">
+      {% for update in recent_updates %}
+      <article class="public-update-card">
+        <div class="public-update-meta">{% if update.date %}<time datetime="{{ update.date }}">{{ update.date }}</time>{% endif %}</div>
+        <h3><a href="{{ url_for('public_update_detail',slug=update.slug) }}">{{ update.title }}</a></h3>
+        <p>{{ update.summary }}</p>
+        <div class="public-audience-chips">{% for audience in update.audiences %}<span>{{ audience }}</span>{% endfor %}</div>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
