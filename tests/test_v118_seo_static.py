@@ -48,3 +48,12 @@ def test_physical_crawler_files_are_packaged():
     assert 'User-agent: *' in robots
     assert 'Sitemap: https://exam.learnwithhemant.com/sitemap.xml' in robots
     assert '<loc>https://exam.learnwithhemant.com/</loc>' in sitemap
+
+def test_hero_is_clean_while_descriptive_seo_copy_remains_visible():
+    hero_start=LOGIN.index('<div class="intro-main">')
+    hero_end=LOGIN.index('<div class="offline-download-box">')
+    hero=LOGIN[hero_start:hero_end]
+    assert 'Create, schedule and conduct assessments with question banks' not in hero
+    assert 'helps faculty create, schedule and conduct assessments with question banks' in LOGIN
+    assert 'randomized papers, autosave, automatic scoring, attendance and practical evaluation tools' in LOGIN
+
