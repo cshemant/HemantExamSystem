@@ -1,0 +1,32 @@
+{% extends 'base.html' %}{% block content %}
+<section class="public-update-detail-hero">
+  <div class="container public-update-detail-wrap">
+    <a class="public-back-link" href="{{ url_for('public_updates') }}">← All updates</a>
+    <div class="public-update-meta">{% if update.date %}<time datetime="{{ update.date }}">{{ update.date }}</time>{% endif %}</div>
+    <h1>{{ update.title }}</h1>
+    <p>{{ update.summary }}</p>
+    <div class="public-audience-chips public-audience-large">{% for audience in update.audiences %}<span>{{ audience }}</span>{% endfor %}</div>
+  </div>
+</section>
+
+<section class="public-guide-section">
+  <div class="container public-update-detail-grid">
+    <article class="public-update-explainer">
+      <div class="eyebrow">What changed</div>
+      <h2>A public summary of the improvement</h2>
+      <p>{{ update.summary }}</p>
+      {% if update.highlights %}
+      <div class="public-update-highlight-cards">{% for item in update.highlights %}<div><span>{{ '%02d'|format(loop.index) }}</span><strong>{{ item }}</strong></div>{% endfor %}</div>
+      {% endif %}
+      <div class="public-safety-note"><strong>Why this page is safe to publish</strong><p>The website reads only the short public metadata block from the release note. Source-code paths, security implementation details and private operational notes are not rendered here.</p></div>
+    </article>
+    <aside>
+      {% if guide %}
+      <div class="public-related-guide-card"><span class="public-guide-icon large">{{ guide.icon }}</span><div class="eyebrow">Related tool</div><h2>{{ guide.short_title }}</h2><p>{{ guide.description }}</p><a class="btn" href="{{ url_for('public_guide',slug=guide.slug) }}">Open visual guide</a></div>
+      {% else %}
+      <div class="public-related-guide-card"><div class="eyebrow">More guides</div><h2>Explore the tool library</h2><p>See visual explanations for the main exam-system workflows.</p><a class="btn" href="{{ url_for('public_guides') }}">Browse guides</a></div>
+      {% endif %}
+    </aside>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,44 @@
+{% extends 'base.html' %}{% block content %}
+<section class="public-blog-hero compact">
+  <div class="container public-blog-hero-grid">
+    <div>
+      <div class="eyebrow">What's new</div>
+      <h1>Public exam system updates</h1>
+      <p>A readable change feed for improvements that affect faculty, administrators or students. Internal implementation notes stay private.</p>
+    </div>
+    <div class="public-update-filter-card">
+      <strong>Filter by audience</strong>
+      <div class="public-filter-links">
+        <a class="{{ 'active' if not active_audience else '' }}" href="{{ url_for('public_updates') }}">All</a>
+        <a class="{{ 'active' if active_audience=='faculty' else '' }}" href="{{ url_for('public_updates',audience='faculty') }}">Faculty</a>
+        <a class="{{ 'active' if active_audience=='admin' else '' }}" href="{{ url_for('public_updates',audience='admin') }}">Admin</a>
+        <a class="{{ 'active' if active_audience=='student' else '' }}" href="{{ url_for('public_updates',audience='student') }}">Students</a>
+      </div>
+      <p>New release notes appear here automatically only when they include the safe <code>PUBLIC_UPDATE</code> metadata block.</p>
+    </div>
+  </div>
+</section>
+
+<section class="public-guide-section">
+  <div class="container">
+    {% if updates %}
+    <div class="public-update-timeline">
+      {% for update in updates %}
+      <article class="public-update-row">
+        <div class="public-update-date">{% if update.date %}<time datetime="{{ update.date }}">{{ update.date }}</time>{% endif %}</div>
+        <div class="public-update-row-body">
+          <div class="public-audience-chips">{% for audience in update.audiences %}<span>{{ audience }}</span>{% endfor %}</div>
+          <h2><a href="{{ url_for('public_update_detail',slug=update.slug) }}">{{ update.title }}</a></h2>
+          <p>{{ update.summary }}</p>
+          {% if update.highlights %}<div class="public-guide-card-capabilities">{% for item in update.highlights %}<span>{{ item }}</span>{% endfor %}</div>{% endif %}
+          {% if update.guide %}<a class="public-card-link" href="{{ url_for('public_guide',slug=update.guide.slug) }}">See {{ update.guide.short_title }} guide →</a>{% endif %}
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="public-empty-state"><h2>No public updates match this filter</h2><p>Choose another audience or view all updates.</p><a class="btn" href="{{ url_for('public_updates') }}">Show all updates</a></div>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

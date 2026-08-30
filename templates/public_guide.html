@@ -1,0 +1,66 @@
+{% extends 'base.html' %}{% block content %}
+<section class="public-guide-detail-hero">
+  <div class="container public-guide-detail-grid">
+    <div>
+      <a class="public-back-link" href="{{ url_for('public_guides') }}">← All tool guides</a>
+      <div class="eyebrow">{{ guide.eyebrow }}</div>
+      <h1>{{ guide.title }}</h1>
+      <p>{{ guide.description }}</p>
+      <div class="public-audience-chips public-audience-large">{% for audience in guide.audiences %}<span>{{ audience }}</span>{% endfor %}</div>
+    </div>
+    <aside class="public-guide-summary-card">
+      <span class="public-guide-icon large">{{ guide.icon }}</span>
+      <h2>Why it matters</h2>
+      <p>{{ guide.why_it_matters }}</p>
+      <div class="public-capability-list">{% for capability in guide.capabilities %}<span>✓ {{ capability }}</span>{% endfor %}</div>
+    </aside>
+  </div>
+</section>
+
+<section class="public-guide-section">
+  <div class="container">
+    <div class="public-section-heading"><div class="eyebrow">Visual workflow</div><h2>How the tool fits into the process</h2><p>The diagram uses simplified interface blocks, so it stays readable on phones and does not expose private user information.</p></div>
+    <div class="public-workflow-visual">
+      <div class="public-workflow-toolbar"><span>Current workflow</span></div>
+      <div class="public-workflow-nodes">
+        {% for step in guide.workflow %}
+        <article class="public-workflow-node">
+          <span class="public-workflow-step">{{ '%02d'|format(loop.index) }}</span>
+          <small>{{ step.label }}</small>
+          <h3>{{ step.title }}</h3>
+          <p>{{ step.text }}</p>
+        </article>
+        {% if not loop.last %}<span class="public-workflow-arrow" aria-hidden="true">→</span>{% endif %}
+        {% endfor %}
+      </div>
+      {% if latest_update %}
+      <div class="public-visual-latest">
+        <div><span>Latest improvement</span><strong>{{ latest_update.title }}</strong></div>
+        <p>{{ latest_update.summary }}</p>
+        <a href="{{ url_for('public_update_detail',slug=latest_update.slug) }}">Read update →</a>
+      </div>
+      {% else %}
+      <div class="public-visual-latest muted-update"><div><span>Latest improvement</span><strong>Guide is current</strong></div><p>Future public updates linked to this tool will appear here automatically after deployment.</p></div>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+{% if related_updates %}
+<section class="public-guide-section public-guide-soft">
+  <div class="container">
+    <div class="public-section-heading"><div class="eyebrow">Change history</div><h2>Recent improvements to this tool</h2><p>The update cards below come from public release metadata rather than being copied into this page manually.</p></div>
+    <div class="public-update-grid">
+      {% for update in related_updates %}
+      <article class="public-update-card">
+        <div class="public-update-meta">{% if update.date %}<time datetime="{{ update.date }}">{{ update.date }}</time>{% endif %}</div>
+        <h3><a href="{{ url_for('public_update_detail',slug=update.slug) }}">{{ update.title }}</a></h3>
+        <p>{{ update.summary }}</p>
+        {% if update.highlights %}<ul class="public-highlight-list">{% for item in update.highlights %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
