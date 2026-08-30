@@ -53,7 +53,7 @@ def test_public_release_metadata_is_discovered_and_attached_to_guides():
 def test_visual_pages_use_auto_latest_update_panel():
     assert 'latest_update' in GUIDE
     assert 'Latest improvement' in GUIDE
-    assert 'Generated from public guide data' in GUIDE
+    assert 'Generated from public guide data' not in GUIDE
     assert 'PUBLIC_UPDATE' in UPDATES
     assert 'Automatically refreshed' in GUIDES
 
