@@ -152,11 +152,20 @@
   </aside>
 </div>
 {% endif %}
-{% if login_page %}<main id="main-content">{% else %}<main id="main-content" class="page"><div class="container">{% endif %}
+{% if login_page or public_page %}<main id="main-content">{% else %}<main id="main-content" class="page"><div class="container">{% endif %}
 {% with msgs=get_flashed_messages(with_categories=true) %}{% for category,m in msgs %}<div class="flash {{ 'error' if category=='error' else '' }}">{{ m }}</div>{% endfor %}{% endwith %}
 {% block content %}{% endblock %}
-{% if not login_page %}</div>{% endif %}</main>
-<footer class="site-footer"><div class="container footer-grid"><span><span class="footer-brand">{{ institution.short_name if institution else 'Learn with Hemant' }}</span>{% if institution and institution.department %} · {{ institution.department }}{% else %} · Practical learning tools{% endif %}</span></div></footer>
+{% if not login_page and not public_page %}</div>{% endif %}</main>
+<footer class="site-footer"><div class="container footer-grid">
+  <div class="footer-identity"><span class="footer-brand">{{ institution.short_name if institution else 'Learn with Hemant' }}</span><span>{% if institution and institution.department %}{{ institution.department }}{% else %}Practical learning tools{% endif %}</span></div>
+  {% if not web_session.get('role') %}<nav class="footer-links" aria-label="Public exam system guides">
+    <a href="{{ url_for('public_guides') }}">Tool Guides</a>
+    <a href="{{ url_for('public_updates') }}">What's New</a>
+    <a href="{{ url_for('public_guide',slug='question-bank') }}">Question Bank</a>
+    <a href="{{ url_for('public_guide',slug='attendance') }}">Attendance</a>
+    <a href="{{ url_for('public_guide',slug='placement-readiness') }}">Placement</a>
+  </nav>{% endif %}
+</div></footer>
 {% if web_session.get('role') in ['admin','faculty'] %}
 <script>
 window.EXAM_VOICE_CONFIG={{ {

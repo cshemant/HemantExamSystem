@@ -26,6 +26,7 @@ from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
 from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
 from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, generate_subject_context_questions, generate_placement_questions, AIProviderError
+from public_content import PUBLIC_GUIDES, discover_public_updates, get_public_guide, public_update_by_slug, related_updates, public_sitemap_paths
 
 RESOURCE_DIR=Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolve()
@@ -2942,6 +2943,33 @@ def home_seo_context():
         'seo_schema':schema,
     }
 
+
+def public_page_seo_context(title,description,path,schema_type='WebPage'):
+    canonical=f"{SEO_CANONICAL_ORIGIN}{path}"
+    logo=f"{SEO_CANONICAL_ORIGIN}{url_for('static',filename='brand-logo.png')}"
+    schema={
+        '@context':'https://schema.org',
+        '@type':schema_type,
+        'name':title,
+        'description':description,
+        'url':canonical,
+        'isPartOf':{'@type':'WebSite','name':'Learn with Hemant Exam System','url':f'{SEO_CANONICAL_ORIGIN}/'},
+        'publisher':{'@type':'Organization','name':'Learn with Hemant','logo':{'@type':'ImageObject','url':logo}},
+    }
+    return {
+        'seo_index':is_public_seo_host(),
+        'seo_title':title,
+        'seo_description':description,
+        'seo_canonical_url':canonical,
+        'seo_og_type':'website',
+        'seo_og_image':logo,
+        'seo_schema':schema,
+    }
+
+
+def public_updates_data():
+    return discover_public_updates(RESOURCE_DIR)
+
 @app.context_processor
 def globals_for_templates():
     practical_code_available=False
@@ -2963,12 +2991,13 @@ def offline_first_run_guard():
 @app.after_request
 def security_headers(response):
     response.headers.setdefault('X-Content-Type-Options','nosniff')
-    # Only the canonical production homepage is intended as a search landing
-    # page. Private/authenticated routes, local builds, staging and Render's
-    # service hostname should not become competing or low-value search results.
+    # Only the curated public homepage, guides and public update pages on the
+    # canonical production host are indexable. Private/authenticated routes,
+    # local builds, staging and Render's service hostname remain noindex.
     endpoint=request.endpoint or ''
-    public_home=endpoint=='home' and request.method=='GET' and is_public_seo_host()
-    if endpoint not in {'static','robots_txt','sitemap_xml'} and not public_home:
+    public_seo_endpoints={'home','public_guides','public_guide','public_updates','public_update_detail'}
+    public_seo_page=endpoint in public_seo_endpoints and request.method=='GET' and is_public_seo_host()
+    if endpoint not in {'static','robots_txt','sitemap_xml'} and not public_seo_page:
         response.headers.setdefault('X-Robots-Tag','noindex, nofollow')
     # Every page remains non-frameable except the authenticated secure exam
     # document loaded by our own PIN-verification shell.  That single route is
@@ -3035,26 +3064,94 @@ def robots_txt():
 
 @app.route('/sitemap.xml')
 def sitemap_xml():
-    # The physical sitemap.xml is intentionally served only on the canonical
-    # production hostname. Staging/local hosts must not become indexable copies.
+    # The live sitemap is generated from the public guide/update registry so a
+    # newly marked public release note becomes discoverable after deployment
+    # without hand-editing sitemap.xml. Staging/local hosts remain blocked.
     if not is_public_seo_host():
         abort(404)
-    sitemap_path=RESOURCE_DIR/'sitemap.xml'
-    try:
-        body=sitemap_path.read_text(encoding='utf-8')
-    except OSError:
-        canonical=f'{SEO_CANONICAL_ORIGIN}/'
-        body=(
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    entries=[]
+    for path in public_sitemap_paths(RESOURCE_DIR):
+        canonical=f"{SEO_CANONICAL_ORIGIN}{path}"
+        priority='1.0' if path=='/' else ('0.9' if path in {'/guides','/updates'} else '0.8')
+        entries.append(
             '  <url>\n'
             f'    <loc>{canonical}</loc>\n'
-            '  </url>\n'
-            '</urlset>\n'
+            f'    <priority>{priority}</priority>\n'
+            '  </url>'
         )
+    body=(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        + '\n'.join(entries)
+        + '\n</urlset>\n'
+    )
     response=app.response_class(body,mimetype='application/xml')
     response.headers['Cache-Control']='public, max-age=3600'
     return response
+
+
+@app.route('/guides')
+def public_guides():
+    guides=list(PUBLIC_GUIDES.values())
+    updates=public_updates_data()
+    description='Visual guides for the Learn with Hemant Exam System, including question banks, online exams, attendance, practical assessment, placement readiness and student practice.'
+    return render_template(
+        'public_guides.html',
+        public_page=True,
+        guides=guides,
+        recent_updates=updates[:5],
+        **public_page_seo_context('Exam System Tool Guides | Learn with Hemant',description,'/guides','CollectionPage'),
+    )
+
+
+@app.route('/guides/<slug>')
+def public_guide(slug):
+    guide=get_public_guide(slug)
+    if not guide:
+        abort(404)
+    updates=related_updates(RESOURCE_DIR,slug)
+    description=guide['description']
+    return render_template(
+        'public_guide.html',
+        public_page=True,
+        guide=guide,
+        related_updates=updates,
+        latest_update=(updates[0] if updates else None),
+        **public_page_seo_context(f"{guide['title']} | Exam System Guide",description,f'/guides/{slug}'),
+    )
+
+
+@app.route('/updates')
+def public_updates():
+    updates=public_updates_data()
+    audience=(request.args.get('audience') or '').strip().lower()
+    if audience:
+        updates=[item for item in updates if any(a.lower()==audience for a in item.get('audiences',[]))]
+    description='See public feature updates for faculty, administrators and students using the Learn with Hemant Exam System.'
+    return render_template(
+        'public_updates.html',
+        public_page=True,
+        updates=updates,
+        active_audience=audience,
+        **public_page_seo_context("What's New in the Exam System | Learn with Hemant",description,'/updates','CollectionPage'),
+    )
+
+
+@app.route('/updates/<slug>')
+def public_update_detail(slug):
+    update=public_update_by_slug(RESOURCE_DIR,slug)
+    if not update:
+        abort(404)
+    guide=update.get('guide')
+    description=update['summary']
+    return render_template(
+        'public_update_detail.html',
+        public_page=True,
+        update=update,
+        guide=guide,
+        **public_page_seo_context(f"{update['title']} | Exam System Update",description,f'/updates/{slug}'),
+    )
+
 
 @app.route('/setup',methods=['GET','POST'])
 def setup_admin():
