@@ -2,6 +2,7 @@
   const root=document.getElementById('student-code-editor');if(!root)return;
   const language=document.getElementById('code-language'),source=document.getElementById('code-source'),stdin=document.getElementById('code-stdin');
   const output=document.getElementById('code-output'),status=document.getElementById('code-status'),run=document.getElementById('code-run');
+  const lineNumbers=document.getElementById('code-line-numbers'),bracketLayer=document.getElementById('code-bracket-layer');
   const examples={
     c:'#include <stdio.h>\n\nint main() {\n    printf("Hello, World!\\n");\n    return 0;\n}\n',
     cpp:'#include <iostream>\nusing namespace std;\n\nint main() {\n    cout << "Hello, World!" << endl;\n    return 0;\n}\n',
@@ -10,11 +11,51 @@
     php:'<?php\necho "Hello, World!\\n";\n?>\n'
   };
   const drafts={};
-  function load(lang){source.value=drafts[lang]===undefined?examples[lang]:drafts[lang];output.textContent='Run your program to see the output here.';output.className='';status.textContent='Ready';}
+  function escapeHtml(value){return value.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function bracketAtCaret(){
+    const value=source.value,caret=source.selectionStart;
+    if('()[]{}'.includes(value.charAt(caret)))return caret;
+    if(caret>0&&'()[]{}'.includes(value.charAt(caret-1)))return caret-1;
+    return -1;
+  }
+  function matchingBracket(index){
+    if(index<0)return -1;
+    const value=source.value,pairs={'(':')','[':']','{':'}',')':'(',']':'[','}':'{'};
+    const bracket=value.charAt(index),mate=pairs[bracket];if(!mate)return -1;
+    const forward='([{'.includes(bracket),step=forward?1:-1;let depth=0;
+    for(let i=index;i>=0&&i<value.length;i+=step){
+      const current=value.charAt(i);
+      if(current===bracket)depth+=1;
+      else if(current===mate){depth-=1;if(depth===0)return i;}
+    }
+    return -1;
+  }
+  function renderEditorGuides(){
+    const value=source.value,count=Math.max(1,value.split('\n').length);
+    lineNumbers.textContent=Array.from({length:count},(_,index)=>index+1).join('\n');
+    const active=bracketAtCaret(),matching=matchingBracket(active);
+    if(active>=0){
+      const marked=new Set([active]);if(matching>=0)marked.add(matching);
+      let html='';
+      for(let i=0;i<value.length;i++){
+        const character=escapeHtml(value.charAt(i));
+        html+=marked.has(i)?'<mark class="code-matching-bracket">'+character+'</mark>':character;
+      }
+      bracketLayer.innerHTML=html+(value.endsWith('\n')?' ':'');
+    }else bracketLayer.textContent=value+(value.endsWith('\n')?' ':'');
+    lineNumbers.scrollTop=source.scrollTop;
+    bracketLayer.scrollTop=source.scrollTop;bracketLayer.scrollLeft=source.scrollLeft;
+  }
+  function load(lang){source.value=drafts[lang]===undefined?examples[lang]:drafts[lang];output.textContent='Run your program to see the output here.';output.className='';status.textContent='Ready';renderEditorGuides();}
   let active=language.value;load(active);
   language.addEventListener('change',()=>{drafts[active]=source.value;active=language.value;load(active);source.focus();});
-  source.addEventListener('keydown',event=>{if(event.key==='Tab'){event.preventDefault();const a=source.selectionStart,b=source.selectionEnd;source.setRangeText('    ',a,b,'end');}});
-  document.getElementById('code-reset').addEventListener('click',()=>{if(!confirm('Reset this language to the starter code?'))return;drafts[active]=examples[active];source.value=examples[active];stdin.value='';output.textContent='Run your program to see the output here.';output.className='';status.textContent='Ready';});
+  source.addEventListener('keydown',event=>{if(event.key==='Tab'){event.preventDefault();const a=source.selectionStart,b=source.selectionEnd;source.setRangeText('    ',a,b,'end');renderEditorGuides();}});
+  source.addEventListener('input',renderEditorGuides);
+  source.addEventListener('click',renderEditorGuides);
+  source.addEventListener('keyup',renderEditorGuides);
+  source.addEventListener('select',renderEditorGuides);
+  source.addEventListener('scroll',renderEditorGuides);
+  document.getElementById('code-reset').addEventListener('click',()=>{if(!confirm('Reset this language to the starter code?'))return;drafts[active]=examples[active];source.value=examples[active];stdin.value='';output.textContent='Run your program to see the output here.';output.className='';status.textContent='Ready';renderEditorGuides();});
   document.getElementById('code-clear').addEventListener('click',()=>{output.textContent='';output.className='';});
   function wait(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
   async function readJob(url){
