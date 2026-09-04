@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from functools import wraps
 from urllib.parse import urlparse
+from urllib.request import Request as URLRequest, urlopen
+from urllib.error import HTTPError, URLError
 
 from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
 from dotenv import load_dotenv
@@ -33,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.38.0'
+APP_VERSION='2.40.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -78,6 +80,22 @@ except Exception:
 
 APP_MODE=os.getenv('APP_MODE','offline').strip().lower()
 if APP_MODE not in {'offline','online'}: raise RuntimeError('APP_MODE must be offline or online')
+CODE_RUNNER_WORKER_MODE=os.getenv('CODE_RUNNER_WORKER_MODE','0').strip().lower() in {'1','true','yes','on'}
+
+# Student code is executed by an isolated Piston-compatible runner.  Never run
+# untrusted student programs as operating-system processes on the exam server.
+CODE_RUNNER_API_URL=(os.getenv('CODE_RUNNER_API_URL','http://127.0.0.1:2000/api/v2/execute').strip() or 'http://127.0.0.1:2000/api/v2/execute')
+CODE_RUNNER_TIMEOUT_SECONDS=max(5,min(30,int(os.getenv('CODE_RUNNER_TIMEOUT_SECONDS','15'))))
+CODE_EDITOR_MAX_SOURCE_BYTES=max(1024,min(100000,int(os.getenv('CODE_EDITOR_MAX_SOURCE_BYTES','50000'))))
+CODE_EDITOR_MAX_STDIN_BYTES=max(256,min(20000,int(os.getenv('CODE_EDITOR_MAX_STDIN_BYTES','10000'))))
+CODE_EDITOR_QUEUE_LIMIT=max(10,min(500,int(os.getenv('CODE_EDITOR_QUEUE_LIMIT','100'))))
+CODE_EDITOR_LANGUAGES={
+    'c':{'label':'C','runner':'c','filename':'main.c'},
+    'cpp':{'label':'C++','runner':'c++','filename':'main.cpp'},
+    'java':{'label':'Java','runner':'java','filename':'Main.java'},
+    'python':{'label':'Python','runner':'python','filename':'main.py'},
+    'php':{'label':'PHP','runner':'php','filename':'main.php'},
+}
 
 def normalize_database_url(raw):
     if not raw:
@@ -103,9 +121,13 @@ legacy_admin_username=os.getenv('LEGACY_ADMIN_USERNAME','admin').strip() or 'adm
 admin_password=(os.getenv('SUPER_ADMIN_PASSWORD') or os.getenv('ADMIN_PASSWORD') or '').strip()
 # Compatibility alias used by older helper code.
 admin_username=super_admin_username
-if APP_MODE=='online':
+if APP_MODE=='online' and not CODE_RUNNER_WORKER_MODE:
     if len(secret)<24: raise RuntimeError('Online mode requires a strong SECRET_KEY (24+ characters).')
     if len(admin_password)<10: raise RuntimeError('Online mode requires SUPER_ADMIN_PASSWORD or ADMIN_PASSWORD with at least 10 characters.')
+elif CODE_RUNNER_WORKER_MODE:
+    # A queue worker needs database access, but it must never require or rotate
+    # the website administrator credentials merely because it imports app.py.
+    secret=secret or 'isolated-code-runner-worker-process'
 if not secret:
     secret='offline-development-secret-change-me'
 if not admin_password and not OFFLINE_REQUIRE_SETUP:
@@ -159,6 +181,23 @@ class Student(Base):
     name:Mapped[str]=mapped_column(String,nullable=False)
     password_hash:Mapped[str]=mapped_column(String,nullable=False)
     created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class CodeRunJob(Base):
+    __tablename__='code_run_jobs'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    token:Mapped[str]=mapped_column(String(64),unique=True,nullable=False)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False,index=True)
+    language:Mapped[str]=mapped_column(String(20),nullable=False)
+    source_code:Mapped[str]=mapped_column(Text,nullable=False)
+    stdin_text:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    status:Mapped[str]=mapped_column(String(20),nullable=False,default='queued',index=True)
+    output:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    error:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    exit_code:Mapped[int|None]=mapped_column(Integer,nullable=True)
+    success:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+    started_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    completed_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 class Exam(Base):
     __tablename__='exams'
@@ -2835,7 +2874,7 @@ def init_db():
     try:
         seed_subject_catalog(s)
         seed_placement_skills(s)
-        if APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP:
+        if (APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP) and not CODE_RUNNER_WORKER_MODE:
             ensure_super_admin_identity(s)
             get_institution(s,create=True)
         # V2.20 one-time migration: existing exams already classified as
@@ -3021,7 +3060,7 @@ def security_headers(response):
     elif secure_exam_frame:
         response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
     else:
-        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+                response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: https://*.google-analytics.com https://*.googletagmanager.com; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://*.googletagmanager.com; connect-src 'self' https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     response.headers.setdefault('Cross-Origin-Opener-Policy','same-origin')
     response.headers.setdefault('Cross-Origin-Resource-Policy','same-origin')
     if APP_MODE=='online' and request.is_secure: response.headers.setdefault('Strict-Transport-Security','max-age=31536000; includeSubDomains')
@@ -3232,6 +3271,32 @@ def student_required(fn):
             return redirect(url_for('home'))
         return fn(*a,**kw)
     return inner
+
+def execute_student_code(language,source,stdin_text=''):
+    """Execute source with a remote sandbox and return a normalized result."""
+    cfg=CODE_EDITOR_LANGUAGES.get(language)
+    if not cfg:raise ValueError('Choose a supported programming language.')
+    if not source.strip():raise ValueError('Write some code before selecting Run.')
+    if len(source.encode('utf-8'))>CODE_EDITOR_MAX_SOURCE_BYTES:raise ValueError('The source code is too large.')
+    if len(stdin_text.encode('utf-8'))>CODE_EDITOR_MAX_STDIN_BYTES:raise ValueError('The program input is too large.')
+    payload={'language':cfg['runner'],'version':'*','files':[{'name':cfg['filename'],'content':source}],'stdin':stdin_text,'compile_timeout':8000,'run_timeout':3000,'compile_cpu_time':8000,'run_cpu_time':3000,'compile_memory_limit':268435456,'run_memory_limit':134217728}
+    req=URLRequest(CODE_RUNNER_API_URL,data=json.dumps(payload).encode('utf-8'),headers={'Content-Type':'application/json','Accept':'application/json','User-Agent':'LearnWithHemant-CodeEditor/1.0'},method='POST')
+    try:
+        with urlopen(req,timeout=CODE_RUNNER_TIMEOUT_SECONDS) as response:
+            raw=response.read(250000)
+    except HTTPError as exc:
+        detail=exc.read(1000).decode('utf-8','replace')
+        raise RuntimeError(f'Compiler service rejected the request ({exc.code}). {detail[:240]}') from exc
+    except (URLError,TimeoutError) as exc:
+        raise RuntimeError('The private code runner is unavailable. Ask the administrator to start the Code Runner service.') from exc
+    try:data=json.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError,json.JSONDecodeError) as exc:raise RuntimeError('The compiler service returned an invalid response.') from exc
+    compile_step=data.get('compile') or {};run_step=data.get('run') or {}
+    output=''.join(str(x or '') for x in (compile_step.get('stdout'),compile_step.get('stderr'),run_step.get('stdout'),run_step.get('stderr')))
+    output=output[:50000]
+    code=run_step.get('code') if run_step else compile_step.get('code')
+    success=compile_step.get('code') in (0,None) and run_step.get('code') in (0,None)
+    return {'output':output or '(Program finished with no output.)','exit_code':code,'success':success,'language':cfg['label']}
 
 def approver_required(fn):
     @wraps(fn)
@@ -8611,6 +8676,53 @@ def student_dashboard():
             if astate in {'active','upcoming'}:
                 attendance_rows.append({'session':arow,'state':astate,'record':attendance_records.get(arow.id)})
     return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups,attendance_rows=attendance_rows,auto_refresh_at_epoch=min(auto_refresh_epochs) if auto_refresh_epochs else None,server_now_epoch=int(dashboard_now.timestamp()))
+
+@app.route('/student/code-editor')
+@student_required
+def student_code_editor():
+    return render_template('code_editor.html',languages=CODE_EDITOR_LANGUAGES)
+
+@app.route('/student/code-editor/run',methods=['POST'])
+@student_required
+def student_code_editor_run():
+    payload=request.get_json(silent=True) or {}
+    language=(payload.get('language') or '').strip().lower()
+    source=payload.get('source') if isinstance(payload.get('source'),str) else ''
+    stdin_text=payload.get('stdin') if isinstance(payload.get('stdin'),str) else ''
+    student_id=int(web_session.get('user_id') or 0);s=DB()
+    try:
+        # Validate before writing the job. Execution happens outside the web
+        # process, so a class-wide burst cannot occupy Gunicorn workers.
+        cfg=CODE_EDITOR_LANGUAGES.get(language)
+        if not cfg:raise ValueError('Choose a supported programming language.')
+        if not source.strip():raise ValueError('Write some code before selecting Run.')
+        if len(source.encode('utf-8'))>CODE_EDITOR_MAX_SOURCE_BYTES:raise ValueError('The source code is too large.')
+        if len(stdin_text.encode('utf-8'))>CODE_EDITOR_MAX_STDIN_BYTES:raise ValueError('The program input is too large.')
+        own_active=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.student_id==student_id,CodeRunJob.status.in_(['queued','running']))) or 0
+        if own_active>=2:return jsonify({'ok':False,'error':'You already have two programs waiting or running. Please wait for one to finish.'}),429
+        queue_size=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status.in_(['queued','running']))) or 0
+        if queue_size>=CODE_EDITOR_QUEUE_LIMIT:return jsonify({'ok':False,'error':'The classroom code queue is full. Please try again shortly.'}),503
+        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language=language,source_code=source,stdin_text=stdin_text,status='queued',created_at=now_iso())
+        s.add(job);s.commit()
+        return jsonify({'ok':True,'job_id':job.token,'status':'queued','position':queue_size+1,'status_url':url_for('student_code_editor_job',job_token=job.token)}),202
+    except ValueError as exc:s.rollback();return jsonify({'ok':False,'error':str(exc)}),400
+    except Exception:
+        s.rollback();app.logger.exception('Student code queue failed')
+        return jsonify({'ok':False,'error':'The program could not be queued safely. Please try again.'}),503
+
+@app.route('/student/code-editor/jobs/<job_token>')
+@student_required
+def student_code_editor_job(job_token):
+    s=DB();student_id=int(web_session.get('user_id') or 0)
+    job=s.scalar(select(CodeRunJob).where(CodeRunJob.token==job_token,CodeRunJob.student_id==student_id))
+    if not job:abort(404)
+    result={'ok':True,'status':job.status}
+    if job.status=='queued':
+        position=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status=='queued',CodeRunJob.id<=job.id)) or 1
+        result['position']=position
+    elif job.status=='completed':result.update({'output':job.output or '(Program finished with no output.)','exit_code':job.exit_code,'success':bool(job.success)})
+    elif job.status=='failed':result.update({'error':job.error or 'Code execution failed safely.'})
+    return jsonify(result)
 
 
 @app.route('/student/practical-code',methods=['GET','POST'])
