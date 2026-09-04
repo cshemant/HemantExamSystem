@@ -9,7 +9,15 @@ from sqlalchemy import delete, update
 
 from app import DB, CodeRunJob, execute_student_code, now_dt, now_iso
 
-WORKERS=max(1,min(4,int(os.getenv('CODE_RUNNER_WORKERS','2'))))
+def configured_worker_count():
+    """Read concurrency from settings while retaining a safe upper bound."""
+    try:
+        requested=int(os.getenv('CODE_RUNNER_WORKERS','2'))
+    except (TypeError,ValueError):
+        requested=2
+    return max(1,min(10,requested))
+
+WORKERS=configured_worker_count()
 POLL_SECONDS=max(0.2,min(5.0,float(os.getenv('CODE_RUNNER_QUEUE_POLL_SECONDS','0.5'))))
 stop_event=threading.Event()
 
