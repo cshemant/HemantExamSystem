@@ -1,0 +1,40 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-head code-editor-heading">
+  <div><h1>Code Editor</h1><p class="muted">Write, run and test programs directly in your browser.</p></div>
+  <span class="badge gray">C · C++ · Java · Python · PHP</span>
+</div>
+
+<section class="card code-editor-card" id="student-code-editor" data-run-url="{{ url_for('student_code_editor_run') }}">
+  <div class="code-editor-toolbar">
+    <label for="code-language">Language
+      <select id="code-language">
+        {% for key,item in languages.items() %}<option value="{{ key }}"{% if key=='python' %} selected{% endif %}>{{ item.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <div class="actions">
+      <button class="btn secondary" type="button" id="code-reset">Reset</button>
+      <button class="btn" type="button" id="code-run"><span aria-hidden="true">▶</span> Run Code</button>
+    </div>
+  </div>
+
+  <div class="code-workspace">
+    <div class="code-pane">
+      <div class="code-pane-title"><span>Source code</span><small id="code-status">Ready</small></div>
+      <textarea id="code-source" aria-label="Source code" spellcheck="false" autocomplete="off"></textarea>
+    </div>
+    <div class="code-side-panel">
+      <div class="code-pane code-input-pane">
+        <div class="code-pane-title"><span>Program input</span><small>Optional stdin</small></div>
+        <textarea id="code-stdin" aria-label="Program input" placeholder="Enter input values here, one per line"></textarea>
+      </div>
+      <div class="code-pane code-output-pane">
+        <div class="code-pane-title"><span>Output</span><button type="button" class="code-clear-output" id="code-clear">Clear</button></div>
+        <pre id="code-output" aria-live="polite">Run your program to see the output here.</pre>
+      </div>
+    </div>
+  </div>
+  <p class="code-editor-note">Programs run inside an isolated compiler service. Execution may stop automatically if code takes too long.</p>
+</section>
+<script src="{{ url_for('static',filename='code_editor.js') }}?v={{ app_version }}"></script>
+{% endblock %}
