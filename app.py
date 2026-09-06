@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.50.0'
+APP_VERSION='2.50.1'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -1067,7 +1067,11 @@ def run_schema_upgrades():
         ('exam_configs','practical_code_end_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','mock_drive_start_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','mock_drive_end_at',"VARCHAR NOT NULL DEFAULT ''"),
-        ('exam_configs','mock_section_minutes',"TEXT NOT NULL DEFAULT '{\"verbal\":0,\"reasoning\":0,\"quantitative\":0,\"technical\":0}'"),
+        # Keep the SQL migration default free of JSON colons. SQLAlchemy's
+        # text() parser can interpret :0 inside an inline JSON literal as a
+        # bind parameter on PostgreSQL. The application-level model default
+        # still supplies the complete four-section JSON for new records.
+        ('exam_configs','mock_section_minutes',"TEXT NOT NULL DEFAULT '{}'"),
         ('exam_configs','mock_minutes_per_question',"INTEGER NOT NULL DEFAULT 1"),
         ('exam_configs','mock_student_message_line1',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','mock_student_message_line2',"VARCHAR NOT NULL DEFAULT ''"),
