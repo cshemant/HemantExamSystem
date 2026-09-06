@@ -3,6 +3,7 @@ function csrfToken(){
   return el ? el.getAttribute('content') : '';
 }
 let examSubmissionInProgress=false;
+let examNavigationInProgress=false;
 function beginExamSubmission(examId,reason='MANUAL'){
   examSubmissionInProgress=true;
   try{
@@ -71,7 +72,20 @@ async function submitExamToServer(form,examId,reason){
   }
 }
 
-async function saveAnswer(examId, questionId, answer, retryCount=0){
+const answerSaveStates=new Map();
+function saveAnswer(examId,questionId,answer){
+  const key=`${Number(examId)}:${Number(questionId)}`;
+  const state=answerSaveStates.get(key)||{timer:null,inFlight:false,pending:undefined,lastSaved:undefined,retries:0};
+  state.pending=String(answer??'');state.retries=0;
+  clearTimeout(state.timer);
+  state.timer=setTimeout(()=>flushAnswerSave(examId,questionId,key),300);
+  answerSaveStates.set(key,state);
+}
+async function flushAnswerSave(examId,questionId,key){
+  const state=answerSaveStates.get(key);
+  if(!state||state.inFlight||state.pending===undefined)return;
+  if(state.pending===state.lastSaved){state.pending=undefined;return;}
+  const answer=state.pending;state.pending=undefined;state.inFlight=true;
   const status=document.getElementById('save-status');
   if(status) status.textContent='Saving…';
   try{
@@ -82,6 +96,7 @@ async function saveAnswer(examId, questionId, answer, retryCount=0){
     });
     const data=await res.json();
     if(!res.ok) throw new Error(data.error || 'Save failed');
+    state.lastSaved=answer;state.retries=0;
     if(data.submitted){
       const resultUrl='/student/submitted/'+examId;
       const form=document.getElementById('exam-form');
@@ -95,8 +110,17 @@ async function saveAnswer(examId, questionId, answer, retryCount=0){
     }
     if(status){status.textContent='Saved';setTimeout(()=>{if(status.textContent==='Saved')status.textContent='';},1000);}
   }catch(err){
-    if(status) status.textContent='Save failed — retrying…';
-    if(retryCount<10) setTimeout(()=>saveAnswer(examId,questionId,answer,retryCount+1),3000);
+    if(status) status.textContent='Save delayed — retrying…';
+    if(state.pending===undefined)state.pending=answer;
+    state.retries+=1;
+  }finally{
+    state.inFlight=false;
+    if(state.pending!==undefined && state.pending!==state.lastSaved && state.retries<=3){
+      clearTimeout(state.timer);
+      state.timer=setTimeout(()=>flushAnswerSave(examId,questionId,key),state.retries?1000*state.retries:100);
+    }else if(state.retries>3 && status){
+      status.textContent='Save failed — use Next to save this answer';
+    }
   }
 }
 function startTimer(endEpoch,serverNowEpoch){
@@ -213,7 +237,7 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
   // The outer secure shell monitors top-level visibility instead.
   if(!insideSecureShell){
     document.addEventListener('visibilitychange',async()=>{
-      if(examSubmissionInProgress)return;
+      if(examSubmissionInProgress||examNavigationInProgress)return;
       if(document.hidden){const data=await logIntegrity(examId,'tab_hidden','Exam tab became hidden');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();}
     });
   }
@@ -223,7 +247,7 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
       catch(_err){fullscreenBtn.textContent='Full Screen Unavailable';}
     });}
     document.addEventListener('fullscreenchange',async()=>{
-      if(examSubmissionInProgress)return;
+      if(examSubmissionInProgress||examNavigationInProgress)return;
       if(document.fullscreenElement){enteredFullscreen=true;if(fullscreenBtn)fullscreenBtn.textContent='Full Screen Active';return;}
       if(enteredFullscreen){const data=await logIntegrity(examId,'fullscreen_exit','Full-screen mode exited');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();if(fullscreenBtn)fullscreenBtn.textContent='Re-enter Full Screen';}
     });
@@ -422,15 +446,17 @@ function initFreeAnswerAutosave(){
     input.addEventListener('blur',()=>{
       const examId=Number(input.getAttribute('data-autosave-exam'));
       const questionId=Number(input.getAttribute('data-autosave-question'));
+      const key=`${examId}:${questionId}`;
+      clearTimeout(freeAnswerTimers.get(key));freeAnswerTimers.delete(key);
       saveAnswer(examId,questionId,input.value);
     });
   });
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initFreeAnswerAutosave); else initFreeAnswerAutosave();
 
-function startExamHeartbeat(examId,seconds=15){
+function startExamHeartbeat(examId,seconds=25){
   try{fetch('/student/exam-page-loaded',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify({exam_id:examId,state:document.hidden?'hidden':'active'})});}catch(_err){}
-  const interval=Math.max(10,Math.min(60,Number(seconds)||15))*1000;
+  const interval=Math.max(20,Math.min(60,Number(seconds)||25))*1000;
   const ping=async(state='active')=>{
     try{await fetch('/student/heartbeat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify({exam_id:examId,state})});}catch(_err){}
   };
@@ -438,6 +464,24 @@ function startExamHeartbeat(examId,seconds=15){
   window.addEventListener('online',()=>ping('online'));
   window.addEventListener('offline',()=>ping('offline'));
 }
+
+function initSingleFlightExamNavigation(){
+  const form=document.getElementById('exam-form');
+  if(!form)return;
+  form.addEventListener('submit',event=>{
+    if(examNavigationInProgress||examSubmissionInProgress){event.preventDefault();return;}
+    examNavigationInProgress=true;
+    // Defer disabling until the browser has captured the clicked submitter's
+    // formaction. The server also checks expected_position under a row lock.
+    setTimeout(()=>{
+      form.querySelectorAll('button[type="submit"]').forEach(button=>{
+        button.disabled=true;
+        if(button.id==='sequential-next')button.textContent='Loading…';
+      });
+    },0);
+  });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initSingleFlightExamNavigation);else initSingleFlightExamNavigation();
 
 function initQuestionTypeForms(){
   document.querySelectorAll('[data-question-definition-form]').forEach(form=>{

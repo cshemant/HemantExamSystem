@@ -15,5 +15,5 @@
     <form method="post" action="{{ url_for('submit_exam',exam_id=exam.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Submit Mock Drive</button></form>
   {% endif %}
 </section></div>
-<script>startTimer({{ end_epoch }},{{ server_now_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});</script>
+<script>startTimer({{ end_epoch }},{{ server_now_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 25 }});</script>
 {% endblock %}

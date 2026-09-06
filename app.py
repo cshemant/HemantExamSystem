@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.50.1'
+APP_VERSION='2.50.2'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -145,7 +145,18 @@ cookie_secure=os.getenv('COOKIE_SECURE','1' if APP_MODE=='online' else '0').stri
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=cookie_secure,MAX_CONTENT_LENGTH=10*1024*1024)
 if APP_MODE=='online': app.wsgi_app=ProxyFix(app.wsgi_app,x_for=1,x_proto=1,x_host=1,x_port=1)
 
-engine=create_engine(DATABASE_URL,pool_pre_ping=True,connect_args={'check_same_thread':False,'timeout':10} if DATABASE_URL.startswith('sqlite') else {})
+if DATABASE_URL.startswith('sqlite'):
+    engine=create_engine(DATABASE_URL,pool_pre_ping=True,connect_args={'check_same_thread':False,'timeout':10})
+else:
+    # Pool totals multiply by the number of Gunicorn workers. Conservative
+    # per-process defaults protect small Render and Cloud SQL instances.
+    engine=create_engine(
+        DATABASE_URL,pool_pre_ping=True,
+        pool_size=max(1,int(os.getenv('DB_POOL_SIZE','2'))),
+        max_overflow=max(0,int(os.getenv('DB_MAX_OVERFLOW','2'))),
+        pool_timeout=max(3,int(os.getenv('DB_POOL_TIMEOUT','10'))),
+        pool_recycle=max(60,int(os.getenv('DB_POOL_RECYCLE','300'))),
+    )
 if DATABASE_URL.startswith('sqlite'):
     @event.listens_for(engine,'connect')
     def _sqlite_connection_pragmas(dbapi_connection,_connection_record):
@@ -706,7 +717,7 @@ class ExamSecurityPolicy(Base):
     exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
     require_candidate_checkin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     require_exam_pin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
-    heartbeat_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=15)
+    heartbeat_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=25)
     # V2.20 secure-practical defaults. These remain editable after the one-time
     # default profile is applied, so a faculty member can relax a setting later.
     strict_start_window:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
@@ -1122,7 +1133,7 @@ def get_exam_security_policy(s,exam_id,create=False):
     row=s.scalar(select(ExamSecurityPolicy).where(ExamSecurityPolicy.exam_id==exam_id))
     if not row and create:
         row=ExamSecurityPolicy(
-            exam_id=exam_id,require_candidate_checkin=False,require_exam_pin=False,heartbeat_seconds=15,
+            exam_id=exam_id,require_candidate_checkin=False,require_exam_pin=False,heartbeat_seconds=25,
             strict_start_window=False,start_grace_minutes=5,auto_submit_on_integrity_limit=False,
             defer_results_until_end=False,result_release_at='',block_ip_roll_switch=False,practical_defaults_applied=False,
             updated_at=now_iso()
@@ -3656,6 +3667,9 @@ def _diagnostic_event(s,attempt,event_type,details=''):
     s.add(AttemptDiagnosticEvent(attempt_id=attempt.id,event_type=str(event_type)[:60],details=str(details)[:1000],created_at=now_iso()))
 
 def finalize_attempt(s,attempt,reason='SYSTEM_FINALIZE'):
+    # Serialize manual, timer and integrity submissions on the attempt row.
+    locked=s.scalar(select(Attempt).where(Attempt.id==attempt.id).with_for_update().execution_options(populate_existing=True))
+    if locked is not None:attempt=locked
     if attempt.status!='submitted':
         diag=_attempt_diagnostic(s,attempt,True)
         diag.submission_reason=(reason or 'SYSTEM_FINALIZE')[:60];diag.updated_at=now_iso()
@@ -7573,7 +7587,7 @@ def import_edge_exam_package():
         easy=int(cfg_data.get('easy_pct') or 30);medium=int(cfg_data.get('medium_pct') or 50);hard=int(cfg_data.get('hard_pct') or 20)
         if easy+medium+hard!=100:easy,medium,hard=30,50,20
         cfg.easy_pct=max(0,easy);cfg.medium_pct=max(0,medium);cfg.hard_pct=max(0,hard);cfg.unit_weights=str(cfg_data.get('unit_weights') or '')[:2000];cfg.randomize_questions=bool(cfg_data.get('randomize_questions',True));cfg.shuffle_options=bool(cfg_data.get('shuffle_options',True));cfg.require_fullscreen=bool(cfg_data.get('require_fullscreen',False));cfg.tab_switch_limit=max(0,min(100,int(cfg_data.get('tab_switch_limit') or 3)));cfg.exam_type=str(cfg_data.get('exam_type') or 'regular')[:30];cfg.practical_experiment_no=normalize_practical_exam_no(cfg_data.get('practical_experiment_no'));cfg.practical_code_start_at=str(cfg_data.get('practical_code_start_at') or '')[:40];cfg.practical_code_end_at=str(cfg_data.get('practical_code_end_at') or '')[:40];cfg.mock_drive_start_at=str(cfg_data.get('mock_drive_start_at') or '')[:40];cfg.mock_drive_end_at=str(cfg_data.get('mock_drive_end_at') or '')[:40];cfg.mock_section_minutes=str(cfg_data.get('mock_section_minutes') or json.dumps(MOCK_SECTION_DEFAULT_MINUTES,separators=(',',':')))[:500];cfg.mock_minutes_per_question=max(1,min(60,int(cfg_data.get('mock_minutes_per_question') or 1)));cfg.mock_student_message_line1=str(cfg_data.get('mock_student_message_line1') or '')[:500];cfg.mock_student_message_line2=str(cfg_data.get('mock_student_message_line2') or '')[:500];cfg.sequential_min_seconds=max(0,min(120,int(cfg_data.get('sequential_min_seconds') or 10)));cfg.last_generation_summary=f'Imported from encrypted Edge package {pid}.';cfg.updated_at=now_iso()
-        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(10,min(60,int(security_data.get('heartbeat_seconds') or 15)));security.strict_start_window=bool(security_data.get('strict_start_window',False));security.start_grace_minutes=max(0,min(60,int(security_data.get('start_grace_minutes') or 5)));security.auto_submit_on_integrity_limit=bool(security_data.get('auto_submit_on_integrity_limit',False));security.defer_results_until_end=bool(security_data.get('defer_results_until_end',False));security.result_release_at=str(security_data.get('result_release_at') or '');security.block_ip_roll_switch=bool(security_data.get('block_ip_roll_switch',False));security.practical_defaults_applied=bool(security_data.get('practical_defaults_applied',False));security.updated_at=now_iso()
+        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(20,min(60,int(security_data.get('heartbeat_seconds') or 25)));security.strict_start_window=bool(security_data.get('strict_start_window',False));security.start_grace_minutes=max(0,min(60,int(security_data.get('start_grace_minutes') or 5)));security.auto_submit_on_integrity_limit=bool(security_data.get('auto_submit_on_integrity_limit',False));security.defer_results_until_end=bool(security_data.get('defer_results_until_end',False));security.result_release_at=str(security_data.get('result_release_at') or '');security.block_ip_roll_switch=bool(security_data.get('block_ip_roll_switch',False));security.practical_defaults_applied=bool(security_data.get('practical_defaults_applied',False));security.updated_at=now_iso()
         if cfg.exam_type=='practical_exam' and not security.practical_defaults_applied:apply_practical_exam_security_defaults(s,exam.id,cfg,security)
         for idx,item in enumerate(qrows,1):
             if not isinstance(item,dict):raise ValueError(f'Question {idx} is malformed.')
@@ -7666,7 +7680,7 @@ def exam_builder(exam_id):
         action=request.form.get('action','save')
         try:
             qcount=max(1,int(request.form.get('question_count','20')));pool_size=max(qcount,int(request.form.get('pool_size',str(qcount))))
-            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(10,min(60,int(request.form.get('heartbeat_seconds','15') or 15)));start_grace_minutes=max(0,min(60,int(request.form.get('start_grace_minutes','5') or 5)));sequential_min_seconds=max(0,min(120,int(request.form.get('sequential_min_seconds','10') or 10)))
+            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(20,min(60,int(request.form.get('heartbeat_seconds','25') or 25)));start_grace_minutes=max(0,min(60,int(request.form.get('start_grace_minutes','5') or 5)));sequential_min_seconds=max(0,min(120,int(request.form.get('sequential_min_seconds','10') or 10)))
             section_minutes={key:max(0,min(240,int(request.form.get(f'mock_{key}_minutes') or 0))) for key in MOCK_DRIVE_SECTIONS}
             mock_minutes_per_question=max(1,min(60,int(request.form.get('mock_minutes_per_question','1') or 1)))
         except ValueError:flash('Blueprint numeric values are invalid.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
@@ -9373,7 +9387,7 @@ def select_mock_drive_section(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
     if not attempt or attempt.status=='submitted' or not cfg or cfg.exam_type!='mock_drive':abort(404)
     if not secure_exam_device_allowed(s,attempt):abort(409)
-    progress=_mock_drive_progress(s,attempt,create=True);completed=_mock_progress_list(progress.completed_sections);order=_mock_progress_list(progress.section_order)
+    progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True);completed=_mock_progress_list(progress.completed_sections);order=_mock_progress_list(progress.section_order)
     section=(request.form.get('section') or '').strip().lower()
     if progress.active_section:
         flash('Complete the current section before selecting another one.','error')
@@ -9392,7 +9406,11 @@ def complete_mock_drive_section(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
     if not attempt or attempt.status=='submitted' or not cfg or cfg.exam_type!='mock_drive':abort(404)
     if not secure_exam_device_allowed(s,attempt):abort(409)
-    progress=_mock_drive_progress(s,attempt,create=True);section=(progress.active_section or '').strip();qids=_mock_section_question_ids(s,attempt,section)
+    progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+    expected=request.form.get('expected_position',type=int)
+    if expected is not None and expected!=int(progress.current_question_position or 1):
+        s.rollback();return redirect(_mock_drive_resume_url(s,exam_id),code=303)
+    section=(progress.active_section or '').strip();qids=_mock_section_question_ids(s,attempt,section)
     if not section or not qids:return redirect(_mock_drive_resume_url(s,exam_id))
     questions={q.id:q for q in s.scalars(select(Question).where(Question.id.in_(qids))).all()}
     for qid,question in questions.items():
@@ -9453,13 +9471,17 @@ def next_exam_question(exam_id):
         security=get_exam_security_policy(s,exam_id,create=False)
         if security and security.require_exam_pin and exam_pin_is_verified(exam_id):
             token=create_secure_exam_launch_token(exam_id)
-            return redirect(url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=token))
-        return redirect(url_for('take_exam',exam_id=exam_id))
+            return redirect(url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=token),code=303)
+        return redirect(url_for('take_exam',exam_id=exam_id),code=303)
 
     if not attempt or attempt.status=='submitted':return redirect(url_for('submitted',exam_id=exam_id))
     if cfg and cfg.exam_type=='mock_drive':
         if not secure_exam_device_allowed(s,attempt):flash('This exam is locked to another device.','error');return redirect(url_for('student_dashboard'))
-        progress=_mock_drive_progress(s,attempt,create=True);section=(progress.active_section or '').strip();qids=_mock_section_question_ids(s,attempt,section)
+        progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+        expected=request.form.get('expected_position',type=int)
+        if expected is not None and expected!=int(progress.current_question_position or 1):
+            s.rollback();return resume_current_question()
+        section=(progress.active_section or '').strip();qids=_mock_section_question_ids(s,attempt,section)
         current=max(1,min(int(progress.current_question_position or 1),len(qids) or 1));qid=qids[current-1] if qids else 0;question=s.get(Question,qid) if qid else None;values=request.form.getlist(f'q_{qid}') if qid else []
         if values:
             value=','.join(values) if question and canonical_question_type(question.question_type)=='multiple_select' else values[0]
@@ -9474,7 +9496,11 @@ def next_exam_question(exam_id):
     if not cfg or not cfg.secure_sequential:return resume_current_question()
     if not secure_exam_device_allowed(s,attempt):flash('This exam is locked to another device.','error');return redirect(url_for('student_dashboard'))
     if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return redirect(url_for('submitted',exam_id=exam_id))
-    progress=_sequential_progress(s,attempt,create=True);aq=_attempt_question_at_position(s,attempt,progress.current_position)
+    progress=s.scalar(select(SequentialAttemptProgress).where(SequentialAttemptProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _sequential_progress(s,attempt,create=True)
+    expected=request.form.get('expected_position',type=int)
+    if expected is not None and expected!=int(progress.current_position or 1):
+        s.rollback();return resume_current_question()
+    aq=_attempt_question_at_position(s,attempt,progress.current_position)
     if not aq:flash('Current question could not be resolved.','error');s.commit();return resume_current_question()
     question=s.get(Question,aq.question_id);field=f'q_{aq.question_id}';values=request.form.getlist(field)
     if values:
@@ -9491,7 +9517,7 @@ def next_exam_question(exam_id):
         flash(f'Please spend at least {minimum} seconds on this question. {minimum-elapsed} second(s) remaining.','error');s.commit();return resume_current_question()
     total=s.scalar(select(func.count()).select_from(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id)) or 0
     if progress.current_position<total:
-        progress.current_position+=1;progress.question_started_at=now_iso();progress.updated_at=now_iso();_diagnostic_event(s,attempt,'question_advanced',f'position={progress.current_position}; previous_elapsed={elapsed}s; answered={1 if answered else 0}');s.commit()
+        progress.current_position+=1;progress.question_started_at=now_iso();progress.updated_at=now_iso();s.commit()
     return resume_current_question()
 
 @app.route('/student/exam/<int:exam_id>/previous-question',methods=['POST'])
@@ -9499,7 +9525,10 @@ def next_exam_question(exam_id):
 def previous_mock_drive_question(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
     if not attempt or attempt.status=='submitted' or not cfg or cfg.exam_type!='mock_drive':return redirect(url_for('student_dashboard'))
-    progress=_mock_drive_progress(s,attempt,create=True)
+    progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+    expected=request.form.get('expected_position',type=int)
+    if expected is not None and expected!=int(progress.current_question_position or 1):
+        s.rollback();return redirect(_mock_drive_resume_url(s,exam_id),code=303)
     if progress.active_section and int(progress.current_question_position or 1)>1:
         progress.current_question_position-=1;progress.question_started_at=now_iso();progress.updated_at=now_iso();s.commit()
     return redirect(_mock_drive_resume_url(s,exam_id))
@@ -9579,9 +9608,10 @@ def student_exam_page_loaded():
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt:return jsonify(saved=False),404
     diag=_attempt_diagnostic(s,attempt,True)
-    if not diag.page_loaded_at:diag.page_loaded_at=now_iso()
+    first_load=not diag.page_loaded_at
+    if first_load:diag.page_loaded_at=now_iso()
     diag.updated_at=now_iso()
-    _diagnostic_event(s,attempt,'page_loaded',f'state={str(data.get("state") or "active")[:30]}')
+    if first_load:_diagnostic_event(s,attempt,'page_loaded',f'state={str(data.get("state") or "active")[:30]}')
     s.commit();return jsonify(saved=True,server_time=now_iso())
 
 @app.route('/student/heartbeat',methods=['POST'])
@@ -9595,13 +9625,13 @@ def student_heartbeat():
     if not secure_exam_device_allowed(s,attempt):return jsonify(saved=False,device_locked=True),409
     device_lock=s.scalar(select(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam_id,ExamDeviceLock.student_id==attempt.student_id))
     if device_lock:device_lock.last_seen_at=now_iso()
-    count=s.scalar(select(func.count()).select_from(Answer).where(Answer.attempt_id==attempt.id)) or 0
     row=s.scalar(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id==attempt.id));fingerprint=hashlib.sha256(((request.headers.get('User-Agent') or '')+'|'+(request.remote_addr or '')).encode('utf-8')).hexdigest()[:24]
     state=str(data.get('state') or 'active')[:30]
-    if not row:row=AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=int(count),client_state=state,client_fingerprint=fingerprint);s.add(row)
-    else:row.last_seen_at=now_iso();row.answer_count=int(count);row.client_state=state;row.client_fingerprint=fingerprint
+    if not row:
+        count=s.scalar(select(func.count()).select_from(Answer).where(Answer.attempt_id==attempt.id)) or 0
+        row=AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=int(count),client_state=state,client_fingerprint=fingerprint);s.add(row)
+    else:row.last_seen_at=now_iso();row.client_state=state;row.client_fingerprint=fingerprint
     diag=_attempt_diagnostic(s,attempt,True);diag.last_client_state=state;diag.updated_at=now_iso()
-    _diagnostic_event(s,attempt,'heartbeat',f'state={state}; answers={int(count)}')
     s.commit();return jsonify(saved=True,server_time=now_iso())
 
 @app.route('/student/exam/<int:exam_id>/submit',methods=['POST'])
