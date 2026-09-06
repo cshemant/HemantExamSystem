@@ -85,7 +85,7 @@
     if(examFinished || !shellActive || submissionInProgress)return;
     if(!document.hidden)return;
     const data=await logIntegrity({{ exam.id }},'tab_hidden','Secure exam tab/window became hidden',{navigateOnSubmit:false});
-    if(data && data.submitted){finishShell('{{ url_for("submitted",exam_id=exam.id) }}');}
+    if(data && data.submitted){showLockedScreen(data.message);}
   });
 
   document.addEventListener('fullscreenchange',async()=>{
@@ -98,10 +98,24 @@
     if(!fullscreenEstablished)return;
     ensureGuard().hidden=false;
     const data=await logIntegrity({{ exam.id }},'fullscreen_exit','Secure exam shell left full-screen',{navigateOnSubmit:false});
-    if(data && data.submitted){finishShell('{{ url_for("submitted",exam_id=exam.id) }}');}
+    if(data && data.submitted){showLockedScreen(data.message);}
   });
 
-  function finishShell(url){
+  function showLockedScreen(message){
+    if(examFinished)return;
+    examFinished=true;submissionInProgress=true;shellActive=false;
+    document.body.classList.add('secure-exam-running');
+    if(guard)guard.hidden=true;
+    verification.hidden=true;shell.hidden=false;shell.setAttribute('aria-hidden','false');
+    shell.innerHTML=`<div class="secure-exam-locked-card" role="alert"><div class="eyebrow">Integrity lock</div><h1>Exam locked and submitted</h1><p>${escapeHtml(message || 'The integrity limit was reached. Your exam has been submitted and cannot be reopened.')}</p><a class="btn" href="{{ url_for('submitted',exam_id=exam.id) }}" target="_top">View submission status</a></div>`;
+    try{if(navigator.keyboard && navigator.keyboard.unlock)navigator.keyboard.unlock();}catch(_err){}
+  }
+
+  function escapeHtml(value){
+    const node=document.createElement('span');node.textContent=String(value || '');return node.innerHTML;
+  }
+
+  async function finishShell(url){
     if(examFinished)return;
     examFinished=true;
     shellActive=false;
@@ -109,10 +123,13 @@
     if(guard)guard.hidden=true;
     shell.hidden=true;shell.setAttribute('aria-hidden','true');shell.replaceChildren();
     try{if(navigator.keyboard && navigator.keyboard.unlock)navigator.keyboard.unlock();}catch(_err){}
-    // Navigation itself ends full-screen. Do not wait on exitFullscreen(),
-    // because waiting here could leave the student on an empty shell page.
-    try{if(document.fullscreenElement && document.exitFullscreen)document.exitFullscreen().catch(()=>{});}catch(_err){}
-    window.location.replace(url);
+    // Explicitly leave full-screen before top-level navigation. The short
+    // timeout prevents a browser-specific Fullscreen API delay from trapping
+    // the student on the secure shell.
+    try{if(document.fullscreenElement && document.exitFullscreen)await Promise.race([document.exitFullscreen().catch(()=>{}),new Promise(resolve=>setTimeout(resolve,400))]);}catch(_err){}
+    let destination='{{ url_for("submitted",exam_id=exam.id) }}';
+    try{const parsed=new URL(url,window.location.origin);if(parsed.origin===window.location.origin)destination=parsed.pathname+parsed.search+parsed.hash;}catch(_err){}
+    window.location.replace(destination);
   }
 
   function launchExam(url){
@@ -134,7 +151,7 @@
       try{
         const loc=frame.contentWindow.location;
         const path=loc.pathname || '';
-        if(path.startsWith('/student/submitted/') || path==='/student'){finishShell(loc.href);return;}
+        if(path.startsWith('/student/submitted/') || path==='/student'){finishShell(path+(loc.search||'')+(loc.hash||''));return;}
         // A new exam must always begin with Q1 fully visible. This also avoids
         // the sticky exam header covering the first question in the iframe.
         frame.contentWindow.scrollTo(0,0);
@@ -154,6 +171,9 @@
       submissionInProgress=true;
       finishShell(data.url || '{{ url_for("submitted",exam_id=exam.id) }}');
     }
+    if(data.type==='secure-exam-locked' && Number(data.exam_id)==={{ exam.id }}){
+      showLockedScreen(data.message);
+    }
   });
 
   window.addEventListener('popstate',()=>{
@@ -162,7 +182,7 @@
     if(fullscreenEstablished && !document.fullscreenElement)ensureGuard().hidden=false;
   });
 
-  setInterval(()=>{remaining=Math.max(0,remaining-1);countdownEl.textContent=remaining;if(remaining<=0)refreshPin();},1000);
+  setInterval(()=>{if(shellActive||examFinished)return;remaining=Math.max(0,remaining-1);countdownEl.textContent=remaining;if(remaining<=0)refreshPin();},1000);
 
   form.addEventListener('submit',async event=>{
     event.preventDefault();

@@ -1,11 +1,12 @@
 {% extends 'base.html' %}{% block content %}
+<script>if(window.parent!==window){const resultPath='{{ url_for("submitted",exam_id=exam.id) }}';try{window.top.location.replace(resultPath);}catch(_err){try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:{{ exam.id }},url:resultPath},window.location.origin);}catch(_ignored){}}}</script>
 <div class="page-head"><div class="eyebrow">Submission complete</div><h1>{{ display_title }}</h1></div>
 <div class="card result-card">
   <div class="result-main">
     {% if not results_released %}
       <h2>Submission Received</h2>
       <div class="result-score">Result locked</div>
-      <p class="muted">Your exam has been submitted successfully. Marks and correct answers will be available only after the common exam window closes{% if result_release_at %} at {{ result_release_at.strftime('%d %b %Y, %I:%M %p') }}{% endif %}.</p>
+      <p class="muted">Your exam has been submitted successfully. Marks and correct answers will be released{% if result_release_at %} on {{ result_release_at.strftime('%d %b %Y, %I:%M %p') }}{% else %} after the configured release time{% endif %}.</p>
     {% elif attempt.grading_status=='pending' %}
       <h2>Submission Received</h2><div class="result-score">Pending grading</div><p class="muted">Your descriptive answer(s) require faculty grading. The final score will appear after grading is completed.</p>
     {% else %}
@@ -15,7 +16,7 @@
     {% if violations %}<p style="margin-top:14px"><span class="badge activity-neutral">Exam activity monitoring: {{ violations }} event{% if violations != 1 %}s{% endif %} recorded</span></p>{% endif %}
   </div>
   <div class="result-performance">
-    {% if not results_released %}<span class="result-grade-label">Performance</span><span class="badge gray">Available after exam window</span>
+    {% if not results_released %}<span class="result-grade-label">Performance</span><span class="badge gray">Available{% if result_release_at %} {{ result_release_at.strftime('%d %b %Y, %I:%M %p') }}{% else %} later{% endif %}</span>
     {% elif attempt.grading_status=='pending' %}<span class="result-grade-label">Performance</span><span class="badge warning">Awaiting faculty grading</span>
     {% else %}<span class="result-grade-label">Performance</span><span class="result-grade {{ grade_class }}">{{ grade }}</span><span class="result-percent">{{ percentage }}%</span>{% endif %}
   </div>

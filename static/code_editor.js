@@ -81,7 +81,8 @@
     if(!source.value.trim()){output.textContent='Write some code before selecting Run.';output.className='code-output-error';return;}
     run.disabled=true;status.textContent='Running…';output.textContent='Compiling and running…';output.className='';
     try{
-      const response=await fetch(root.dataset.runUrl,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':document.querySelector('meta[name="csrf-token"]').content},body:JSON.stringify({language:language.value,source:source.value,stdin:stdin.value})});
+      const payload={language:language.value,source:source.value,stdin:stdin.value};if(root.dataset.examId)payload.exam_id=Number(root.dataset.examId);
+      const response=await fetch(root.dataset.runUrl,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':document.querySelector('meta[name="csrf-token"]').content},body:JSON.stringify(payload)});
       const result=await response.json().catch(()=>({ok:false,error:'The server returned an invalid response.'}));
       if(!response.ok||!result.ok)throw new Error(result.error||'Code execution failed.');
       status.textContent='Queued · '+(result.position||1);output.textContent='Program accepted. Waiting safely in the classroom queue…';

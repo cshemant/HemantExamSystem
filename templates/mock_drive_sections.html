@@ -1,0 +1,19 @@
+{% extends 'base.html' %}{% block content %}{% set manual_fullscreen = cfg and cfg.require_fullscreen and not (security and security.require_exam_pin) %}
+<div class="exam-head"><span class="exam-title">{{ display_title }}</span><span id="save-status" class="save-status"></span>{% if manual_fullscreen %}<button type="button" id="fullscreen-btn" class="btn small secondary">Enter Full Screen</button>{% endif %}<span class="timer">Time left: <span id="timer"></span></span></div>
+<div id="exam-form" data-exam-integrity="{{ exam.id }}" data-secure-shell="{{ '1' if secure_shell else '0' }}"><section class="card mock-section-picker">
+  <h1>{% if sections %}Choose your next section{% else %}All sections completed{% endif %}</h1>
+  <div class="mock-drive-student-schedule"><div><span>Exam starts</span><strong>{{ cfg.mock_drive_start_at|replace('T',' ') }}</strong></div><div><span>Exam ends</span><strong>{{ cfg.mock_drive_end_at|replace('T',' ') }}</strong></div><div><span>Minimum per question</span><strong>{{ cfg.sequential_min_seconds }} seconds</strong></div></div>
+  {% if cfg.mock_student_message_line1 or cfg.mock_student_message_line2 %}<div class="mock-student-messages" aria-label="Important exam messages">{% if cfg.mock_student_message_line1 %}<p>{{ cfg.mock_student_message_line1 }}</p>{% endif %}{% if cfg.mock_student_message_line2 %}<p>{{ cfg.mock_student_message_line2 }}</p>{% endif %}</div>{% endif %}
+  {% if completed %}<p class="mini-meta">Completed and locked: {{ completed|join(', ') }}</p>{% endif %}
+  {% if sections %}
+    <p>Start any available section. After starting, you must answer every question in that section before moving to another section. A completed section cannot be reopened.</p>
+    <div class="mock-section-grid">
+    {% for section in sections %}<form method="post" action="{{ url_for('select_mock_drive_section',exam_id=exam.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="section" value="{{ section.key }}"><button class="mock-section-card" type="submit"><strong>{{ section.label }}</strong><span>{{ section.count }} question(s) · {{ section.minutes }} minutes</span><small>Start timed section →</small></button></form>{% endfor %}
+    </div>
+  {% else %}
+    <p>Review is no longer available because every section is locked. Submit the complete mock drive when you are ready.</p>
+    <form method="post" action="{{ url_for('submit_exam',exam_id=exam.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Submit Mock Drive</button></form>
+  {% endif %}
+</section></div>
+<script>startTimer({{ end_epoch }},{{ server_now_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 15 }});</script>
+{% endblock %}

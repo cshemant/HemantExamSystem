@@ -45,6 +45,12 @@ async function submitExamToServer(form,examId,reason){
     const payload=await response.json().catch(()=>({ok:false,message:'Submission response could not be read.'}));
 
     if(response.ok && payload.ok && payload.submitted && payload.submitted_url){
+      // A secure exam runs in a same-origin iframe. Navigate the top-level
+      // window directly so the result can never remain trapped in that frame.
+      try{
+        const destination=new URL(payload.submitted_url,window.location.origin);
+        if(destination.origin===window.location.origin){window.top.location.replace(destination.pathname+destination.search+destination.hash);return {ok:true,submitted:true,navigating:true};}
+      }catch(_err){}
       try{
         window.parent.postMessage({
           type:'secure-exam-submitted',
@@ -53,7 +59,7 @@ async function submitExamToServer(form,examId,reason){
         },window.location.origin);
         return {ok:true,submitted:true};
       }catch(_err){}
-      window.top.location.replace(payload.submitted_url);
+      window.location.replace(payload.submitted_url);
       return {ok:true,submitted:true,navigating:true};
     }
 
@@ -121,6 +127,39 @@ function startTimer(endEpoch,serverNowEpoch){
   };
   tick();handle=setInterval(tick,1000);
 }
+function startSectionTimer(endEpoch,serverNowEpoch,expiryUrl){
+  const timer=document.getElementById('timer'),form=document.getElementById('exam-form');
+  const initialLeft=Math.max(0,Number(endEpoch)-Number(serverNowEpoch));
+  const started=(window.performance&&performance.now)?performance.now():0;let handle=null,expired=false;
+  const tick=()=>{
+    const elapsed=started&&window.performance?Math.max(0,(performance.now()-started)/1000):0;
+    const left=Math.max(0,Math.ceil(initialLeft-elapsed)),h=Math.floor(left/3600),m=Math.floor((left%3600)/60),s=left%60;
+    if(timer)timer.textContent=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    if(left<=0&&!expired){
+      expired=true;if(handle)clearInterval(handle);
+      if(form){
+        const examId=Number(form.getAttribute('data-exam-integrity')||0);
+        fetch(expiryUrl,{method:'POST',body:new FormData(form),credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest','Accept':'application/json'},cache:'no-store'})
+          .then(async response=>({response,payload:await response.json().catch(()=>null)}))
+          .then(({response,payload})=>{
+            if(!response.ok||!payload)throw new Error('Section expiry response failed');
+            if(payload.submitted&&payload.submitted_url){
+              examSubmissionInProgress=true;
+              if(window.parent!==window){
+                window.parent.postMessage({type:'secure-exam-submitting',exam_id:examId,reason:'TIME_EXPIRED'},window.location.origin);
+                window.parent.postMessage({type:'secure-exam-submitted',exam_id:examId,url:payload.submitted_url},window.location.origin);
+                return;
+              }
+              window.location.replace(payload.submitted_url);return;
+            }
+            if(payload.exam_url)window.location.replace(payload.exam_url);
+          })
+          .catch(()=>{form.action=expiryUrl;form.method='post';form.submit();});
+      }
+    }
+  };
+  tick();handle=setInterval(tick,1000);
+}
 async function logIntegrity(examId,eventType,details='',options={}){
   try{
     const res=await fetch('/student/integrity-event',{
@@ -139,10 +178,10 @@ async function logIntegrity(examId,eventType,details='',options={}){
         // cleanly.  The fallback keeps normal/non-shell exam pages working.
         const secureFrame=document.body && document.body.classList.contains('secure-exam-shell-page') && window.parent!==window;
         if(secureFrame){
-          try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:Number(examId),url:resultUrl},window.location.origin);return data;}catch(_err){}
+          try{window.parent.postMessage({type:'secure-exam-locked',exam_id:Number(examId),url:resultUrl,message:data.message || ''},window.location.origin);return data;}catch(_err){}
         }
         if(window.parent!==window){
-          try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:Number(examId),url:resultUrl},window.location.origin);return data;}catch(_err){}
+          try{window.parent.postMessage({type:'secure-exam-locked',exam_id:Number(examId),url:resultUrl,message:data.message || ''},window.location.origin);return data;}catch(_err){}
         }
         window.location.href=resultUrl;
       }
