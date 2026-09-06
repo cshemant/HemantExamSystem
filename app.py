@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from functools import wraps
 from urllib.parse import urlparse
+from urllib.request import Request as URLRequest, urlopen
+from urllib.error import HTTPError, URLError
 
 from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
 from dotenv import load_dotenv
@@ -33,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.38.0'
+APP_VERSION='2.50.2'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -78,6 +80,28 @@ except Exception:
 
 APP_MODE=os.getenv('APP_MODE','offline').strip().lower()
 if APP_MODE not in {'offline','online'}: raise RuntimeError('APP_MODE must be offline or online')
+CODE_RUNNER_WORKER_MODE=os.getenv('CODE_RUNNER_WORKER_MODE','0').strip().lower() in {'1','true','yes','on'}
+
+# Student code is executed by an isolated Piston-compatible runner.  Never run
+# untrusted student programs as operating-system processes on the exam server.
+CODE_RUNNER_API_URL=(os.getenv('CODE_RUNNER_API_URL','http://127.0.0.1:2000/api/v2/execute').strip() or 'http://127.0.0.1:2000/api/v2/execute')
+CODE_RUNNER_TIMEOUT_SECONDS=max(5,min(30,int(os.getenv('CODE_RUNNER_TIMEOUT_SECONDS','15'))))
+CODE_EDITOR_MAX_SOURCE_BYTES=max(1024,min(100000,int(os.getenv('CODE_EDITOR_MAX_SOURCE_BYTES','50000'))))
+CODE_EDITOR_MAX_STDIN_BYTES=max(256,min(20000,int(os.getenv('CODE_EDITOR_MAX_STDIN_BYTES','10000'))))
+CODE_EDITOR_QUEUE_LIMIT=max(10,min(500,int(os.getenv('CODE_EDITOR_QUEUE_LIMIT','100'))))
+CODE_EDITOR_LANGUAGES={
+    'c':{'label':'C','runner':'c','filename':'main.c'},
+    'cpp':{'label':'C++','runner':'c++','filename':'main.cpp'},
+    'java':{'label':'Java','runner':'java','filename':'Main.java'},
+    'python':{'label':'Python','runner':'python','filename':'main.py'},
+    'php':{'label':'PHP','runner':'php','filename':'main.php'},
+}
+MOCK_DRIVE_SECTIONS={
+    'verbal': 'Verbal Ability',
+    'reasoning': 'Logical Reasoning and Aptitude',
+    'quantitative': 'Quantitative Ability',
+    'technical': 'Technical Coding / Problem Solving',
+}
 
 def normalize_database_url(raw):
     if not raw:
@@ -103,9 +127,13 @@ legacy_admin_username=os.getenv('LEGACY_ADMIN_USERNAME','admin').strip() or 'adm
 admin_password=(os.getenv('SUPER_ADMIN_PASSWORD') or os.getenv('ADMIN_PASSWORD') or '').strip()
 # Compatibility alias used by older helper code.
 admin_username=super_admin_username
-if APP_MODE=='online':
+if APP_MODE=='online' and not CODE_RUNNER_WORKER_MODE:
     if len(secret)<24: raise RuntimeError('Online mode requires a strong SECRET_KEY (24+ characters).')
     if len(admin_password)<10: raise RuntimeError('Online mode requires SUPER_ADMIN_PASSWORD or ADMIN_PASSWORD with at least 10 characters.')
+elif CODE_RUNNER_WORKER_MODE:
+    # A queue worker needs database access, but it must never require or rotate
+    # the website administrator credentials merely because it imports app.py.
+    secret=secret or 'isolated-code-runner-worker-process'
 if not secret:
     secret='offline-development-secret-change-me'
 if not admin_password and not OFFLINE_REQUIRE_SETUP:
@@ -117,7 +145,18 @@ cookie_secure=os.getenv('COOKIE_SECURE','1' if APP_MODE=='online' else '0').stri
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=cookie_secure,MAX_CONTENT_LENGTH=10*1024*1024)
 if APP_MODE=='online': app.wsgi_app=ProxyFix(app.wsgi_app,x_for=1,x_proto=1,x_host=1,x_port=1)
 
-engine=create_engine(DATABASE_URL,pool_pre_ping=True,connect_args={'check_same_thread':False,'timeout':10} if DATABASE_URL.startswith('sqlite') else {})
+if DATABASE_URL.startswith('sqlite'):
+    engine=create_engine(DATABASE_URL,pool_pre_ping=True,connect_args={'check_same_thread':False,'timeout':10})
+else:
+    # Pool totals multiply by the number of Gunicorn workers. Conservative
+    # per-process defaults protect small Render and Cloud SQL instances.
+    engine=create_engine(
+        DATABASE_URL,pool_pre_ping=True,
+        pool_size=max(1,int(os.getenv('DB_POOL_SIZE','2'))),
+        max_overflow=max(0,int(os.getenv('DB_MAX_OVERFLOW','2'))),
+        pool_timeout=max(3,int(os.getenv('DB_POOL_TIMEOUT','10'))),
+        pool_recycle=max(60,int(os.getenv('DB_POOL_RECYCLE','300'))),
+    )
 if DATABASE_URL.startswith('sqlite'):
     @event.listens_for(engine,'connect')
     def _sqlite_connection_pragmas(dbapi_connection,_connection_record):
@@ -160,6 +199,23 @@ class Student(Base):
     password_hash:Mapped[str]=mapped_column(String,nullable=False)
     created_at:Mapped[str]=mapped_column(String,nullable=False)
 
+class CodeRunJob(Base):
+    __tablename__='code_run_jobs'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    token:Mapped[str]=mapped_column(String(64),unique=True,nullable=False)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False,index=True)
+    language:Mapped[str]=mapped_column(String(20),nullable=False)
+    source_code:Mapped[str]=mapped_column(Text,nullable=False)
+    stdin_text:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    status:Mapped[str]=mapped_column(String(20),nullable=False,default='queued',index=True)
+    output:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    error:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    exit_code:Mapped[int|None]=mapped_column(Integer,nullable=True)
+    success:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+    started_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    completed_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
 class Exam(Base):
     __tablename__='exams'
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
@@ -186,6 +242,8 @@ class Question(Base):
     # Snapshot of practical-exam mapping at the time the bank question is copied.
     # Blank means this is a normal/official exam question.
     practical_experiment_no:Mapped[str]=mapped_column(String,nullable=False,default='')
+    # Mock-drive section. Blank keeps legacy/regular exams unchanged.
+    mock_section:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 class Attempt(Base):
     __tablename__='attempts'
@@ -307,6 +365,12 @@ class ExamConfig(Base):
     # institutional datetimes (YYYY-MM-DDTHH:MM:SS) in APP_TIMEZONE.
     practical_code_start_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     practical_code_end_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    mock_drive_start_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    mock_drive_end_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    mock_section_minutes:Mapped[str]=mapped_column(Text,nullable=False,default='{"verbal":0,"reasoning":0,"quantitative":0,"technical":0}')
+    mock_minutes_per_question:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
+    mock_student_message_line1:Mapped[str]=mapped_column(String,nullable=False,default='')
+    mock_student_message_line2:Mapped[str]=mapped_column(String,nullable=False,default='')
     last_generation_summary:Mapped[str]=mapped_column(String,nullable=False,default='')
     institution_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
     curriculum_subject_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
@@ -329,6 +393,21 @@ class SequentialAttemptProgress(Base):
     attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False)
     current_position:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
     question_started_at:Mapped[str]=mapped_column(String,nullable=False)
+    updated_at:Mapped[str]=mapped_column(String,nullable=False)
+
+class MockDriveProgress(Base):
+    __tablename__='mock_drive_progress'
+    __table_args__=(UniqueConstraint('attempt_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False,index=True)
+    active_section:Mapped[str]=mapped_column(String,nullable=False,default='')
+    completed_sections:Mapped[str]=mapped_column(Text,nullable=False,default='[]')
+    section_order:Mapped[str]=mapped_column(Text,nullable=False,default='[]')
+    current_question_position:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
+    furthest_question_position:Mapped[int]=mapped_column(Integer,nullable=False,default=1)
+    question_started_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    section_started_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    section_end_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class IntegrityEvent(Base):
@@ -638,13 +717,14 @@ class ExamSecurityPolicy(Base):
     exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False)
     require_candidate_checkin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     require_exam_pin:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
-    heartbeat_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=15)
+    heartbeat_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=25)
     # V2.20 secure-practical defaults. These remain editable after the one-time
     # default profile is applied, so a faculty member can relax a setting later.
     strict_start_window:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     start_grace_minutes:Mapped[int]=mapped_column(Integer,nullable=False,default=5)
     auto_submit_on_integrity_limit:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     defer_results_until_end:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    result_release_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     block_ip_roll_switch:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     practical_defaults_applied:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
@@ -965,6 +1045,7 @@ def run_schema_upgrades():
         ('questions','answer_tolerance',"VARCHAR NOT NULL DEFAULT ''"),
         ('questions','answer_case_sensitive',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('questions','practical_experiment_no',"VARCHAR NOT NULL DEFAULT ''"),
+        ('questions','mock_section',"VARCHAR NOT NULL DEFAULT ''"),
         ('answers','answer_value',"TEXT NOT NULL DEFAULT ''"),
         ('answers','manual_score',"INTEGER"),
         ('answers','grader_comment',"TEXT NOT NULL DEFAULT ''"),
@@ -988,14 +1069,30 @@ def run_schema_upgrades():
         ('exam_security_policies','start_grace_minutes',"INTEGER NOT NULL DEFAULT 5"),
         ('exam_security_policies','auto_submit_on_integrity_limit',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_policies','defer_results_until_end',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_policies','result_release_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_security_policies','block_ip_roll_switch',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_policies','practical_defaults_applied',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_configs','exam_type',"VARCHAR NOT NULL DEFAULT 'regular'"),
         ('exam_configs','practical_experiment_no',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','practical_code_start_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','practical_code_end_at',"VARCHAR NOT NULL DEFAULT ''"),
+        ('exam_configs','mock_drive_start_at',"VARCHAR NOT NULL DEFAULT ''"),
+        ('exam_configs','mock_drive_end_at',"VARCHAR NOT NULL DEFAULT ''"),
+        # Keep the SQL migration default free of JSON colons. SQLAlchemy's
+        # text() parser can interpret :0 inside an inline JSON literal as a
+        # bind parameter on PostgreSQL. The application-level model default
+        # still supplies the complete four-section JSON for new records.
+        ('exam_configs','mock_section_minutes',"TEXT NOT NULL DEFAULT '{}'"),
+        ('exam_configs','mock_minutes_per_question',"INTEGER NOT NULL DEFAULT 1"),
+        ('exam_configs','mock_student_message_line1',"VARCHAR NOT NULL DEFAULT ''"),
+        ('exam_configs','mock_student_message_line2',"VARCHAR NOT NULL DEFAULT ''"),
         ('exam_configs','secure_sequential',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_configs','sequential_min_seconds',"INTEGER NOT NULL DEFAULT 10"),
+        ('mock_drive_progress','current_question_position',"INTEGER NOT NULL DEFAULT 1"),
+        ('mock_drive_progress','furthest_question_position',"INTEGER NOT NULL DEFAULT 1"),
+        ('mock_drive_progress','question_started_at',"VARCHAR NOT NULL DEFAULT ''"),
+        ('mock_drive_progress','section_started_at',"VARCHAR NOT NULL DEFAULT ''"),
+        ('mock_drive_progress','section_end_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('audit_logs','prev_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('audit_logs','event_hash',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('practical_registers','attendance_max_marks','INTEGER NOT NULL DEFAULT 5'),
@@ -1036,9 +1133,9 @@ def get_exam_security_policy(s,exam_id,create=False):
     row=s.scalar(select(ExamSecurityPolicy).where(ExamSecurityPolicy.exam_id==exam_id))
     if not row and create:
         row=ExamSecurityPolicy(
-            exam_id=exam_id,require_candidate_checkin=False,require_exam_pin=False,heartbeat_seconds=15,
+            exam_id=exam_id,require_candidate_checkin=False,require_exam_pin=False,heartbeat_seconds=25,
             strict_start_window=False,start_grace_minutes=5,auto_submit_on_integrity_limit=False,
-            defer_results_until_end=False,block_ip_roll_switch=False,practical_defaults_applied=False,
+            defer_results_until_end=False,result_release_at='',block_ip_roll_switch=False,practical_defaults_applied=False,
             updated_at=now_iso()
         )
         s.add(row);s.flush()
@@ -1297,7 +1394,7 @@ def question_definition_from_form(form):
         selected=form.getlist('correct_answers') if hasattr(form,'getlist') else []
         answer_key=','.join(selected) if selected else (form.get('answer_key') or '')
     elif qtype=='true_false':
-        answer_key=(form.get('true_false_answer') or '').strip()
+        answer_key=(form.get('true_false_answer') or form.get('answer_key') or '').strip()
     elif qtype=='numerical':
         answer_key=(form.get('numerical_answer_key') or form.get('answer_key') or '').strip()
     elif qtype=='short_text':
@@ -1307,7 +1404,7 @@ def question_definition_from_form(form):
     else:
         answer_key=(form.get('answer_key') or '').strip()
     tolerance=(form.get('answer_tolerance') or '').strip()
-    case_sensitive=form.get('answer_case_sensitive')=='on'
+    case_sensitive=str(form.get('answer_case_sensitive') or '').strip().lower() in {'on','1','true','yes'}
     error=validate_question_definition(qtype,form.get('question',''),options,answer_key,tolerance)
     legacy=(answer_key[:1].upper() if qtype=='single_choice' and answer_key[:1].upper() in {'A','B','C','D'} else 'A')
     return {'question_type':qtype,'options':options,'answer_key':answer_key,'answer_tolerance':tolerance,'answer_case_sensitive':case_sensitive,'legacy_correct_answer':legacy,'error':error}
@@ -2257,6 +2354,9 @@ def exam_access_for_student(s,student_id,exam):
         is_practical=bool(cfg and (cfg.exam_type or '').strip().lower()=='practical_exam')
         if is_practical and (not start or not end):
             return False,'Practical Exam start/end time is not configured',matched
+        is_mock=bool(cfg and (cfg.exam_type or '').strip().lower()=='mock_drive')
+        # Without a configured window, Mock Test Drives use their calculated
+        # question-based duration and remain available like regular exams.
     if start and now<start:
         return False,f'Scheduled for {start.strftime("%d %b, %I:%M %p")}',matched
     if end and now>end:
@@ -2835,7 +2935,7 @@ def init_db():
     try:
         seed_subject_catalog(s)
         seed_placement_skills(s)
-        if APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP:
+        if (APP_MODE=='online' or not OFFLINE_REQUIRE_SETUP) and not CODE_RUNNER_WORKER_MODE:
             ensure_super_admin_identity(s)
             get_institution(s,create=True)
         # V2.20 one-time migration: existing exams already classified as
@@ -3021,7 +3121,7 @@ def security_headers(response):
     elif secure_exam_frame:
         response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
     else:
-        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+                response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: https://*.google-analytics.com https://*.googletagmanager.com; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://*.googletagmanager.com; connect-src 'self' https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     response.headers.setdefault('Cross-Origin-Opener-Policy','same-origin')
     response.headers.setdefault('Cross-Origin-Resource-Policy','same-origin')
     if APP_MODE=='online' and request.is_secure: response.headers.setdefault('Strict-Transport-Security','max-age=31536000; includeSubDomains')
@@ -3233,6 +3333,32 @@ def student_required(fn):
         return fn(*a,**kw)
     return inner
 
+def execute_student_code(language,source,stdin_text=''):
+    """Execute source with a remote sandbox and return a normalized result."""
+    cfg=CODE_EDITOR_LANGUAGES.get(language)
+    if not cfg:raise ValueError('Choose a supported programming language.')
+    if not source.strip():raise ValueError('Write some code before selecting Run.')
+    if len(source.encode('utf-8'))>CODE_EDITOR_MAX_SOURCE_BYTES:raise ValueError('The source code is too large.')
+    if len(stdin_text.encode('utf-8'))>CODE_EDITOR_MAX_STDIN_BYTES:raise ValueError('The program input is too large.')
+    payload={'language':cfg['runner'],'version':'*','files':[{'name':cfg['filename'],'content':source}],'stdin':stdin_text,'compile_timeout':8000,'run_timeout':3000,'compile_cpu_time':8000,'run_cpu_time':3000,'compile_memory_limit':268435456,'run_memory_limit':134217728}
+    req=URLRequest(CODE_RUNNER_API_URL,data=json.dumps(payload).encode('utf-8'),headers={'Content-Type':'application/json','Accept':'application/json','User-Agent':'LearnWithHemant-CodeEditor/1.0'},method='POST')
+    try:
+        with urlopen(req,timeout=CODE_RUNNER_TIMEOUT_SECONDS) as response:
+            raw=response.read(250000)
+    except HTTPError as exc:
+        detail=exc.read(1000).decode('utf-8','replace')
+        raise RuntimeError(f'Compiler service rejected the request ({exc.code}). {detail[:240]}') from exc
+    except (URLError,TimeoutError) as exc:
+        raise RuntimeError('The private code runner is unavailable. Ask the administrator to start the Code Runner service.') from exc
+    try:data=json.loads(raw.decode('utf-8'))
+    except (UnicodeDecodeError,json.JSONDecodeError) as exc:raise RuntimeError('The compiler service returned an invalid response.') from exc
+    compile_step=data.get('compile') or {};run_step=data.get('run') or {}
+    output=''.join(str(x or '') for x in (compile_step.get('stdout'),compile_step.get('stderr'),run_step.get('stdout'),run_step.get('stderr')))
+    output=output[:50000]
+    code=run_step.get('code') if run_step else compile_step.get('code')
+    success=compile_step.get('code') in (0,None) and run_step.get('code') in (0,None)
+    return {'output':output or '(Program finished with no output.)','exit_code':code,'success':success,'language':cfg['label']}
+
 def approver_required(fn):
     @wraps(fn)
     def inner(*a,**kw):
@@ -3242,6 +3368,32 @@ def approver_required(fn):
     return inner
 
 def get_attempt(s,student_id,exam_id): return s.scalar(select(Attempt).where(Attempt.student_id==student_id,Attempt.exam_id==exam_id))
+
+def _mock_drive_progress(s,attempt,create=False):
+    row=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id))
+    if not row and create:
+        sections=[]
+        qids=attempt_question_ids(s,attempt)
+        if qids:
+            used=set(s.scalars(select(Question.mock_section).where(Question.id.in_(qids))).all())
+            sections=[key for key in MOCK_DRIVE_SECTIONS if key in used]
+        row=MockDriveProgress(attempt_id=attempt.id,active_section='',completed_sections='[]',section_order=json.dumps(sections),updated_at=now_iso())
+        s.add(row);s.flush()
+    return row
+
+def _mock_progress_list(raw):
+    try:value=json.loads(raw or '[]')
+    except Exception:value=[]
+    return [str(item) for item in value if str(item) in MOCK_DRIVE_SECTIONS]
+
+def _mock_drive_resume_url(s,exam_id):
+    security=get_exam_security_policy(s,exam_id,create=False)
+    if security and security.require_exam_pin and exam_pin_is_verified(exam_id):
+        return url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=create_secure_exam_launch_token(exam_id))
+    return url_for('take_exam',exam_id=exam_id)
+
+def _mock_section_question_ids(s,attempt,section):
+    return list(s.scalars(select(AttemptQuestion.question_id).join(Question,Question.id==AttemptQuestion.question_id).where(AttemptQuestion.attempt_id==attempt.id,Question.mock_section==section).order_by(AttemptQuestion.position)).all())
 
 def student_exam_display_title(s, exam):
     """Return the stored exam title, adding a Part suffix for duplicates."""
@@ -3286,9 +3438,44 @@ def result_performance(score,total_marks):
 def get_exam_config(s,exam_id,create=False):
     cfg=s.scalar(select(ExamConfig).where(ExamConfig.exam_id==exam_id))
     if not cfg and create:
-        cfg=ExamConfig(exam_id=exam_id,question_count=0,pool_size=0,easy_pct=30,medium_pct=50,hard_pct=20,unit_weights='',randomize_questions=True,shuffle_options=True,secure_sequential=False,sequential_min_seconds=10,require_fullscreen=False,tab_switch_limit=3,exam_type='regular',practical_experiment_no='',last_generation_summary='',updated_at=now_iso())
+        cfg=ExamConfig(exam_id=exam_id,question_count=0,pool_size=0,easy_pct=30,medium_pct=50,hard_pct=20,unit_weights='',randomize_questions=True,shuffle_options=True,secure_sequential=False,sequential_min_seconds=10,require_fullscreen=False,tab_switch_limit=3,exam_type='regular',practical_experiment_no='',mock_student_message_line1='',mock_student_message_line2='',last_generation_summary='',updated_at=now_iso())
         s.add(cfg); s.flush()
     return cfg
+
+MOCK_SECTION_DEFAULT_MINUTES={'verbal':0,'reasoning':0,'quantitative':0,'technical':0}
+
+def mock_section_minutes(cfg):
+    try:raw=json.loads((getattr(cfg,'mock_section_minutes','') or '{}'))
+    except Exception:raw={}
+    result={}
+    for key in MOCK_SECTION_DEFAULT_MINUTES:
+        try:value=int(raw.get(key) or 0)
+        except (TypeError,ValueError):value=0
+        result[key]=max(0,min(240,value))
+    return result
+
+def mock_drive_total_minutes(cfg,question_count,fallback=1):
+    start=(getattr(cfg,'mock_drive_start_at','') or '').strip();end=(getattr(cfg,'mock_drive_end_at','') or '').strip()
+    if start and end:
+        try:return max(1,int(math.ceil((datetime.fromisoformat(end)-datetime.fromisoformat(start)).total_seconds()/60)))
+        except Exception:pass
+    per_question=max(1,min(60,int(getattr(cfg,'mock_minutes_per_question',1) or 1)))
+    return max(1,int(question_count or 0)*per_question) if int(question_count or 0)>0 else max(1,int(fallback or 1))
+
+def effective_mock_section_minutes(s,cfg,exam_id,total_minutes=None):
+    explicit=mock_section_minutes(cfg)
+    counts=dict(s.execute(select(Question.mock_section,func.count(Question.id)).where(Question.exam_id==exam_id).group_by(Question.mock_section)).all())
+    active=[key for key in MOCK_DRIVE_SECTIONS if int(counts.get(key,0) or 0)>0]
+    if not active:return explicit
+    total=total_minutes or mock_drive_total_minutes(cfg,sum(int(counts.get(key,0) or 0) for key in active),1)
+    unset=[key for key in active if not explicit[key]];remaining=max(0,int(total)-sum(explicit[key] for key in active if explicit[key]))
+    if unset:
+        base,extra=divmod(remaining,len(unset))
+        for index,key in enumerate(unset):explicit[key]=max(1,base+(1 if index<extra else 0))
+    return explicit
+
+def mock_section_duration(cfg,section):
+    return mock_section_minutes(cfg).get(section,0)
 
 def _student_exam_session_match(s,student_id,exam_id):
     sessions=s.scalars(select(ExamSession).where(ExamSession.exam_id==exam_id)).all()
@@ -3311,6 +3498,13 @@ def resolved_exam_window_for_student(s,student_id,exam,matched_session=None):
     start_value=(matched.scheduled_start or '').strip() if matched else ''
     end_value=(matched.scheduled_end or '').strip() if matched else ''
     source='session' if matched else ''
+    # Mock Test Drive has one explicit exam-wide clock in its own settings.
+    # Keep batch sessions for assignment/venue only; allowing an older session
+    # clock to override this window also produced incorrect answer-release dates.
+    if cfg and (cfg.exam_type or '').strip().lower()=='mock_drive':
+        start_value=(getattr(cfg,'mock_drive_start_at','') or '').strip()
+        end_value=(getattr(cfg,'mock_drive_end_at','') or '').strip()
+        if start_value or end_value:source='mock_drive_window'
     # Practical Code Start/End doubles as the secure common exam window when
     # a practical exam has no batch-specific session clock configured.
     if not sessions and cfg and security and security.strict_start_window and (cfg.exam_type or '').strip().lower()=='practical_exam':
@@ -3331,6 +3525,16 @@ def exam_result_release_at(s,student_id,exam):
     security=get_exam_security_policy(s,exam.id,create=False)
     if not security or not security.defer_results_until_end:
         return None
+    custom=(getattr(security,'result_release_at','') or '').strip()
+    if custom:
+        try:return datetime.fromisoformat(custom)
+        except (TypeError,ValueError):pass
+    cfg=get_exam_config(s,exam.id,create=False)
+    if cfg and (cfg.exam_type or '').strip().lower()=='mock_drive':
+        mock_end=(getattr(cfg,'mock_drive_end_at','') or '').strip()
+        if mock_end:
+            try:return datetime.fromisoformat(mock_end)
+            except (TypeError,ValueError):pass
     window=resolved_exam_window_for_student(s,student_id,exam)
     return window.get('end')
 
@@ -3463,6 +3667,9 @@ def _diagnostic_event(s,attempt,event_type,details=''):
     s.add(AttemptDiagnosticEvent(attempt_id=attempt.id,event_type=str(event_type)[:60],details=str(details)[:1000],created_at=now_iso()))
 
 def finalize_attempt(s,attempt,reason='SYSTEM_FINALIZE'):
+    # Serialize manual, timer and integrity submissions on the attempt row.
+    locked=s.scalar(select(Attempt).where(Attempt.id==attempt.id).with_for_update().execution_options(populate_existing=True))
+    if locked is not None:attempt=locked
     if attempt.status!='submitted':
         diag=_attempt_diagnostic(s,attempt,True)
         diag.submission_reason=(reason or 'SYSTEM_FINALIZE')[:60];diag.updated_at=now_iso()
@@ -3562,6 +3769,9 @@ def sync_manual_exam_question_count(s,exam_id):
     cfg=get_exam_config(s,exam_id,create=True)
     cfg.pool_size=pool_count
     cfg.question_count=pool_count
+    exam=s.get(Exam,exam_id)
+    if exam and cfg.exam_type=='mock_drive':
+        exam.duration_minutes=mock_drive_total_minutes(cfg,pool_count,exam.duration_minutes)
     cfg.updated_at=now_iso()
     return pool_count
 
@@ -3588,10 +3798,10 @@ def edge_exam_payload(s,exam):
             'subject':cfg.subject,'course_semester':cfg.course_semester,'question_count':cfg.question_count,'pool_size':cfg.pool_size,
             'easy_pct':cfg.easy_pct,'medium_pct':cfg.medium_pct,'hard_pct':cfg.hard_pct,'unit_weights':cfg.unit_weights,
             'randomize_questions':bool(cfg.randomize_questions),'shuffle_options':bool(cfg.shuffle_options),'require_fullscreen':bool(cfg.require_fullscreen),'tab_switch_limit':cfg.tab_switch_limit,
-            'exam_type':cfg.exam_type,'practical_experiment_no':cfg.practical_experiment_no,'practical_code_start_at':cfg.practical_code_start_at,'practical_code_end_at':cfg.practical_code_end_at
+            'exam_type':cfg.exam_type,'practical_experiment_no':cfg.practical_experiment_no,'practical_code_start_at':cfg.practical_code_start_at,'practical_code_end_at':cfg.practical_code_end_at,'mock_drive_start_at':cfg.mock_drive_start_at,'mock_drive_end_at':cfg.mock_drive_end_at,'mock_section_minutes':cfg.mock_section_minutes,'mock_minutes_per_question':cfg.mock_minutes_per_question,'sequential_min_seconds':cfg.sequential_min_seconds,'mock_student_message_line1':cfg.mock_student_message_line1 or '','mock_student_message_line2':cfg.mock_student_message_line2 or ''
         } if cfg else {}),
-        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'require_exam_pin':bool(security.require_exam_pin),'heartbeat_seconds':security.heartbeat_seconds,'strict_start_window':bool(security.strict_start_window),'start_grace_minutes':security.start_grace_minutes,'auto_submit_on_integrity_limit':bool(security.auto_submit_on_integrity_limit),'defer_results_until_end':bool(security.defer_results_until_end),'block_ip_roll_switch':bool(security.block_ip_roll_switch),'practical_defaults_applied':bool(security.practical_defaults_applied)} if security else {}),
-        'questions':[{'question':q.question,'question_type':canonical_question_type(q.question_type),'option_a':q.option_a,'option_b':q.option_b,'option_c':q.option_c,'option_d':q.option_d,'correct_answer':q.correct_answer,'answer_key':q.answer_key,'answer_tolerance':q.answer_tolerance,'answer_case_sensitive':bool(q.answer_case_sensitive),'marks':q.marks,'practical_experiment_no':q.practical_experiment_no or ''} for q in questions],
+        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'require_exam_pin':bool(security.require_exam_pin),'heartbeat_seconds':security.heartbeat_seconds,'strict_start_window':bool(security.strict_start_window),'start_grace_minutes':security.start_grace_minutes,'auto_submit_on_integrity_limit':bool(security.auto_submit_on_integrity_limit),'defer_results_until_end':bool(security.defer_results_until_end),'result_release_at':security.result_release_at or '','block_ip_roll_switch':bool(security.block_ip_roll_switch),'practical_defaults_applied':bool(security.practical_defaults_applied)} if security else {}),
+        'questions':[{'question':q.question,'question_type':canonical_question_type(q.question_type),'option_a':q.option_a,'option_b':q.option_b,'option_c':q.option_c,'option_d':q.option_d,'correct_answer':q.correct_answer,'answer_key':q.answer_key,'answer_tolerance':q.answer_tolerance,'answer_case_sensitive':bool(q.answer_case_sensitive),'marks':q.marks,'practical_experiment_no':q.practical_experiment_no or '','mock_section':q.mock_section or ''} for q in questions],
     }
 
 
@@ -6927,6 +7137,32 @@ def create_exam_for_existing_subject():
     return redirect(url_for('question_bank',subject=subject.name,unit=selected_unit,target_exam_id=exam.id)+'#bank-questions')
 
 
+def build_admin_exam_rows(s, mock_drive_only=False):
+    raw=s.execute(select(Exam,func.count(Question.id)).outerjoin(Question,Question.exam_id==Exam.id).group_by(Exam.id).order_by(Exam.id.desc())).all();rows=[]
+    for e,count in raw:
+        cfg=get_exam_config(s,e.id);resolved_meta=practical_exam_metadata_for_exam(s,e.id)
+        exam_type=('practical_exam' if resolved_meta.get('is_practical') else ((getattr(cfg,'exam_type','') or 'regular') if cfg else 'regular'))
+        is_mock=exam_type=='mock_drive'
+        if is_mock!=bool(mock_drive_only):continue
+        target=(cfg.question_count if cfg and cfg.question_count else count)
+        approval=get_exam_approval(s,e.id,create=True);session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.exam_id==e.id)) or 0
+        policy=exam_approval_policy(s,e)
+        subject,unit_label=student_exam_subject_unit(s,e,cfg)
+        if is_mock:subject,unit_label='General','Mock Test Drive'
+        practical_experiment_no=(resolved_meta.get('experiment_no') or (getattr(cfg,'practical_experiment_no','') if cfg else '') or '')
+        practical_code_start_at=(getattr(cfg,'practical_code_start_at','') or '') if cfg else ''
+        practical_code_end_at=(getattr(cfg,'practical_code_end_at','') or '') if cfg else ''
+        display_duration=mock_drive_total_minutes(cfg,count,e.duration_minutes) if is_mock else e.duration_minutes
+        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':display_duration,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no,'practical_code_start_at':practical_code_start_at,'practical_code_end_at':practical_code_end_at,'mock_drive_start_at':getattr(cfg,'mock_drive_start_at','') or '','mock_drive_end_at':getattr(cfg,'mock_drive_end_at','') or '','mock_section_minutes':json.dumps(mock_section_minutes(cfg),separators=(',',':')),'mock_minutes_per_question':int(getattr(cfg,'mock_minutes_per_question',1) or 1),'sequential_min_seconds':int(getattr(cfg,'sequential_min_seconds',10) or 0),'ai_review_pending':bool(getattr(cfg,'ai_review_pending',False))})())
+    return rows
+
+
+def group_admin_exam_rows(rows):
+    grouped={}
+    for row in rows:grouped.setdefault(row.subject,[]).append(row)
+    return [{'subject':subject,'exams':grouped[subject]} for subject in sorted(grouped,key=lambda name:(name in {'General','Mixed Subjects'},name.casefold()))]
+
+
 @app.route('/admin/exams',methods=['GET','POST'])
 @staff_required
 def exams():
@@ -6936,7 +7172,12 @@ def exams():
         except ValueError:duration=30
         title=request.form.get('title','').strip()
         if title:
-            e=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(e);s.flush();get_exam_config(s,e.id,create=True);get_exam_approval(s,e.id,create=True);audit_event(s,'exam_created','exam',e.id,title);s.commit();flash('Exam created as draft.')
+            exam_type='regular'
+            e=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(e);s.flush();cfg=get_exam_config(s,e.id,create=True);cfg.exam_type=exam_type
+            if exam_type=='mock_drive':
+                cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.secure_sequential=False;cfg.require_fullscreen=True
+                security=get_exam_security_policy(s,e.id,create=True);security.require_exam_pin=True;security.strict_start_window=True;security.auto_submit_on_integrity_limit=True;security.defer_results_until_end=True;security.updated_at=now_iso()
+            get_exam_approval(s,e.id,create=True);audit_event(s,'exam_created','exam',e.id,f'{title}; type={exam_type}');s.commit();flash('Mock Drive Exam created as a draft. Add questions and assign all four sections.' if exam_type=='mock_drive' else 'Exam created as draft.')
     subject_exam_options=[]
     voice_subject_catalog=[]
     curriculum_exam_options=[]
@@ -6988,29 +7229,34 @@ def exams():
             'units':units,
         })
 
-    raw=s.execute(select(Exam,func.count(Question.id)).outerjoin(Question,Question.exam_id==Exam.id).group_by(Exam.id).order_by(Exam.id.desc())).all();rows=[]
-    for e,count in raw:
-        cfg=get_exam_config(s,e.id);target=(cfg.question_count if cfg and cfg.question_count else count)
-        approval=get_exam_approval(s,e.id,create=True);session_count=s.scalar(select(func.count()).select_from(ExamSession).where(ExamSession.exam_id==e.id)) or 0
-        policy=exam_approval_policy(s,e)
-        subject,unit_label=student_exam_subject_unit(s,e,cfg)
-        resolved_meta=practical_exam_metadata_for_exam(s,e.id)
-        exam_type=('practical_exam' if resolved_meta.get('is_practical') else ((getattr(cfg,'exam_type','') or 'regular') if cfg else 'regular'))
-        practical_experiment_no=(resolved_meta.get('experiment_no') or (getattr(cfg,'practical_experiment_no','') if cfg else '') or '')
-        practical_code_start_at=(getattr(cfg,'practical_code_start_at','') or '') if cfg else ''
-        practical_code_end_at=(getattr(cfg,'practical_code_end_at','') or '') if cfg else ''
-        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':e.duration_minutes,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no,'practical_code_start_at':practical_code_start_at,'practical_code_end_at':practical_code_end_at,'ai_review_pending':bool(getattr(cfg,'ai_review_pending',False))})())
-
-    grouped={}
-    for row in rows:
-        grouped.setdefault(row.subject,[]).append(row)
-    exam_groups=[{'subject':subject,'exams':grouped[subject]} for subject in sorted(grouped,key=lambda name:(name in {'General','Mixed Subjects'},name.casefold()))]
+    rows=build_admin_exam_rows(s,False);exam_groups=group_admin_exam_rows(rows)
     return render_template(
         'exams.html',exams=rows,exam_groups=exam_groups,
         subject_exam_options=subject_exam_options,catalog_subjects=catalog_subjects,
         voice_subject_catalog=voice_subject_catalog,curriculum_exam_options=curriculum_exam_options,
-        active_curriculum_institution=active_curriculum_institution,ai=ai_status()
+        active_curriculum_institution=active_curriculum_institution,ai=ai_status(),mock_drive_page=False
     )
+
+
+@app.route('/admin/mock-test-drive',methods=['GET','POST'])
+@staff_required
+def mock_test_drive_exams():
+    s=DB()
+    if request.method=='POST':
+        title=(request.form.get('title') or '').strip()
+        try:minutes_per_question=max(1,min(60,int(request.form.get('mock_minutes_per_question','1'))))
+        except ValueError:minutes_per_question=1
+        duration=1
+        if not title:
+            flash('Enter a title for the Mock Test Drive.','error');return redirect(url_for('mock_test_drive_exams'))
+        e=Exam(title=title,duration_minutes=duration,is_active=False,created_at=now_iso());s.add(e);s.flush()
+        cfg=get_exam_config(s,e.id,create=True);cfg.exam_type='mock_drive';cfg.subject='';cfg.course_semester='';cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.secure_sequential=False;cfg.require_fullscreen=True;cfg.mock_minutes_per_question=minutes_per_question
+        security=get_exam_security_policy(s,e.id,create=True);security.require_exam_pin=True;security.strict_start_window=True;security.auto_submit_on_integrity_limit=True;security.defer_results_until_end=True;security.updated_at=now_iso()
+        get_exam_approval(s,e.id,create=True);audit_event(s,'exam_created','exam',e.id,f'{title}; type=mock_drive; placement_page=1');s.commit()
+        flash('Mock Test Drive created as a draft. Configure timing, then add questions to all four sections.')
+        return redirect(url_for('questions',exam_id=e.id))
+    rows=build_admin_exam_rows(s,True);exam_groups=group_admin_exam_rows(rows)
+    return render_template('exams.html',exams=rows,exam_groups=exam_groups,subject_exam_options=[],catalog_subjects=[],voice_subject_catalog=[],curriculum_exam_options=[],active_curriculum_institution=current_curriculum_institution(s),ai=ai_status(),mock_drive_page=True)
 
 @app.route('/admin/exam/<int:exam_id>/edit-metadata',methods=['POST'])
 @admin_required
@@ -7028,7 +7274,7 @@ def edit_exam_metadata(exam_id):
         return redirect(url_for('exams'))
 
     exam_type=(request.form.get('exam_type') or 'regular').strip().lower()
-    if exam_type not in {'regular','practical_exam'}:
+    if exam_type not in {'regular','practical_exam','mock_drive'}:
         flash('Choose a valid exam type.','error')
         return redirect(url_for('exams'))
     practical_experiment_no=normalize_practical_exam_no(request.form.get('practical_experiment_no')) if exam_type=='practical_exam' else ''
@@ -7052,6 +7298,21 @@ def edit_exam_metadata(exam_id):
             if datetime.fromisoformat(practical_code_end_at)<=datetime.fromisoformat(practical_code_start_at):
                 flash('Practical Code end time must be after the start time.','error')
                 return redirect(url_for('exams'))
+
+    mock_drive_start_at='';mock_drive_end_at='';mock_minutes=None;mock_min_seconds=10;mock_minutes_per_question=1
+    if exam_type=='mock_drive':
+        try:
+            mock_drive_start_at=parse_local_schedule(request.form.get('mock_drive_start_at',''))
+            mock_drive_end_at=parse_local_schedule(request.form.get('mock_drive_end_at',''))
+            mock_minutes={key:max(0,min(240,int(request.form.get(f'mock_{key}_minutes') or 0))) for key in MOCK_DRIVE_SECTIONS}
+            mock_min_seconds=max(0,min(120,int(request.form.get('mock_min_question_seconds') or 10)))
+            mock_minutes_per_question=max(1,min(60,int(request.form.get('mock_minutes_per_question') or 1)))
+        except ValueError:
+            flash('Mock Drive timing values are invalid.','error');return redirect(url_for('exams'))
+        if bool(mock_drive_start_at)!=bool(mock_drive_end_at):
+            flash('Set both Mock Drive start and end times, or leave both blank.','error');return redirect(url_for('exams'))
+        if mock_drive_start_at and datetime.fromisoformat(mock_drive_end_at)<=datetime.fromisoformat(mock_drive_start_at):
+            flash('Mock Drive end time must be after the start time.','error');return redirect(url_for('exams'))
 
     subject_value=(request.form.get('subject_id') or '').strip()
     if subject_value=='__general__':
@@ -7091,6 +7352,19 @@ def edit_exam_metadata(exam_id):
         # becomes practical (and once for older practical exams after upgrade).
         if old_exam_type!='practical_exam':security.practical_defaults_applied=False
         apply_practical_exam_security_defaults(s,exam.id,cfg,security)
+    elif exam_type=='mock_drive':
+        cfg.mock_drive_start_at=mock_drive_start_at;cfg.mock_drive_end_at=mock_drive_end_at;cfg.mock_section_minutes=json.dumps(mock_minutes,separators=(',',':'));cfg.mock_minutes_per_question=mock_minutes_per_question;cfg.sequential_min_seconds=mock_min_seconds
+        question_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam.id)) or 0
+        exam.duration_minutes=mock_drive_total_minutes(cfg,question_count,exam.duration_minutes)
+        cfg.randomize_questions=True
+        cfg.shuffle_options=True
+        cfg.secure_sequential=False
+        cfg.require_fullscreen=True
+        security.require_exam_pin=True
+        security.strict_start_window=True
+        security.auto_submit_on_integrity_limit=True
+        security.defer_results_until_end=True
+        security.updated_at=now_iso()
 
     # Exam Question rows are exam-specific snapshots, so keep their practical
     # serial aligned with the explicit exam-level setting.  This makes later
@@ -7117,9 +7391,12 @@ def edit_exam_metadata(exam_id):
         # Practical Exam, repair those Viva entries immediately.
         resync_submitted_practical_attempts(s,exam.id)
         flash(f'Updated “{title}” as Practical Exam · Experiment {practical_experiment_no}.')
+    elif exam_type=='mock_drive':
+        flash(f'Updated “{title}” as a Mock Drive Exam. Assign every question to a section before activation.')
     else:
         flash(f'Updated “{title}” as Regular Exam.')
-    return redirect(url_for('exams')+f'#exam-{exam.id}')
+    fallback=url_for('mock_test_drive_exams') if exam_type=='mock_drive' else url_for('exams')
+    return redirect((request.referrer or fallback).split('#',1)[0]+f'#exam-{exam.id}')
 
 @app.route('/admin/exam/<int:exam_id>/delete',methods=['POST'])
 @admin_required
@@ -7148,6 +7425,7 @@ def delete_exam(exam_id):
         s.execute(delete(AttemptDiagnosticEvent).where(AttemptDiagnosticEvent.attempt_id.in_(attempt_ids)))
         s.execute(delete(AttemptDiagnostic).where(AttemptDiagnostic.attempt_id.in_(attempt_ids)))
         s.execute(delete(SequentialAttemptProgress).where(SequentialAttemptProgress.attempt_id.in_(attempt_ids)))
+        s.execute(delete(MockDriveProgress).where(MockDriveProgress.attempt_id.in_(attempt_ids)))
         s.execute(delete(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id.in_(attempt_ids)))
         s.execute(delete(IntegrityEvent).where(IntegrityEvent.attempt_id.in_(attempt_ids)))
         s.execute(delete(Answer).where(Answer.attempt_id.in_(attempt_ids)))
@@ -7186,7 +7464,7 @@ def delete_exam(exam_id):
     s.delete(exam)
     s.commit()
     flash(f'Exam “{title}” and its related results/marks were deleted.')
-    return redirect(url_for('exams'))
+    return redirect(request.referrer or url_for('exams'))
 
 
 @app.route('/admin/exam/<int:exam_id>/toggle',methods=['POST'])
@@ -7195,6 +7473,18 @@ def toggle_exam(exam_id):
     s=DB();e=s.get(Exam,exam_id)
     if e:
         if not e.is_active and (s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0)==0:flash('Add questions before activating this exam.','error');return redirect(url_for('exams'))
+        cfg=get_exam_config(s,exam_id,create=False)
+        if not e.is_active and cfg and cfg.exam_type=='mock_drive':
+            section_counts=dict(s.execute(select(Question.mock_section,func.count(Question.id)).where(Question.exam_id==exam_id).group_by(Question.mock_section)).all())
+            populated=[key for key in MOCK_DRIVE_SECTIONS if int(section_counts.get(key,0) or 0)>0]
+            missing=[label for key,label in MOCK_DRIVE_SECTIONS.items() if key not in populated]
+            unassigned=int(section_counts.get('',0) or 0)
+            if len(populated)<2 or unassigned:
+                detail=f' At least two sections need questions; currently {len(populated)}.' if len(populated)<2 else ''
+                if unassigned:detail+=f' Assign the {unassigned} unassigned question(s) to a section.'
+                flash('Mock Test Drive cannot be activated yet.'+detail,'error');return redirect(url_for('questions',exam_id=exam_id))
+            if missing:
+                flash('Warning: this Mock Test Drive will activate with '+str(len(populated))+' populated sections. Empty sections will not be shown: '+', '.join(missing)+'.','warning')
         if not e.is_active and refresh_exam_ai_review_pending(s,exam_id):s.commit();flash('Review and approve all AI-generated questions before activating this exam.','error');return redirect(url_for('question_bank',target_exam_id=exam_id,status='draft')+'#bank-questions')
         if not e.is_active:
             approval=get_exam_approval(s,exam_id,create=True)
@@ -7211,7 +7501,7 @@ def toggle_exam(exam_id):
                     flash('This exam requires HOD / Exam Controller approval before activation. Use Request Approval first.','error');return redirect(request.referrer or url_for('exams'))
         e.is_active=not bool(e.is_active)
         audit_event(s,'exam_activated' if e.is_active else 'exam_deactivated','exam',e.id,e.title);s.commit()
-    return redirect(url_for('exams'))
+    return redirect(request.referrer or url_for('exams'))
 
 
 @app.route('/admin/exam/<int:exam_id>/approval/request',methods=['POST'])
@@ -7296,8 +7586,8 @@ def import_edge_exam_package():
         cfg_data=payload.get('config') or {};cfg=get_exam_config(s,exam.id,create=True);cfg.subject=str(cfg_data.get('subject') or '')[:200];cfg.course_semester=str(cfg_data.get('course_semester') or '')[:200];cfg.question_count=max(1,min(len(qrows),int(cfg_data.get('question_count') or len(qrows))));cfg.pool_size=max(cfg.question_count,min(len(qrows),int(cfg_data.get('pool_size') or len(qrows))))
         easy=int(cfg_data.get('easy_pct') or 30);medium=int(cfg_data.get('medium_pct') or 50);hard=int(cfg_data.get('hard_pct') or 20)
         if easy+medium+hard!=100:easy,medium,hard=30,50,20
-        cfg.easy_pct=max(0,easy);cfg.medium_pct=max(0,medium);cfg.hard_pct=max(0,hard);cfg.unit_weights=str(cfg_data.get('unit_weights') or '')[:2000];cfg.randomize_questions=bool(cfg_data.get('randomize_questions',True));cfg.shuffle_options=bool(cfg_data.get('shuffle_options',True));cfg.require_fullscreen=bool(cfg_data.get('require_fullscreen',False));cfg.tab_switch_limit=max(0,min(100,int(cfg_data.get('tab_switch_limit') or 3)));cfg.exam_type=str(cfg_data.get('exam_type') or 'regular')[:30];cfg.practical_experiment_no=normalize_practical_exam_no(cfg_data.get('practical_experiment_no'));cfg.practical_code_start_at=str(cfg_data.get('practical_code_start_at') or '')[:40];cfg.practical_code_end_at=str(cfg_data.get('practical_code_end_at') or '')[:40];cfg.last_generation_summary=f'Imported from encrypted Edge package {pid}.';cfg.updated_at=now_iso()
-        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(10,min(60,int(security_data.get('heartbeat_seconds') or 15)));security.strict_start_window=bool(security_data.get('strict_start_window',False));security.start_grace_minutes=max(0,min(60,int(security_data.get('start_grace_minutes') or 5)));security.auto_submit_on_integrity_limit=bool(security_data.get('auto_submit_on_integrity_limit',False));security.defer_results_until_end=bool(security_data.get('defer_results_until_end',False));security.block_ip_roll_switch=bool(security_data.get('block_ip_roll_switch',False));security.practical_defaults_applied=bool(security_data.get('practical_defaults_applied',False));security.updated_at=now_iso()
+        cfg.easy_pct=max(0,easy);cfg.medium_pct=max(0,medium);cfg.hard_pct=max(0,hard);cfg.unit_weights=str(cfg_data.get('unit_weights') or '')[:2000];cfg.randomize_questions=bool(cfg_data.get('randomize_questions',True));cfg.shuffle_options=bool(cfg_data.get('shuffle_options',True));cfg.require_fullscreen=bool(cfg_data.get('require_fullscreen',False));cfg.tab_switch_limit=max(0,min(100,int(cfg_data.get('tab_switch_limit') or 3)));cfg.exam_type=str(cfg_data.get('exam_type') or 'regular')[:30];cfg.practical_experiment_no=normalize_practical_exam_no(cfg_data.get('practical_experiment_no'));cfg.practical_code_start_at=str(cfg_data.get('practical_code_start_at') or '')[:40];cfg.practical_code_end_at=str(cfg_data.get('practical_code_end_at') or '')[:40];cfg.mock_drive_start_at=str(cfg_data.get('mock_drive_start_at') or '')[:40];cfg.mock_drive_end_at=str(cfg_data.get('mock_drive_end_at') or '')[:40];cfg.mock_section_minutes=str(cfg_data.get('mock_section_minutes') or json.dumps(MOCK_SECTION_DEFAULT_MINUTES,separators=(',',':')))[:500];cfg.mock_minutes_per_question=max(1,min(60,int(cfg_data.get('mock_minutes_per_question') or 1)));cfg.mock_student_message_line1=str(cfg_data.get('mock_student_message_line1') or '')[:500];cfg.mock_student_message_line2=str(cfg_data.get('mock_student_message_line2') or '')[:500];cfg.sequential_min_seconds=max(0,min(120,int(cfg_data.get('sequential_min_seconds') or 10)));cfg.last_generation_summary=f'Imported from encrypted Edge package {pid}.';cfg.updated_at=now_iso()
+        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(20,min(60,int(security_data.get('heartbeat_seconds') or 25)));security.strict_start_window=bool(security_data.get('strict_start_window',False));security.start_grace_minutes=max(0,min(60,int(security_data.get('start_grace_minutes') or 5)));security.auto_submit_on_integrity_limit=bool(security_data.get('auto_submit_on_integrity_limit',False));security.defer_results_until_end=bool(security_data.get('defer_results_until_end',False));security.result_release_at=str(security_data.get('result_release_at') or '');security.block_ip_roll_switch=bool(security_data.get('block_ip_roll_switch',False));security.practical_defaults_applied=bool(security_data.get('practical_defaults_applied',False));security.updated_at=now_iso()
         if cfg.exam_type=='practical_exam' and not security.practical_defaults_applied:apply_practical_exam_security_defaults(s,exam.id,cfg,security)
         for idx,item in enumerate(qrows,1):
             if not isinstance(item,dict):raise ValueError(f'Question {idx} is malformed.')
@@ -7306,7 +7596,7 @@ def import_edge_exam_package():
             try:marks=max(1,int(item.get('marks') or 1))
             except Exception:marks=1
             legacy=str(item.get('correct_answer') or '').upper();legacy=legacy if legacy in {'A','B','C','D'} else (answer_key[:1].upper() if qtype=='single_choice' and answer_key[:1].upper() in {'A','B','C','D'} else 'A')
-            s.add(Question(exam_id=exam.id,question=question_text,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,question_type=qtype,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=bool(item.get('answer_case_sensitive',False)),marks=marks,practical_experiment_no=normalize_practical_exam_no(item.get('practical_experiment_no'))))
+            mock_section=str(item.get('mock_section') or '').strip().lower();s.add(Question(exam_id=exam.id,question=question_text,option_a=options['A'],option_b=options['B'],option_c=options['C'],option_d=options['D'],correct_answer=legacy,question_type=qtype,answer_key=answer_key,answer_tolerance=tolerance,answer_case_sensitive=bool(item.get('answer_case_sensitive',False)),marks=marks,practical_experiment_no=normalize_practical_exam_no(item.get('practical_experiment_no')),mock_section=mock_section if mock_section in MOCK_DRIVE_SECTIONS else ''))
         source=payload.get('source') or {};s.add(EdgePackageReceipt(package_id=pid,exam_id=exam.id,source_mode=str(source.get('mode') or '')[:20],source_exam_id=str(source.get('exam_id') or '')[:80],imported_by=actor_label(s),imported_at=now_iso()));audit_event(s,'edge_exam_package_imported','exam',exam.id,f'package={pid}, source={source.get("mode","")}:{source.get("exam_id","")}');s.commit();flash(f'Encrypted Edge package verified and imported as Draft Exam #{exam.id}. Assign the local batch/session, then approve and activate it.');return redirect(url_for('exam_builder',exam_id=exam.id))
     except (ValueError,TypeError,json.JSONDecodeError,UnicodeDecodeError) as exc:
         s.rollback();flash(f'Edge package rejected: {exc}','error');return redirect(url_for('exam_centre'))
@@ -7390,12 +7680,30 @@ def exam_builder(exam_id):
         action=request.form.get('action','save')
         try:
             qcount=max(1,int(request.form.get('question_count','20')));pool_size=max(qcount,int(request.form.get('pool_size',str(qcount))))
-            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(10,min(60,int(request.form.get('heartbeat_seconds','15') or 15)));start_grace_minutes=max(0,min(60,int(request.form.get('start_grace_minutes','5') or 5)));sequential_min_seconds=max(0,min(120,int(request.form.get('sequential_min_seconds','10') or 10)))
+            easy=max(0,int(request.form.get('easy_pct','30')));medium=max(0,int(request.form.get('medium_pct','50')));hard=max(0,int(request.form.get('hard_pct','20')));tab_limit=max(0,int(request.form.get('tab_switch_limit','3')));heartbeat_seconds=max(20,min(60,int(request.form.get('heartbeat_seconds','25') or 25)));start_grace_minutes=max(0,min(60,int(request.form.get('start_grace_minutes','5') or 5)));sequential_min_seconds=max(0,min(120,int(request.form.get('sequential_min_seconds','10') or 10)))
+            section_minutes={key:max(0,min(240,int(request.form.get(f'mock_{key}_minutes') or 0))) for key in MOCK_DRIVE_SECTIONS}
+            mock_minutes_per_question=max(1,min(60,int(request.form.get('mock_minutes_per_question','1') or 1)))
         except ValueError:flash('Blueprint numeric values are invalid.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         if easy+medium+hard!=100:flash('Difficulty distribution must total 100%.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         try:unit_weights=parse_unit_weights(request.form.get('unit_weights',''))
         except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
-        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.secure_sequential=request.form.get('secure_sequential')=='on';cfg.sequential_min_seconds=sequential_min_seconds;cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.strict_start_window=request.form.get('strict_start_window')=='on';security.start_grace_minutes=start_grace_minutes;security.auto_submit_on_integrity_limit=request.form.get('auto_submit_on_integrity_limit')=='on';security.defer_results_until_end=request.form.get('defer_results_until_end')=='on';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.practical_defaults_applied=True if (cfg.exam_type or '').strip().lower()=='practical_exam' else security.practical_defaults_applied;security.updated_at=now_iso();s.flush()
+        try:result_release_at=parse_local_schedule(request.form.get('result_release_at','')) if request.form.get('defer_results_until_end')=='on' else ''
+        except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
+        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.secure_sequential=request.form.get('secure_sequential')=='on';cfg.sequential_min_seconds=sequential_min_seconds;cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.strict_start_window=request.form.get('strict_start_window')=='on';security.start_grace_minutes=start_grace_minutes;security.auto_submit_on_integrity_limit=request.form.get('auto_submit_on_integrity_limit')=='on';security.defer_results_until_end=request.form.get('defer_results_until_end')=='on';security.result_release_at=result_release_at or '';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.practical_defaults_applied=True if (cfg.exam_type or '').strip().lower()=='practical_exam' else security.practical_defaults_applied;security.updated_at=now_iso();
+        if cfg.exam_type=='mock_drive':
+            try:
+                mock_start=parse_local_schedule(request.form.get('mock_drive_start_at',''));mock_end=parse_local_schedule(request.form.get('mock_drive_end_at',''))
+            except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
+            if bool(mock_start)!=bool(mock_end):flash('Set both Mock Drive start and end times, or leave both blank.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+            if mock_start and datetime.fromisoformat(mock_end)<=datetime.fromisoformat(mock_start):flash('Mock Drive end time must be after its start time.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+            messages=[]
+            for field,label in [('mock_student_message_line1','Message line 1'),('mock_student_message_line2','Message line 2')]:
+                value=' '.join((request.form.get(field) or '').split())
+                if len(value.split())>30:
+                    flash(f'{label} must contain no more than 30 words.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+                messages.append(value[:500])
+            cfg.mock_drive_start_at=mock_start;cfg.mock_drive_end_at=mock_end;cfg.mock_section_minutes=json.dumps(section_minutes,separators=(',',':'));cfg.mock_minutes_per_question=mock_minutes_per_question;cfg.mock_student_message_line1=messages[0];cfg.mock_student_message_line2=messages[1];cfg.secure_sequential=False;cfg.question_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or qcount;exam.duration_minutes=mock_drive_total_minutes(cfg,cfg.question_count,exam.duration_minutes)
+        s.flush()
         if action=='generate':
             if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)>0:flash('This exam already has attempts. The question pool is locked to protect result integrity.','error');s.rollback();return redirect(url_for('exam_builder',exam_id=exam_id))
             stmt=select(BankQuestion).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both']))
@@ -7422,7 +7730,7 @@ def exam_builder(exam_id):
     subjects=s.scalars(select(BankQuestion.subject).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both'])).distinct().order_by(BankQuestion.subject)).all();pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0;attempt_count=s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0
     try:unit_weights_display=', '.join(f'{k}:{v}' for k,v in json.loads(cfg.unit_weights or '{}').items())
     except Exception:unit_weights_display=''
-    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);approval_policy=exam_approval_policy(s,exam);practice_release=get_exam_practice_release(s,exam_id,create=True);s.commit();return render_template('exam_builder.html',exam=exam,cfg=cfg,security=security,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,approval_policy=approval_policy,practice_release=practice_release,group_label=group_label,can_approve=can_approve_exams(s))
+    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);approval_policy=exam_approval_policy(s,exam);practice_release=get_exam_practice_release(s,exam_id,create=True);s.commit();return render_template('exam_builder.html',exam=exam,cfg=cfg,security=security,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,approval_policy=approval_policy,practice_release=practice_release,group_label=group_label,can_approve=can_approve_exams(s),mock_durations=mock_section_minutes(cfg),mock_sections=MOCK_DRIVE_SECTIONS)
 
 @app.route('/admin/exam/<int:exam_id>/student-access')
 @staff_required
@@ -7522,31 +7830,87 @@ def questions(exam_id):
         if qdef['error']:flash(qdef['error'],'error');return redirect(url_for('questions',exam_id=exam_id))
         try:marks=max(1,int(request.form.get('marks','1')))
         except ValueError:marks=1
-        opts=qdef['options'];q=Question(exam_id=exam_id,question=request.form.get('question','').strip(),option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],question_type=qdef['question_type'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks);s.add(q);s.flush();pool_count=sync_manual_exam_question_count(s,exam_id);audit_event(s,'exam_question_added','exam',exam_id,f'question_id={q.id}, type={qdef["question_type"]}, pool={pool_count}');s.commit();flash(f'Question added. New attempts will receive all {pool_count} question(s) in this exam.')
+        mock_section=(request.form.get('mock_section') or '').strip().lower()
+        cfg=get_exam_config(s,exam_id,create=False)
+        if cfg and cfg.exam_type=='mock_drive' and mock_section not in MOCK_DRIVE_SECTIONS:
+            flash('Choose a mock-drive section for this question.','error');return redirect(url_for('questions',exam_id=exam_id))
+        opts=qdef['options'];q=Question(exam_id=exam_id,question=request.form.get('question','').strip(),option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],question_type=qdef['question_type'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks,mock_section=mock_section if mock_section in MOCK_DRIVE_SECTIONS else '');s.add(q);s.flush();pool_count=sync_manual_exam_question_count(s,exam_id);audit_event(s,'exam_question_added','exam',exam_id,f'question_id={q.id}, type={qdef["question_type"]}, section={q.mock_section}, pool={pool_count}');s.commit();flash(f'Question added. New attempts will receive all {pool_count} question(s) in this exam.')
     qs=s.scalars(select(Question).where(Question.exam_id==exam_id).order_by(Question.id)).all()
     cfg=normalize_legacy_manual_subject_exam(s,exam_id,get_exam_config(s,exam_id,create=False))
     mapped=set(s.scalars(select(ExamBankMap.exam_question_id).where(ExamBankMap.exam_id==exam_id)).all())
-    return render_template('questions.html',exam=exam,questions=qs,mapped=mapped)
+    return render_template('questions.html',exam=exam,questions=qs,mapped=mapped,cfg=cfg,mock_sections=MOCK_DRIVE_SECTIONS,question_type_labels=QUESTION_TYPE_LABELS)
+
+@app.route('/admin/exam/<int:exam_id>/questions/template/<question_type>.csv')
+@staff_required
+def download_question_csv_template(exam_id,question_type):
+    if not DB().get(Exam,exam_id):abort(404)
+    qtype=canonical_question_type(question_type)
+    if qtype not in QUESTION_TYPE_LABELS:abort(404)
+    examples={
+        'single_choice':['Which option is correct?','Option A','Option B','Option C','Option D','A','','0','0','1'],
+        'multiple_select':['Select every correct option.','Option A','Option B','Option C','Option D','','A,C','0','0','1'],
+        'true_false':['This statement is true.','','','','','','true','0','0','1'],
+        'numerical':['Enter the numeric answer.','','','','','','42','0.01','0','1'],
+        'short_text':['Enter the short answer.','','','','','','sample answer','0','1','1'],
+        'essay':['Explain your answer.','','','','','','','0','0','5'],
+    }
+    output=io.StringIO();writer=csv.writer(output);writer.writerow(['question_type','question','option_a','option_b','option_c','option_d','correct_answer','answer_key','answer_tolerance','answer_case_sensitive','marks']);writer.writerow([qtype]+examples[qtype])
+    return Response(output.getvalue(),mimetype='text/csv',headers={'Content-Disposition':f'attachment; filename={qtype}_questions_template.csv'})
+
+@app.route('/admin/exam/<int:exam_id>/questions/sections',methods=['POST'])
+@staff_required
+def update_mock_drive_sections(exam_id):
+    s=DB();exam=s.get(Exam,exam_id);cfg=get_exam_config(s,exam_id,create=False)
+    if not exam or not cfg:abort(404)
+    if cfg.exam_type!='mock_drive':
+        flash('Section assignment is available only for Mock Drive Exams.','error');return redirect(url_for('questions',exam_id=exam_id))
+    if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)>0:
+        flash('Sections are locked after the first student starts the exam.','error');return redirect(url_for('questions',exam_id=exam_id))
+    rows=s.scalars(select(Question).where(Question.exam_id==exam_id)).all();updated=0
+    for row in rows:
+        value=(request.form.get(f'section_{row.id}') or '').strip().lower()
+        if value not in MOCK_DRIVE_SECTIONS:
+            flash('Every question must be assigned to one of the four sections.','error');s.rollback();return redirect(url_for('questions',exam_id=exam_id))
+        row.mock_section=value;updated+=1
+    audit_event(s,'mock_drive_sections_updated','exam',exam_id,f'questions={updated}')
+    s.commit();flash(f'Saved section assignments for {updated} question(s).')
+    return redirect(url_for('questions',exam_id=exam_id))
 
 @app.route('/admin/exam/<int:exam_id>/import',methods=['POST'])
 @staff_required
 def import_questions(exam_id):
+    s=DB();exam=s.get(Exam,exam_id);cfg=get_exam_config(s,exam_id,create=False)
+    if not exam:abort(404)
+    selected_section=(request.form.get('mock_section') or '').strip().lower()
+    if cfg and cfg.exam_type=='mock_drive':
+        if selected_section not in MOCK_DRIVE_SECTIONS:
+            flash('Choose a Mock Drive section before importing the CSV.','error');return redirect(url_for('questions',exam_id=exam_id))
+        if (s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)>0:
+            flash('Questions and sections are locked after the first student starts the exam.','error');return redirect(url_for('questions',exam_id=exam_id))
     f=request.files.get('csv_file')
     if not f:flash('Choose a CSV file.','error');return redirect(url_for('questions',exam_id=exam_id))
     try:text=f.stream.read().decode('utf-8-sig')
     except UnicodeDecodeError:flash('CSV must be UTF-8 encoded.','error');return redirect(url_for('questions',exam_id=exam_id))
-    reader=csv.DictReader(io.StringIO(text));required={'question','option_a','option_b','option_c','option_d','correct_answer','marks'}
-    if not required.issubset(set(reader.fieldnames or [])):flash('CSV columns are incorrect. Use sample_questions.csv.','error');return redirect(url_for('questions',exam_id=exam_id))
-    s=DB();count=0
+    reader=csv.DictReader(io.StringIO(text));required={'question','marks'}
+    if not required.issubset(set(reader.fieldnames or [])):flash('CSV must include question and marks columns. Download a question-type template above.','error');return redirect(url_for('questions',exam_id=exam_id))
+    count=0;invalid=0
     for r in reader:
-        ans=(r.get('correct_answer') or '').strip().upper()
-        if ans not in {'A','B','C','D'}:continue
         try:marks=max(1,int(r.get('marks') or 1))
         except ValueError:marks=1
-        if not (r.get('question') or '').strip():continue
-        s.add(Question(exam_id=exam_id,question=r['question'].strip(),option_a=(r.get('option_a') or '').strip(),option_b=(r.get('option_b') or '').strip(),option_c=(r.get('option_c') or '').strip(),option_d=(r.get('option_d') or '').strip(),correct_answer=ans,question_type='single_choice',answer_key=ans,answer_tolerance='',answer_case_sensitive=False,marks=marks));count+=1
+        qdef=question_definition_from_form(r)
+        if qdef['error']:invalid+=1;continue
+        # In a Mock Drive Exam the faculty's visible section selection is the
+        # source of truth for the entire import. This intentionally overrides
+        # a missing, stale, or incorrect mock_section column in the CSV.
+        mock_section=selected_section if cfg and cfg.exam_type=='mock_drive' else (r.get('mock_section') or '').strip().lower()
+        opts=qdef['options'];s.add(Question(exam_id=exam_id,question=(r.get('question') or '').strip(),option_a=opts['A'],option_b=opts['B'],option_c=opts['C'],option_d=opts['D'],correct_answer=qdef['legacy_correct_answer'],question_type=qdef['question_type'],answer_key=qdef['answer_key'],answer_tolerance=qdef['answer_tolerance'],answer_case_sensitive=qdef['answer_case_sensitive'],marks=marks,mock_section=mock_section if mock_section in MOCK_DRIVE_SECTIONS else ''));count+=1
     pool_count=sync_manual_exam_question_count(s,exam_id)
-    audit_event(s,'exam_questions_csv_import','exam',exam_id,f'count={count}, pool={pool_count}');s.commit();flash(f'Imported {count} questions. New attempts will receive all {pool_count} question(s) in this exam.');return redirect(url_for('questions',exam_id=exam_id))
+    audit_event(s,'exam_questions_csv_import','exam',exam_id,f'count={count}, section={selected_section}, pool={pool_count}');s.commit()
+    section_label=MOCK_DRIVE_SECTIONS.get(selected_section)
+    message=(f'Imported and saved {count} question(s) in {section_label}. Total pool: {pool_count}.' if section_label else f'Imported {count} questions. New attempts will receive all {pool_count} question(s) in this exam.')
+    if invalid:message+=f' Skipped {invalid} invalid row(s).'
+    flash(message)
+    return redirect(url_for('questions',exam_id=exam_id))
 
 def result_rows(s,exam_id=None):
     stmt=select(Attempt,Student,Exam).join(Student,Student.id==Attempt.student_id).join(Exam,Exam.id==Attempt.exam_id)
@@ -8571,6 +8935,8 @@ def student_exam_unit_sort_key(label):
 @student_required
 def student_dashboard():
     s=DB();st=s.get(Student,web_session['user_id']);exams_list=s.scalars(select(Exam).where(Exam.is_active==True).order_by(Exam.id.desc())).all();rows=[]
+    if not st:
+        web_session.clear();flash('Your student login is no longer available. Please sign in again.','error');return redirect(url_for('home'))
     dashboard_now=now_dt();dashboard_now_naive=dashboard_now.astimezone(DISPLAY_TZ).replace(tzinfo=None);auto_refresh_epochs=[]
     for e in exams_list:
         allowed,access_label,session_row=exam_access_for_student(s,st.id,e)
@@ -8584,14 +8950,16 @@ def student_dashboard():
         # the Start button appear automatically with one request per student,
         # instead of repeated requests every few seconds for the whole class.
         start_value=(session_row.scheduled_start or '').strip() if session_row else ''
-        if not start_value and cfg and security and security.strict_start_window and (cfg.exam_type or '').strip().lower()=='practical_exam':
-            start_value=(cfg.practical_code_start_at or '').strip()
+        if not start_value and cfg and security and security.strict_start_window:
+            if (cfg.exam_type or '').strip().lower()=='practical_exam':start_value=(cfg.practical_code_start_at or '').strip()
+            elif (cfg.exam_type or '').strip().lower()=='mock_drive':start_value=(cfg.mock_drive_start_at or '').strip()
         try:dashboard_start=datetime.fromisoformat(start_value) if start_value else None
         except Exception:dashboard_start=None
         if not allowed and dashboard_start and dashboard_start>dashboard_now_naive:
             auto_refresh_epochs.append(int(dashboard_start.replace(tzinfo=DISPLAY_TZ).timestamp()))
 
-        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_grouped_exam_display_title(s,e,subject),'duration_minutes':e.duration_minutes,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label,'pin_required':bool(security and security.require_exam_pin)})())
+        display_duration=mock_drive_total_minutes(cfg,pool_count,e.duration_minutes) if cfg and cfg.exam_type=='mock_drive' else e.duration_minutes
+        rows.append(type('StudentExamRow',(),{'id':e.id,'title':e.title,'display_title':student_grouped_exam_display_title(s,e,subject),'duration_minutes':display_duration,'question_count':display_count,'attempt_status':att.status if att else None,'can_start':allowed,'access_label':access_label,'venue':session_row.venue if session_row else '','subject':subject,'unit_label':unit_label,'pin_required':bool(security and security.require_exam_pin)})())
 
     grouped={}
     for row in rows:
@@ -8611,6 +8979,60 @@ def student_dashboard():
             if astate in {'active','upcoming'}:
                 attendance_rows.append({'session':arow,'state':astate,'record':attendance_records.get(arow.id)})
     return render_template('student_dashboard.html',student=st,exams=rows,exam_groups=exam_groups,attendance_rows=attendance_rows,auto_refresh_at_epoch=min(auto_refresh_epochs) if auto_refresh_epochs else None,server_now_epoch=int(dashboard_now.timestamp()))
+
+@app.route('/student/code-editor')
+@student_required
+def student_code_editor():
+    return render_template('code_editor.html',languages=CODE_EDITOR_LANGUAGES)
+
+@app.route('/student/code-editor/run',methods=['POST'])
+@student_required
+def student_code_editor_run():
+    payload=request.get_json(silent=True) or {}
+    language=(payload.get('language') or '').strip().lower()
+    source=payload.get('source') if isinstance(payload.get('source'),str) else ''
+    stdin_text=payload.get('stdin') if isinstance(payload.get('stdin'),str) else ''
+    student_id=int(web_session.get('user_id') or 0);s=DB()
+    try:
+        if payload.get('exam_id') is not None:
+            try:exam_id=int(payload.get('exam_id'))
+            except Exception:raise ValueError('Invalid mock-drive exam.')
+            attempt=get_attempt(s,student_id,exam_id);exam_cfg=get_exam_config(s,exam_id,create=False)
+            progress=_mock_drive_progress(s,attempt,create=False) if attempt else None
+            if not attempt or attempt.status!='in_progress' or not exam_cfg or exam_cfg.exam_type!='mock_drive' or not progress or progress.active_section!='technical':
+                return jsonify({'ok':False,'error':'The embedded editor is available only inside the active Technical section.'}),403
+        # Validate before writing the job. Execution happens outside the web
+        # process, so a class-wide burst cannot occupy Gunicorn workers.
+        cfg=CODE_EDITOR_LANGUAGES.get(language)
+        if not cfg:raise ValueError('Choose a supported programming language.')
+        if not source.strip():raise ValueError('Write some code before selecting Run.')
+        if len(source.encode('utf-8'))>CODE_EDITOR_MAX_SOURCE_BYTES:raise ValueError('The source code is too large.')
+        if len(stdin_text.encode('utf-8'))>CODE_EDITOR_MAX_STDIN_BYTES:raise ValueError('The program input is too large.')
+        own_active=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.student_id==student_id,CodeRunJob.status.in_(['queued','running']))) or 0
+        if own_active>=2:return jsonify({'ok':False,'error':'You already have two programs waiting or running. Please wait for one to finish.'}),429
+        queue_size=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status.in_(['queued','running']))) or 0
+        if queue_size>=CODE_EDITOR_QUEUE_LIMIT:return jsonify({'ok':False,'error':'The classroom code queue is full. Please try again shortly.'}),503
+        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language=language,source_code=source,stdin_text=stdin_text,status='queued',created_at=now_iso())
+        s.add(job);s.commit()
+        return jsonify({'ok':True,'job_id':job.token,'status':'queued','position':queue_size+1,'status_url':url_for('student_code_editor_job',job_token=job.token)}),202
+    except ValueError as exc:s.rollback();return jsonify({'ok':False,'error':str(exc)}),400
+    except Exception:
+        s.rollback();app.logger.exception('Student code queue failed')
+        return jsonify({'ok':False,'error':'The program could not be queued safely. Please try again.'}),503
+
+@app.route('/student/code-editor/jobs/<job_token>')
+@student_required
+def student_code_editor_job(job_token):
+    s=DB();student_id=int(web_session.get('user_id') or 0)
+    job=s.scalar(select(CodeRunJob).where(CodeRunJob.token==job_token,CodeRunJob.student_id==student_id))
+    if not job:abort(404)
+    result={'ok':True,'status':job.status}
+    if job.status=='queued':
+        position=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status=='queued',CodeRunJob.id<=job.id)) or 1
+        result['position']=position
+    elif job.status=='completed':result.update({'output':job.output or '(Program finished with no output.)','exit_code':job.exit_code,'success':bool(job.success)})
+    elif job.status=='failed':result.update({'error':job.error or 'Code execution failed safely.'})
+    return jsonify(result)
 
 
 @app.route('/student/practical-code',methods=['GET','POST'])
@@ -8891,10 +9313,15 @@ def take_exam(exam_id):
     if not attempt:
         qids=list(s.scalars(select(Question.id).where(Question.exam_id==exam_id).order_by(Question.id)).all())
         if not qids:flash('This exam has no questions.','error');return redirect(url_for('student_dashboard'))
-        target=min((cfg.question_count if cfg and cfg.question_count else len(qids)),len(qids))
+        mock_drive=bool(cfg and cfg.exam_type=='mock_drive')
+        if mock_drive:
+            assigned=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id,Question.mock_section.in_(list(MOCK_DRIVE_SECTIONS)))) or 0
+            if int(assigned)!=len(qids):
+                flash('This Mock Drive Exam is not ready: faculty must assign every question to a section.','error');return redirect(url_for('student_dashboard'))
+        target=len(qids) if mock_drive else min((cfg.question_count if cfg and cfg.question_count else len(qids)),len(qids))
         if cfg is None or cfg.randomize_questions:qids=random.sample(qids,target)
         else:qids=qids[:target]
-        started=now_dt();end=started+timedelta(minutes=exam.duration_minutes)
+        started=now_dt();attempt_minutes=mock_drive_total_minutes(cfg,len(qids),exam.duration_minutes) if mock_drive else exam.duration_minutes;end=started+timedelta(minutes=attempt_minutes)
         common_window=resolved_exam_window_for_student(s,web_session['user_id'],exam,_session)
         common_end=common_window.get('end')
         if common_end:
@@ -8905,6 +9332,7 @@ def take_exam(exam_id):
             keys=list('ABCD')
             if cfg and cfg.shuffle_options:random.shuffle(keys)
             s.add(AttemptQuestion(attempt_id=attempt.id,question_id=qid,position=pos,option_order=''.join(keys)))
+        if mock_drive:_mock_drive_progress(s,attempt,create=True)
         if cfg and cfg.secure_sequential:
             _sequential_progress(s,attempt,create=True)
         s.commit()
@@ -8915,8 +9343,24 @@ def take_exam(exam_id):
         qids=[int(x) for x in attempt.question_order.split(',') if x]
         for pos,qid in enumerate(qids,1):s.add(AttemptQuestion(attempt_id=attempt.id,question_id=qid,position=pos,option_order='ABCD'))
         s.commit();aq_rows=s.scalars(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id).order_by(AttemptQuestion.position)).all()
-    sequential_mode=bool(cfg and cfg.secure_sequential)
-    sequential_progress=None;current_position=1;total_questions=len(aq_rows);sequential_elapsed=0;sequential_wait=0
+    mock_drive=bool(cfg and cfg.exam_type=='mock_drive');mock_progress=None;mock_active_section='';mock_completed=[];mock_remaining=[];durations={}
+    if mock_drive:
+        durations=effective_mock_section_minutes(s,cfg,exam_id,mock_drive_total_minutes(cfg,len(aq_rows),exam.duration_minutes))
+        mock_progress=_mock_drive_progress(s,attempt,create=True);s.commit()
+        mock_completed=_mock_progress_list(mock_progress.completed_sections)
+        section_order=_mock_progress_list(mock_progress.section_order)
+        mock_remaining=[key for key in section_order if key not in mock_completed]
+        mock_active_section=(mock_progress.active_section or '').strip()
+        if not mock_active_section:
+            return render_template('mock_drive_sections.html',exam=exam,display_title=student_exam_display_title(s,exam),sections=[{'key':key,'label':MOCK_DRIVE_SECTIONS[key],'count':len(_mock_section_question_ids(s,attempt,key)),'minutes':durations[key]} for key in mock_remaining],completed=[MOCK_DRIVE_SECTIONS[key] for key in mock_completed],end_epoch=end_dt.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=get_exam_security_policy(s,exam_id,create=False),secure_shell=bool(request.args.get('secure_shell')=='1'),mock_durations=durations,mock_sections=MOCK_DRIVE_SECTIONS)
+        if mock_active_section and not mock_progress.section_end_at:
+            resumed=now_dt();resumed_end=min(end_dt,resumed+timedelta(minutes=durations.get(mock_active_section,1)));mock_progress.current_question_position=max(1,int(mock_progress.current_question_position or 1));mock_progress.furthest_question_position=max(1,int(mock_progress.furthest_question_position or 1));mock_progress.question_started_at=resumed.isoformat(timespec='seconds');mock_progress.section_started_at=resumed.isoformat(timespec='seconds');mock_progress.section_end_at=resumed_end.isoformat(timespec='seconds');mock_progress.updated_at=now_iso();s.commit()
+        if mock_progress.section_end_at and now_dt()>=parse_dt(mock_progress.section_end_at):
+            if mock_active_section not in mock_completed:mock_completed.append(mock_active_section)
+            mock_progress.completed_sections=json.dumps(mock_completed);mock_progress.active_section='';mock_progress.updated_at=now_iso();audit_event(s,'mock_drive_section_time_expired','attempt',attempt.id,mock_active_section);s.commit();flash(f'{MOCK_DRIVE_SECTIONS[mock_active_section]} time ended and the section was locked.');return redirect(_mock_drive_resume_url(s,exam_id))
+        section_ids=_mock_section_question_ids(s,attempt,mock_active_section);section_rows=[row for row in aq_rows if row.question_id in set(section_ids)];total_questions=len(section_rows);current_position=max(1,min(int(mock_progress.current_question_position or 1),total_questions or 1));aq_rows=[section_rows[current_position-1]] if section_rows else []
+    sequential_mode=bool(cfg and cfg.secure_sequential and not mock_drive)
+    sequential_progress=None;current_position=locals().get('current_position',1);total_questions=locals().get('total_questions',len(aq_rows));sequential_elapsed=0;sequential_wait=0
     if sequential_mode:
         sequential_progress=_sequential_progress(s,attempt,create=True);s.commit()
         current_position=max(1,min(sequential_progress.current_position,total_questions or 1))
@@ -8928,11 +9372,95 @@ def take_exam(exam_id):
         q=qmap.get(aq.question_id)
         if not q:continue
         qtype=canonical_question_type(q.question_type);text={'A':q.option_a,'B':q.option_b,'C':q.option_c,'D':q.option_d};order=aq.option_order or 'ABCD';display=[(chr(65+i),key,text[key]) for i,key in enumerate(order)] if qtype in {'single_choice','multiple_select'} else []
-        views.append(type('QuestionView',(),{'id':q.id,'question':q.question,'question_type':qtype,'question_type_label':QUESTION_TYPE_LABELS.get(qtype,qtype),'display_options':display,'marks':q.marks})())
+        views.append(type('QuestionView',(),{'id':q.id,'question':q.question,'question_type':qtype,'question_type_label':QUESTION_TYPE_LABELS.get(qtype,qtype),'display_options':display,'marks':q.marks,'mock_section':q.mock_section or ''})())
     saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();answers={a.question_id:answer_record_value(a) for a in saved}
     security=get_exam_security_policy(s,exam_id,create=False)
     secure_shell=bool(request.args.get('secure_shell')=='1' and security and security.require_exam_pin)
-    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=end_dt.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait)
+    if mock_drive and mock_progress:
+        elapsed=max(0,int((now_dt()-parse_dt(mock_progress.question_started_at or now_iso())).total_seconds()));sequential_wait=max(0,int(cfg.sequential_min_seconds or 0)-elapsed);timer_end=min(end_dt,parse_dt(mock_progress.section_end_at)) if mock_progress.section_end_at else end_dt
+    else:timer_end=end_dt
+    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
+
+@app.route('/student/exam/<int:exam_id>/section/select',methods=['POST'])
+@student_required
+def select_mock_drive_section(exam_id):
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
+    if not attempt or attempt.status=='submitted' or not cfg or cfg.exam_type!='mock_drive':abort(404)
+    if not secure_exam_device_allowed(s,attempt):abort(409)
+    progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True);completed=_mock_progress_list(progress.completed_sections);order=_mock_progress_list(progress.section_order)
+    section=(request.form.get('section') or '').strip().lower()
+    if progress.active_section:
+        flash('Complete the current section before selecting another one.','error')
+    elif section not in order or section in completed:
+        flash('That section is unavailable.','error')
+    else:
+        exam=s.get(Exam,exam_id);durations=effective_mock_section_minutes(s,cfg,exam_id,mock_drive_total_minutes(cfg,len(attempt_question_ids(s,attempt)),exam.duration_minutes if exam else 1));section_minutes=durations.get(section,1)
+        started=now_dt();section_end=started+timedelta(minutes=section_minutes);exam_end=parse_dt(attempt.end_at)
+        if exam_end<section_end:section_end=exam_end
+        progress.active_section=section;progress.current_question_position=1;progress.furthest_question_position=1;progress.question_started_at=started.isoformat(timespec='seconds');progress.section_started_at=started.isoformat(timespec='seconds');progress.section_end_at=section_end.isoformat(timespec='seconds');progress.updated_at=now_iso();audit_event(s,'mock_drive_section_started','attempt',attempt.id,f'{section}; minutes={section_minutes}');s.commit()
+    return redirect(_mock_drive_resume_url(s,exam_id))
+
+@app.route('/student/exam/<int:exam_id>/section/complete',methods=['POST'])
+@student_required
+def complete_mock_drive_section(exam_id):
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
+    if not attempt or attempt.status=='submitted' or not cfg or cfg.exam_type!='mock_drive':abort(404)
+    if not secure_exam_device_allowed(s,attempt):abort(409)
+    progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+    expected=request.form.get('expected_position',type=int)
+    if expected is not None and expected!=int(progress.current_question_position or 1):
+        s.rollback();return redirect(_mock_drive_resume_url(s,exam_id),code=303)
+    section=(progress.active_section or '').strip();qids=_mock_section_question_ids(s,attempt,section)
+    if not section or not qids:return redirect(_mock_drive_resume_url(s,exam_id))
+    questions={q.id:q for q in s.scalars(select(Question).where(Question.id.in_(qids))).all()}
+    for qid,question in questions.items():
+        values=request.form.getlist(f'q_{qid}')
+        if values:
+            value=','.join(values) if canonical_question_type(question.question_type)=='multiple_select' else values[0]
+            try:save_answer_record(s,attempt.id,qid,value[:MAX_ANSWER_LENGTH],question)
+            except ValueError as exc:flash(str(exc),'error');s.rollback();return redirect(_mock_drive_resume_url(s,exam_id))
+    s.flush();answered=set(s.scalars(select(Answer.question_id).where(Answer.attempt_id==attempt.id,Answer.question_id.in_(qids),Answer.answer_value!='')).all())
+    missing=len(set(qids)-answered)
+    if missing:
+        flash(f'Complete all questions in this section before continuing. {missing} question(s) remain.','error');s.commit();return redirect(_mock_drive_resume_url(s,exam_id))
+    elapsed=max(0,int((now_dt()-parse_dt(progress.question_started_at or now_iso())).total_seconds()));minimum=max(0,int(cfg.sequential_min_seconds or 0))
+    if elapsed<minimum:
+        flash(f'Please spend at least {minimum} seconds on the final question. {minimum-elapsed} second(s) remaining.','error');s.commit();return redirect(_mock_drive_resume_url(s,exam_id))
+    completed=_mock_progress_list(progress.completed_sections)
+    if section not in completed:completed.append(section)
+    progress.completed_sections=json.dumps(completed);progress.active_section='';progress.section_end_at='';progress.updated_at=now_iso();audit_event(s,'mock_drive_section_completed','attempt',attempt.id,section);s.commit()
+    if len(completed)>=len(_mock_progress_list(progress.section_order)):
+        return redirect(_mock_drive_resume_url(s,exam_id))
+    flash(f'{MOCK_DRIVE_SECTIONS[section]} completed and locked. Choose the next section.')
+    return redirect(_mock_drive_resume_url(s,exam_id))
+
+@app.route('/student/exam/<int:exam_id>/section/expire',methods=['POST'])
+@student_required
+def expire_mock_drive_section(exam_id):
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False);ajax=request.headers.get('X-Requested-With')=='XMLHttpRequest'
+    if not attempt or not cfg or cfg.exam_type!='mock_drive':
+        if ajax:return jsonify(ok=False,submitted=False,exam_url=url_for('student_dashboard')),404
+        return redirect(url_for('student_dashboard'))
+    if attempt.status=='submitted':
+        result_url=url_for('submitted',exam_id=exam_id)
+        if ajax:return jsonify(ok=True,submitted=True,submitted_url=result_url)
+        return redirect(result_url)
+    # The rendered countdown is the earlier of the active section end and the
+    # common exam-window end. If the common window expired, finish the entire
+    # attempt here instead of redirecting the result page inside the iframe.
+    if now_dt()>=parse_dt(attempt.end_at):
+        finalize_attempt(s,attempt,'TIME_EXPIRED');clear_secure_exam_launch_token(exam_id)
+        result_url=url_for('submitted',exam_id=exam_id)
+        if ajax:return jsonify(ok=True,submitted=True,submitted_url=result_url)
+        return redirect(result_url)
+    progress=_mock_drive_progress(s,attempt,create=True);section=(progress.active_section or '').strip()
+    if section and progress.section_end_at and now_dt()>=parse_dt(progress.section_end_at):
+        completed=_mock_progress_list(progress.completed_sections)
+        if section not in completed:completed.append(section)
+        progress.completed_sections=json.dumps(completed);progress.active_section='';progress.updated_at=now_iso();audit_event(s,'mock_drive_section_time_expired','attempt',attempt.id,section);s.commit();flash(f'{MOCK_DRIVE_SECTIONS[section]} time ended and the section was locked.')
+    exam_url=_mock_drive_resume_url(s,exam_id)
+    if ajax:return jsonify(ok=True,submitted=False,exam_url=exam_url)
+    return redirect(exam_url)
 
 @app.route('/student/exam/<int:exam_id>/next-question',methods=['POST'])
 @student_required
@@ -8943,14 +9471,36 @@ def next_exam_question(exam_id):
         security=get_exam_security_policy(s,exam_id,create=False)
         if security and security.require_exam_pin and exam_pin_is_verified(exam_id):
             token=create_secure_exam_launch_token(exam_id)
-            return redirect(url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=token))
-        return redirect(url_for('take_exam',exam_id=exam_id))
+            return redirect(url_for('take_exam',exam_id=exam_id,secure_shell=1,launch=token),code=303)
+        return redirect(url_for('take_exam',exam_id=exam_id),code=303)
 
     if not attempt or attempt.status=='submitted':return redirect(url_for('submitted',exam_id=exam_id))
+    if cfg and cfg.exam_type=='mock_drive':
+        if not secure_exam_device_allowed(s,attempt):flash('This exam is locked to another device.','error');return redirect(url_for('student_dashboard'))
+        progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+        expected=request.form.get('expected_position',type=int)
+        if expected is not None and expected!=int(progress.current_question_position or 1):
+            s.rollback();return resume_current_question()
+        section=(progress.active_section or '').strip();qids=_mock_section_question_ids(s,attempt,section)
+        current=max(1,min(int(progress.current_question_position or 1),len(qids) or 1));qid=qids[current-1] if qids else 0;question=s.get(Question,qid) if qid else None;values=request.form.getlist(f'q_{qid}') if qid else []
+        if values:
+            value=','.join(values) if question and canonical_question_type(question.question_type)=='multiple_select' else values[0]
+            try:save_answer_record(s,attempt.id,qid,value[:MAX_ANSWER_LENGTH],question)
+            except ValueError as exc:flash(str(exc),'error');s.rollback();return resume_current_question()
+        if current>=int(progress.furthest_question_position or 1):
+            elapsed=max(0,int((now_dt()-parse_dt(progress.question_started_at or now_iso())).total_seconds()));minimum=max(0,int(cfg.sequential_min_seconds or 0))
+            if elapsed<minimum:flash(f'Please spend at least {minimum} seconds on this question. {minimum-elapsed} second(s) remaining.','error');s.commit();return resume_current_question()
+        if current<len(qids):
+            progress.current_question_position=current+1;progress.furthest_question_position=max(int(progress.furthest_question_position or 1),current+1);progress.question_started_at=now_iso();progress.updated_at=now_iso();s.commit()
+        return resume_current_question()
     if not cfg or not cfg.secure_sequential:return resume_current_question()
     if not secure_exam_device_allowed(s,attempt):flash('This exam is locked to another device.','error');return redirect(url_for('student_dashboard'))
     if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return redirect(url_for('submitted',exam_id=exam_id))
-    progress=_sequential_progress(s,attempt,create=True);aq=_attempt_question_at_position(s,attempt,progress.current_position)
+    progress=s.scalar(select(SequentialAttemptProgress).where(SequentialAttemptProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _sequential_progress(s,attempt,create=True)
+    expected=request.form.get('expected_position',type=int)
+    if expected is not None and expected!=int(progress.current_position or 1):
+        s.rollback();return resume_current_question()
+    aq=_attempt_question_at_position(s,attempt,progress.current_position)
     if not aq:flash('Current question could not be resolved.','error');s.commit();return resume_current_question()
     question=s.get(Question,aq.question_id);field=f'q_{aq.question_id}';values=request.form.getlist(field)
     if values:
@@ -8967,8 +9517,21 @@ def next_exam_question(exam_id):
         flash(f'Please spend at least {minimum} seconds on this question. {minimum-elapsed} second(s) remaining.','error');s.commit();return resume_current_question()
     total=s.scalar(select(func.count()).select_from(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id)) or 0
     if progress.current_position<total:
-        progress.current_position+=1;progress.question_started_at=now_iso();progress.updated_at=now_iso();_diagnostic_event(s,attempt,'question_advanced',f'position={progress.current_position}; previous_elapsed={elapsed}s; answered={1 if answered else 0}');s.commit()
+        progress.current_position+=1;progress.question_started_at=now_iso();progress.updated_at=now_iso();s.commit()
     return resume_current_question()
+
+@app.route('/student/exam/<int:exam_id>/previous-question',methods=['POST'])
+@student_required
+def previous_mock_drive_question(exam_id):
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
+    if not attempt or attempt.status=='submitted' or not cfg or cfg.exam_type!='mock_drive':return redirect(url_for('student_dashboard'))
+    progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+    expected=request.form.get('expected_position',type=int)
+    if expected is not None and expected!=int(progress.current_question_position or 1):
+        s.rollback();return redirect(_mock_drive_resume_url(s,exam_id),code=303)
+    if progress.active_section and int(progress.current_question_position or 1)>1:
+        progress.current_question_position-=1;progress.question_started_at=now_iso();progress.updated_at=now_iso();s.commit()
+    return redirect(_mock_drive_resume_url(s,exam_id))
 
 @app.route('/student/save-answer',methods=['POST'])
 @student_required
@@ -8984,6 +9547,11 @@ def save_answer():
     if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return jsonify(saved=False,submitted=True)
     if qid not in attempt_question_ids(s,attempt):return jsonify(error='Question not part of this attempt'),400
     cfg=get_exam_config(s,exam_id,create=False)
+    if cfg and cfg.exam_type=='mock_drive':
+        progress=_mock_drive_progress(s,attempt,create=True)
+        question=s.get(Question,qid)
+        if not question or not progress.active_section or question.mock_section!=progress.active_section:
+            return jsonify(error='This question belongs to a locked or inactive section.'),409
     if cfg and cfg.secure_sequential:
         progress=_sequential_progress(s,attempt,create=True);current=_attempt_question_at_position(s,attempt,progress.current_position)
         if not current or current.question_id!=qid:return jsonify(error='Only the current question can be answered in Secure Sequential mode.'),409
@@ -9040,9 +9608,10 @@ def student_exam_page_loaded():
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt:return jsonify(saved=False),404
     diag=_attempt_diagnostic(s,attempt,True)
-    if not diag.page_loaded_at:diag.page_loaded_at=now_iso()
+    first_load=not diag.page_loaded_at
+    if first_load:diag.page_loaded_at=now_iso()
     diag.updated_at=now_iso()
-    _diagnostic_event(s,attempt,'page_loaded',f'state={str(data.get("state") or "active")[:30]}')
+    if first_load:_diagnostic_event(s,attempt,'page_loaded',f'state={str(data.get("state") or "active")[:30]}')
     s.commit();return jsonify(saved=True,server_time=now_iso())
 
 @app.route('/student/heartbeat',methods=['POST'])
@@ -9056,13 +9625,13 @@ def student_heartbeat():
     if not secure_exam_device_allowed(s,attempt):return jsonify(saved=False,device_locked=True),409
     device_lock=s.scalar(select(ExamDeviceLock).where(ExamDeviceLock.exam_id==exam_id,ExamDeviceLock.student_id==attempt.student_id))
     if device_lock:device_lock.last_seen_at=now_iso()
-    count=s.scalar(select(func.count()).select_from(Answer).where(Answer.attempt_id==attempt.id)) or 0
     row=s.scalar(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id==attempt.id));fingerprint=hashlib.sha256(((request.headers.get('User-Agent') or '')+'|'+(request.remote_addr or '')).encode('utf-8')).hexdigest()[:24]
     state=str(data.get('state') or 'active')[:30]
-    if not row:row=AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=int(count),client_state=state,client_fingerprint=fingerprint);s.add(row)
-    else:row.last_seen_at=now_iso();row.answer_count=int(count);row.client_state=state;row.client_fingerprint=fingerprint
+    if not row:
+        count=s.scalar(select(func.count()).select_from(Answer).where(Answer.attempt_id==attempt.id)) or 0
+        row=AttemptHeartbeat(attempt_id=attempt.id,last_seen_at=now_iso(),answer_count=int(count),client_state=state,client_fingerprint=fingerprint);s.add(row)
+    else:row.last_seen_at=now_iso();row.client_state=state;row.client_fingerprint=fingerprint
     diag=_attempt_diagnostic(s,attempt,True);diag.last_client_state=state;diag.updated_at=now_iso()
-    _diagnostic_event(s,attempt,'heartbeat',f'state={state}; answers={int(count)}')
     s.commit();return jsonify(saved=True,server_time=now_iso())
 
 @app.route('/student/exam/<int:exam_id>/submit',methods=['POST'])
@@ -9116,6 +9685,11 @@ def submit_exam(exam_id):
                 return redirect(url)
             finalize_attempt(s,attempt,'TIME_EXPIRED')
         else:
+            if cfg and cfg.exam_type=='mock_drive':
+                progress=_mock_drive_progress(s,attempt,create=True)
+                completed=_mock_progress_list(progress.completed_sections);required=_mock_progress_list(progress.section_order)
+                if progress.active_section or set(completed)!=set(required):
+                    return reject_submit('Complete and lock every Mock Drive section before submitting the exam.')
             if cfg and cfg.secure_sequential:
                 progress=_sequential_progress(s,attempt,create=True);total=s.scalar(select(func.count()).select_from(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id)) or 0
                 current=_attempt_question_at_position(s,attempt,progress.current_position)
@@ -9155,7 +9729,7 @@ def submitted(exam_id):
     release_at=exam_result_release_at(s,attempt.student_id,exam)
     results_released=not release_at or now_dt().replace(tzinfo=None)>=release_at.replace(tzinfo=None)
     percentage,grade,grade_class=result_performance(attempt.score,attempt.total_marks)
-    return render_template('submitted.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,violations=violations,percentage=percentage,grade=grade,grade_class=grade_class,results_released=results_released,result_release_at=release_at,answer_review_exam_id=exam.id if attempt.status=='submitted' and results_released else None)
+    return render_template('submitted.html',exam=exam,display_title=student_exam_display_title(s,exam),attempt=attempt,violations=violations,percentage=percentage,grade=grade,grade_class=grade_class,results_released=results_released,result_release_at=release_at,answer_review_exam_id=exam.id if attempt.status=='submitted' else None)
 
 @app.route('/student/submitted/<int:exam_id>/answers')
 @student_required

@@ -3,6 +3,7 @@ function csrfToken(){
   return el ? el.getAttribute('content') : '';
 }
 let examSubmissionInProgress=false;
+let examNavigationInProgress=false;
 function beginExamSubmission(examId,reason='MANUAL'){
   examSubmissionInProgress=true;
   try{
@@ -45,6 +46,12 @@ async function submitExamToServer(form,examId,reason){
     const payload=await response.json().catch(()=>({ok:false,message:'Submission response could not be read.'}));
 
     if(response.ok && payload.ok && payload.submitted && payload.submitted_url){
+      // A secure exam runs in a same-origin iframe. Navigate the top-level
+      // window directly so the result can never remain trapped in that frame.
+      try{
+        const destination=new URL(payload.submitted_url,window.location.origin);
+        if(destination.origin===window.location.origin){window.top.location.replace(destination.pathname+destination.search+destination.hash);return {ok:true,submitted:true,navigating:true};}
+      }catch(_err){}
       try{
         window.parent.postMessage({
           type:'secure-exam-submitted',
@@ -53,7 +60,7 @@ async function submitExamToServer(form,examId,reason){
         },window.location.origin);
         return {ok:true,submitted:true};
       }catch(_err){}
-      window.top.location.replace(payload.submitted_url);
+      window.location.replace(payload.submitted_url);
       return {ok:true,submitted:true,navigating:true};
     }
 
@@ -65,7 +72,20 @@ async function submitExamToServer(form,examId,reason){
   }
 }
 
-async function saveAnswer(examId, questionId, answer, retryCount=0){
+const answerSaveStates=new Map();
+function saveAnswer(examId,questionId,answer){
+  const key=`${Number(examId)}:${Number(questionId)}`;
+  const state=answerSaveStates.get(key)||{timer:null,inFlight:false,pending:undefined,lastSaved:undefined,retries:0};
+  state.pending=String(answer??'');state.retries=0;
+  clearTimeout(state.timer);
+  state.timer=setTimeout(()=>flushAnswerSave(examId,questionId,key),300);
+  answerSaveStates.set(key,state);
+}
+async function flushAnswerSave(examId,questionId,key){
+  const state=answerSaveStates.get(key);
+  if(!state||state.inFlight||state.pending===undefined)return;
+  if(state.pending===state.lastSaved){state.pending=undefined;return;}
+  const answer=state.pending;state.pending=undefined;state.inFlight=true;
   const status=document.getElementById('save-status');
   if(status) status.textContent='Saving…';
   try{
@@ -76,6 +96,7 @@ async function saveAnswer(examId, questionId, answer, retryCount=0){
     });
     const data=await res.json();
     if(!res.ok) throw new Error(data.error || 'Save failed');
+    state.lastSaved=answer;state.retries=0;
     if(data.submitted){
       const resultUrl='/student/submitted/'+examId;
       const form=document.getElementById('exam-form');
@@ -89,8 +110,17 @@ async function saveAnswer(examId, questionId, answer, retryCount=0){
     }
     if(status){status.textContent='Saved';setTimeout(()=>{if(status.textContent==='Saved')status.textContent='';},1000);}
   }catch(err){
-    if(status) status.textContent='Save failed — retrying…';
-    if(retryCount<10) setTimeout(()=>saveAnswer(examId,questionId,answer,retryCount+1),3000);
+    if(status) status.textContent='Save delayed — retrying…';
+    if(state.pending===undefined)state.pending=answer;
+    state.retries+=1;
+  }finally{
+    state.inFlight=false;
+    if(state.pending!==undefined && state.pending!==state.lastSaved && state.retries<=3){
+      clearTimeout(state.timer);
+      state.timer=setTimeout(()=>flushAnswerSave(examId,questionId,key),state.retries?1000*state.retries:100);
+    }else if(state.retries>3 && status){
+      status.textContent='Save failed — use Next to save this answer';
+    }
   }
 }
 function startTimer(endEpoch,serverNowEpoch){
@@ -121,6 +151,39 @@ function startTimer(endEpoch,serverNowEpoch){
   };
   tick();handle=setInterval(tick,1000);
 }
+function startSectionTimer(endEpoch,serverNowEpoch,expiryUrl){
+  const timer=document.getElementById('timer'),form=document.getElementById('exam-form');
+  const initialLeft=Math.max(0,Number(endEpoch)-Number(serverNowEpoch));
+  const started=(window.performance&&performance.now)?performance.now():0;let handle=null,expired=false;
+  const tick=()=>{
+    const elapsed=started&&window.performance?Math.max(0,(performance.now()-started)/1000):0;
+    const left=Math.max(0,Math.ceil(initialLeft-elapsed)),h=Math.floor(left/3600),m=Math.floor((left%3600)/60),s=left%60;
+    if(timer)timer.textContent=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    if(left<=0&&!expired){
+      expired=true;if(handle)clearInterval(handle);
+      if(form){
+        const examId=Number(form.getAttribute('data-exam-integrity')||0);
+        fetch(expiryUrl,{method:'POST',body:new FormData(form),credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest','Accept':'application/json'},cache:'no-store'})
+          .then(async response=>({response,payload:await response.json().catch(()=>null)}))
+          .then(({response,payload})=>{
+            if(!response.ok||!payload)throw new Error('Section expiry response failed');
+            if(payload.submitted&&payload.submitted_url){
+              examSubmissionInProgress=true;
+              if(window.parent!==window){
+                window.parent.postMessage({type:'secure-exam-submitting',exam_id:examId,reason:'TIME_EXPIRED'},window.location.origin);
+                window.parent.postMessage({type:'secure-exam-submitted',exam_id:examId,url:payload.submitted_url},window.location.origin);
+                return;
+              }
+              window.location.replace(payload.submitted_url);return;
+            }
+            if(payload.exam_url)window.location.replace(payload.exam_url);
+          })
+          .catch(()=>{form.action=expiryUrl;form.method='post';form.submit();});
+      }
+    }
+  };
+  tick();handle=setInterval(tick,1000);
+}
 async function logIntegrity(examId,eventType,details='',options={}){
   try{
     const res=await fetch('/student/integrity-event',{
@@ -139,10 +202,10 @@ async function logIntegrity(examId,eventType,details='',options={}){
         // cleanly.  The fallback keeps normal/non-shell exam pages working.
         const secureFrame=document.body && document.body.classList.contains('secure-exam-shell-page') && window.parent!==window;
         if(secureFrame){
-          try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:Number(examId),url:resultUrl},window.location.origin);return data;}catch(_err){}
+          try{window.parent.postMessage({type:'secure-exam-locked',exam_id:Number(examId),url:resultUrl,message:data.message || ''},window.location.origin);return data;}catch(_err){}
         }
         if(window.parent!==window){
-          try{window.parent.postMessage({type:'secure-exam-submitted',exam_id:Number(examId),url:resultUrl},window.location.origin);return data;}catch(_err){}
+          try{window.parent.postMessage({type:'secure-exam-locked',exam_id:Number(examId),url:resultUrl,message:data.message || ''},window.location.origin);return data;}catch(_err){}
         }
         window.location.href=resultUrl;
       }
@@ -174,7 +237,7 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
   // The outer secure shell monitors top-level visibility instead.
   if(!insideSecureShell){
     document.addEventListener('visibilitychange',async()=>{
-      if(examSubmissionInProgress)return;
+      if(examSubmissionInProgress||examNavigationInProgress)return;
       if(document.hidden){const data=await logIntegrity(examId,'tab_hidden','Exam tab became hidden');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();}
     });
   }
@@ -184,7 +247,7 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
       catch(_err){fullscreenBtn.textContent='Full Screen Unavailable';}
     });}
     document.addEventListener('fullscreenchange',async()=>{
-      if(examSubmissionInProgress)return;
+      if(examSubmissionInProgress||examNavigationInProgress)return;
       if(document.fullscreenElement){enteredFullscreen=true;if(fullscreenBtn)fullscreenBtn.textContent='Full Screen Active';return;}
       if(enteredFullscreen){const data=await logIntegrity(examId,'fullscreen_exit','Full-screen mode exited');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();if(fullscreenBtn)fullscreenBtn.textContent='Re-enter Full Screen';}
     });
@@ -383,15 +446,17 @@ function initFreeAnswerAutosave(){
     input.addEventListener('blur',()=>{
       const examId=Number(input.getAttribute('data-autosave-exam'));
       const questionId=Number(input.getAttribute('data-autosave-question'));
+      const key=`${examId}:${questionId}`;
+      clearTimeout(freeAnswerTimers.get(key));freeAnswerTimers.delete(key);
       saveAnswer(examId,questionId,input.value);
     });
   });
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initFreeAnswerAutosave); else initFreeAnswerAutosave();
 
-function startExamHeartbeat(examId,seconds=15){
+function startExamHeartbeat(examId,seconds=25){
   try{fetch('/student/exam-page-loaded',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify({exam_id:examId,state:document.hidden?'hidden':'active'})});}catch(_err){}
-  const interval=Math.max(10,Math.min(60,Number(seconds)||15))*1000;
+  const interval=Math.max(20,Math.min(60,Number(seconds)||25))*1000;
   const ping=async(state='active')=>{
     try{await fetch('/student/heartbeat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken()},body:JSON.stringify({exam_id:examId,state})});}catch(_err){}
   };
@@ -399,6 +464,24 @@ function startExamHeartbeat(examId,seconds=15){
   window.addEventListener('online',()=>ping('online'));
   window.addEventListener('offline',()=>ping('offline'));
 }
+
+function initSingleFlightExamNavigation(){
+  const form=document.getElementById('exam-form');
+  if(!form)return;
+  form.addEventListener('submit',event=>{
+    if(examNavigationInProgress||examSubmissionInProgress){event.preventDefault();return;}
+    examNavigationInProgress=true;
+    // Defer disabling until the browser has captured the clicked submitter's
+    // formaction. The server also checks expected_position under a row lock.
+    setTimeout(()=>{
+      form.querySelectorAll('button[type="submit"]').forEach(button=>{
+        button.disabled=true;
+        if(button.id==='sequential-next')button.textContent='Loading…';
+      });
+    },0);
+  });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initSingleFlightExamNavigation);else initSingleFlightExamNavigation();
 
 function initQuestionTypeForms(){
   document.querySelectorAll('[data-question-definition-form]').forEach(form=>{

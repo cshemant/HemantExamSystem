@@ -1,7 +1,44 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div class="eyebrow">Exam question pool</div><h1>{{ exam.title }}</h1><p class="muted">Questions copied from the Question Bank are stable snapshots. One-off questions can now use five answer types.</p></div>
+<div class="page-head">
+  <div class="eyebrow">Exam question pool</div><h1>{{ exam.title }}</h1>
+  <p class="muted">Questions copied from the Question Bank are stable snapshots. One-off questions can use five answer types.</p>
+</div>
 <div class="actions page-actions"><a class="btn" href="{{ url_for('question_bank') }}">Add from Question Bank</a><a class="btn secondary" href="{{ url_for('exam_builder',exam_id=exam.id) }}">Open Blueprint Generator</a></div>
-<div class="card"><h2>Add One-off Question</h2><form method="post" data-question-definition-form><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% include '_question_fields.html' %}<button>Add Question</button></form></div>
-<div class="card"><h2>Legacy MCQ CSV Import</h2><form method="post" action="{{ url_for('import_questions',exam_id=exam.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="file" name="csv_file" accept=".csv" required><button>Import CSV</button></form><p class="muted" style="margin-top:12px">For multi-type reusable questions, use the main Question Bank CSV/Excel import.</p></div>
-<div class="card"><h2>Question Pool ({{ questions|length }})</h2>{% for q in questions %}<div class="question"><div class="question-title">Q{{ loop.index }}. {{ q.question }}</div><div class="mini-meta">{{ q.question_type|replace('_',' ')|title }} · {{ q.marks }} mark(s)</div>{% if q.question_type in ['single_choice','MCQ','multiple_select'] %}<p class="muted">A. {{ q.option_a }}<br>B. {{ q.option_b }}<br>C. {{ q.option_c }}<br>D. {{ q.option_d }}</p>{% else %}<p class="muted">Answer key configured for automatic marking.</p>{% endif %}<div style="margin-top:10px"><span class="badge">Type: {{ q.question_type|replace('_',' ')|title }}</span>{% if q.id in mapped %} <span class="badge success">Question Bank</span>{% else %} <span class="badge gray">One-off</span>{% endif %}</div></div>{% else %}<p class="muted">No questions added yet.</p>{% endfor %}</div>
+
+<div class="card mock-question-entry-card">
+  <h2>Add One-off Question</h2>
+  {% if cfg and cfg.exam_type=='mock_drive' %}
+  <div class="mock-entry-section-picker">
+    <label for="mock-entry-section">Mock Drive Section</label>
+    <select id="mock-entry-section" required><option value="">Choose section…</option>{% for key,label in mock_sections.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select>
+    <p class="mini-meta">This section applies to either the one-off question or every question imported from the CSV below.</p>
+  </div>
+  {% endif %}
+  <form method="post" data-question-definition-form id="one-off-question-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if cfg and cfg.exam_type=='mock_drive' %}<input type="hidden" name="mock_section" data-mock-section-target>{% endif %}{% include '_question_fields.html' %}<button>Add Question</button></form>
+  <div class="mock-entry-or" role="separator"><span>OR</span></div>
+  <section class="inline-csv-import">
+    <h3 id="mock-csv-import-title">{% if cfg and cfg.exam_type=='mock_drive' %}Selected Section CSV Import{% else %}Question CSV Import{% endif %}</h3>
+    <div class="actions" style="margin-bottom:12px;flex-wrap:wrap">{% for key,label in question_type_labels.items() %}<a class="btn small secondary" href="{{ url_for('download_question_csv_template',exam_id=exam.id,question_type=key) }}">{{ label }} template</a>{% endfor %}</div>
+    <form method="post" action="{{ url_for('import_questions',exam_id=exam.id) }}" enctype="multipart/form-data" id="question-csv-import-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if cfg and cfg.exam_type=='mock_drive' %}<input type="hidden" name="mock_section" data-mock-section-target>{% endif %}<input type="file" name="csv_file" accept=".csv" required><button>Import CSV</button></form>
+    <p class="muted" style="margin-top:12px">Every imported question will be saved directly in the selected Mock Drive section.</p>
+  </section>
+</div>
+
+<div class="card"><h2>Question Pool ({{ questions|length }})</h2>
+{% if cfg and cfg.exam_type=='mock_drive' %}<div class="generation-summary"><strong>Required:</strong> assign every existing unassigned question to a section. Assignments become locked when the first attempt starts.</div><form method="post" action="{{ url_for('update_mock_drive_sections',exam_id=exam.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+{% for q in questions %}<div class="question"><div class="question-title">Q{{ loop.index }}. {{ q.question }}</div><div class="mini-meta">{{ q.question_type|replace('_',' ')|title }} · {{ q.marks }} mark(s)</div>
+{% if cfg and cfg.exam_type=='mock_drive' %}<label>Section<select name="section_{{ q.id }}" required><option value="" {% if not q.mock_section %}selected{% endif %}>Unassigned — choose section…</option>{% for key,label in mock_sections.items() %}<option value="{{ key }}" {% if q.mock_section==key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>{% endif %}
+{% if q.question_type in ['single_choice','MCQ','multiple_select'] %}<p class="muted">A. {{ q.option_a }}<br>B. {{ q.option_b }}<br>C. {{ q.option_c }}<br>D. {{ q.option_d }}</p>{% else %}<p class="muted">Answer key configured for automatic marking.</p>{% endif %}
+<div style="margin-top:10px"><span class="badge">Type: {{ q.question_type|replace('_',' ')|title }}</span>{% if q.id in mapped %} <span class="badge success">Question Bank</span>{% else %} <span class="badge gray">One-off</span>{% endif %}{% if cfg and cfg.exam_type=='mock_drive' %} <span class="badge {% if q.mock_section %}success{% else %}warning{% endif %}">{{ mock_sections.get(q.mock_section,'Unassigned') }}</span>{% endif %}</div></div>{% else %}<p class="muted">No questions added yet.</p>{% endfor %}
+{% if cfg and cfg.exam_type=='mock_drive' and questions %}<button>Save All Section Assignments</button></form>{% endif %}</div>
+
+{% if cfg and cfg.exam_type=='mock_drive' %}<script>
+(function(){
+  const section=document.getElementById('mock-entry-section'),title=document.getElementById('mock-csv-import-title');
+  const labels={{ mock_sections|tojson }};if(!section)return;
+  function sync(){document.querySelectorAll('[data-mock-section-target]').forEach(input=>{input.value=section.value;});title.textContent=section.value?labels[section.value]+' CSV Import':'Selected Section CSV Import';}
+  section.addEventListener('change',sync);sync();
+  ['one-off-question-form','question-csv-import-form'].forEach(id=>{const form=document.getElementById(id);if(!form)return;form.addEventListener('submit',event=>{sync();if(!section.value){event.preventDefault();section.focus();window.alert('Choose a Mock Drive section first.');}});});
+})();
+</script>{% endif %}
 {% endblock %}

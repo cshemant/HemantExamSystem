@@ -1,6 +1,7 @@
 {% extends 'base.html' %}{% block content %}
 <script>window.EXAM_VOICE_SUBJECT_CATALOG={{ (voice_subject_catalog or [])|tojson }};window.EXAM_VOICE_CURRICULUM_CATALOG={{ (curriculum_exam_options or [])|tojson }};window.EXAM_VOICE_AI_CONFIGURED={{ ai.configured|tojson }};</script>
-<div class="page-head"><h1>Exams</h1></div>
+<div class="page-head"><div><h1>{{ 'Mock Test Drive' if mock_drive_page else 'Exams' }}</h1>{% if mock_drive_page %}<p>Placement-focused mock examinations kept separate from subject examinations.</p>{% endif %}</div></div>
+{% if not mock_drive_page %}
 <script>
 (function(){
  const subject=document.getElementById('ai-curriculum-subject'),unit=document.getElementById('ai-curriculum-unit'),context=document.getElementById('ai-curriculum-context');
@@ -83,13 +84,14 @@
   syncUnits();
 })();
 </script>
+{% endif %}
 
-<div class="card"><h2>Create Exam</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Exam Title</label><input name="title" required></div><div><label>Duration (minutes)</label><input name="duration" type="number" min="1" value="30" required></div></div><button>Create Draft Exam</button></form></div>
+<div class="card"><h2>Create Exam</h2><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Exam Title</label><input name="title" required placeholder="{{ 'Campus Placement Mock - Set A' if mock_drive_page else '' }}"></div>{% if not mock_drive_page %}<input type="hidden" name="exam_type" value="regular"><div><label>Duration (minutes)</label><input name="duration" type="number" min="1" value="30" required></div>{% else %}<div><label>Minutes per question</label><input name="mock_minutes_per_question" type="number" min="1" max="60" value="1" required></div>{% endif %}</div><button>Create Draft {{ 'Mock Test Drive' if mock_drive_page else 'Exam' }}</button>{% if mock_drive_page %}<p class="mini-meta">The scheduled start/end window determines total duration when set; otherwise duration is questions × minutes per question.</p>{% endif %}</form></div>
 <div class="card"><h2>Exam List</h2>
 {% if exam_groups %}
   {% for group in exam_groups %}
   <section class="admin-exam-subject-group">
-    <h3>{{ group.subject }}</h3>
+    {% if not mock_drive_page %}<h3>{{ group.subject }}</h3>{% endif %}
     <div class="table-wrap"><table>
       <tr><th>Title</th><th>Duration</th><th>Pool</th><th>Per Student</th><th>Batch Sessions</th><th>Approval</th><th>Status</th><th>Actions</th></tr>
       {% for e in group.exams %}
@@ -104,6 +106,11 @@
                   data-practical-experiment-no="{{ e.practical_experiment_no|e }}"
                   data-practical-code-start-at="{{ (e.practical_code_start_at or '')[:16]|e }}"
                   data-practical-code-end-at="{{ (e.practical_code_end_at or '')[:16]|e }}"
+                  data-mock-drive-start-at="{{ (e.mock_drive_start_at or '')[:16]|e }}"
+                  data-mock-drive-end-at="{{ (e.mock_drive_end_at or '')[:16]|e }}"
+                  data-mock-section-minutes="{{ e.mock_section_minutes|e }}"
+                  data-mock-minutes-per-question="{{ e.mock_minutes_per_question }}"
+                  data-mock-min-question-seconds="{{ e.sequential_min_seconds }}"
                   aria-label="Edit {{ e.title }}" title="Edit exam">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4zM13.5 6.5l4 4"/></svg>
           </button>
@@ -122,12 +129,12 @@
   </section>
   {% endfor %}
 {% else %}
-  <p>No exams created yet.</p>
+  <p>{{ 'No Mock Test Drive exams created yet.' if mock_drive_page else 'No exams created yet.' }}</p>
 {% endif %}
 </div>
 
 {% if staff_role=='super_admin' %}
-<dialog id="exam-edit-dialog" style="max-width:560px;width:calc(100% - 32px);border:0;border-radius:16px;padding:0;box-shadow:0 18px 60px rgba(15,23,42,.22)">
+<dialog id="exam-edit-dialog" style="max-width:720px;width:calc(100% - 32px);max-height:90vh;overflow:auto;border:0;border-radius:16px;padding:0;box-shadow:0 18px 60px rgba(15,23,42,.22)">
   <form id="exam-edit-form" method="post" style="padding:24px;margin:0">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <h2 style="margin-top:0">Edit Exam</h2>
@@ -136,7 +143,7 @@
         <label for="exam-edit-title">Exam Title</label>
         <input id="exam-edit-title" name="title" required>
       </div>
-      <div>
+      <div {% if mock_drive_page %}hidden{% endif %}>
         <label for="exam-edit-subject">Subject Section</label>
         <select id="exam-edit-subject" name="subject_id" required>
           <option value="__general__" data-subject-name="General">General</option>
@@ -148,8 +155,12 @@
       <div>
         <label for="exam-edit-type">Exam Type</label>
         <select id="exam-edit-type" name="exam_type" required>
+          {% if mock_drive_page %}
+          <option value="mock_drive">Mock Test Drive</option>
+          {% else %}
           <option value="regular">Regular Exam</option>
           <option value="practical_exam">Practical Exam</option>
+          {% endif %}
         </select>
       </div>
       <div id="exam-edit-practical-mapping" hidden style="display:grid;gap:16px">
@@ -166,6 +177,13 @@
           <input id="exam-edit-practical-code-end" name="practical_code_end_at" type="datetime-local">
         </div>
         <div class="mini-meta"><strong>Secure defaults:</strong> selecting Practical Exam automatically enables randomization, option shuffle, Secure Sequential (one question at a time), a 10-second minimum per question, full-screen monitoring, rotating PIN/device lock, strict start window, auto-submit after integrity violations, and delayed result release. You can adjust these later under Blueprint &amp; Sessions.</div>
+      </div>
+      <div id="exam-edit-mock-settings" hidden style="display:grid;gap:16px">
+        <div class="grid"><div><label for="exam-edit-mock-start">Exam Start</label><input id="exam-edit-mock-start" name="mock_drive_start_at" type="datetime-local"></div><div><label for="exam-edit-mock-end">Exam End</label><input id="exam-edit-mock-end" name="mock_drive_end_at" type="datetime-local"></div></div>
+        <div><label for="exam-edit-mock-minutes-per-question">Minutes per question</label><input id="exam-edit-mock-minutes-per-question" name="mock_minutes_per_question" type="number" min="1" max="60" value="1"></div>
+        <div><label for="exam-edit-mock-min-seconds">Minimum time per question (seconds)</label><input id="exam-edit-mock-min-seconds" name="mock_min_question_seconds" type="number" min="0" max="120" value="10"></div>
+        <div class="grid"><div><label>Verbal Ability</label><input id="exam-edit-mock-verbal" name="mock_verbal_minutes" type="number" min="0" max="240" placeholder="Auto"></div><div><label>Logical Reasoning and Aptitude</label><input id="exam-edit-mock-reasoning" name="mock_reasoning_minutes" type="number" min="0" max="240" placeholder="Auto"></div><div><label>Quantitative Ability</label><input id="exam-edit-mock-quantitative" name="mock_quantitative_minutes" type="number" min="0" max="240" placeholder="Auto"></div><div><label>Technical Coding / Problem Solving</label><input id="exam-edit-mock-technical" name="mock_technical_minutes" type="number" min="0" max="240" placeholder="Auto"></div></div>
+        <div class="mini-meta"><strong>Mock Drive flow:</strong> one question appears at a time. Students may revisit questions only inside the active section. Each section is permanently locked after completion or timer expiry.</div>
       </div>
     </div>
     <div class="actions">
@@ -185,8 +203,11 @@
   const practicalInput=document.getElementById('exam-edit-practical-experiment-no');
   const practicalStart=document.getElementById('exam-edit-practical-code-start');
   const practicalEnd=document.getElementById('exam-edit-practical-code-end');
+  const mockWrap=document.getElementById('exam-edit-mock-settings');
+  const mockStart=document.getElementById('exam-edit-mock-start'),mockEnd=document.getElementById('exam-edit-mock-end'),mockMin=document.getElementById('exam-edit-mock-min-seconds'),mockPerQuestion=document.getElementById('exam-edit-mock-minutes-per-question');
+  const mockInputs={verbal:document.getElementById('exam-edit-mock-verbal'),reasoning:document.getElementById('exam-edit-mock-reasoning'),quantitative:document.getElementById('exam-edit-mock-quantitative'),technical:document.getElementById('exam-edit-mock-technical')};
   const cancel=document.getElementById('exam-edit-cancel');
-  if(!dialog||!form||!titleInput||!subjectSelect||!typeSelect||!practicalWrap||!practicalInput||!practicalStart||!practicalEnd||!cancel)return;
+  if(!dialog||!form||!titleInput||!subjectSelect||!typeSelect||!practicalWrap||!practicalInput||!practicalStart||!practicalEnd||!mockWrap||!mockStart||!mockEnd||!mockMin||!cancel)return;
   function syncPracticalFields(){
     const active=typeSelect.value==='practical_exam';
     practicalWrap.hidden=!active;
@@ -198,7 +219,12 @@
       practicalEnd.value='';
     }
   }
-  typeSelect.addEventListener('change',syncPracticalFields);
+  function syncTypeFields(){
+    syncPracticalFields();
+    const active=typeSelect.value==='mock_drive';mockWrap.hidden=!active;mockWrap.style.display=active?'grid':'none';mockStart.required=false;mockEnd.required=false;mockMin.required=active;mockPerQuestion.required=active;
+    Object.values(mockInputs).forEach(input=>{input.required=false;});
+  }
+  typeSelect.addEventListener('change',syncTypeFields);
   document.querySelectorAll('.exam-edit-trigger').forEach(function(button){
     button.addEventListener('click',function(){
       form.action=button.dataset.editUrl || '';
@@ -212,11 +238,14 @@
         }
       });
       if(!matched)subjectSelect.value='__general__';
-      typeSelect.value=(button.dataset.examType==='practical_exam' ? 'practical_exam' : 'regular');
+      typeSelect.value=['practical_exam','mock_drive'].includes(button.dataset.examType) ? button.dataset.examType : 'regular';
       practicalInput.value=button.dataset.practicalExperimentNo || '';
       practicalStart.value=button.dataset.practicalCodeStartAt || '';
       practicalEnd.value=button.dataset.practicalCodeEndAt || '';
-      syncPracticalFields();
+      mockStart.value=button.dataset.mockDriveStartAt || '';mockEnd.value=button.dataset.mockDriveEndAt || '';mockMin.value=button.dataset.mockMinQuestionSeconds || '10';mockPerQuestion.value=button.dataset.mockMinutesPerQuestion || '1';
+      let durations={};try{durations=JSON.parse(button.dataset.mockSectionMinutes||'{}');}catch(_err){}
+      Object.entries(mockInputs).forEach(([key,input])=>{input.value=durations[key]||'';});
+      syncTypeFields();
       dialog.showModal();
       titleInput.focus();
     });

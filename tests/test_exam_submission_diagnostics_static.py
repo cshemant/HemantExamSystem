@@ -13,7 +13,8 @@ def test_submission_reasons():
         assert reason in APP
 def test_page_load_and_heartbeat_history():
     assert "/student/exam-page-loaded" in APP
-    assert "_diagnostic_event(s,attempt,'heartbeat'" in APP
+    assert "_diagnostic_event(s,attempt,'heartbeat'" not in APP
+    assert "heartbeat_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=25)" in APP
     assert "/student/exam-page-loaded" in JS
 def test_results_has_audit_link():
     assert "View Audit" in RESULTS
