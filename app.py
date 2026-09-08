@@ -7,12 +7,13 @@ from urllib.parse import urlparse
 from urllib.request import Request as URLRequest, urlopen
 from urllib.error import HTTPError, URLError
 
-from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, Response, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
+from flask import Response
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
-from sqlalchemy import create_engine, String, Integer, Boolean, Float, ForeignKey, UniqueConstraint, Text, select, func, or_, delete, update, inspect, text, event
+from sqlalchemy import create_engine, String, Integer, Boolean, Float, ForeignKey, UniqueConstraint, Text, select, func, or_, delete, inspect, text, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, scoped_session, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from openpyxl import load_workbook, Workbook
@@ -35,7 +36,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.51.0'
+APP_VERSION='2.50.2'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -86,8 +87,6 @@ CODE_RUNNER_WORKER_MODE=os.getenv('CODE_RUNNER_WORKER_MODE','0').strip().lower()
 # untrusted student programs as operating-system processes on the exam server.
 CODE_RUNNER_API_URL=(os.getenv('CODE_RUNNER_API_URL','http://127.0.0.1:2000/api/v2/execute').strip() or 'http://127.0.0.1:2000/api/v2/execute')
 CODE_RUNNER_TIMEOUT_SECONDS=max(5,min(30,int(os.getenv('CODE_RUNNER_TIMEOUT_SECONDS','15'))))
-CODE_RUNNER_SHARED_TOKEN=os.getenv('CODE_RUNNER_SHARED_TOKEN','').strip()
-CODE_RUNNER_LEASE_SECONDS=max(30,min(600,int(os.getenv('CODE_RUNNER_LEASE_SECONDS','120'))))
 CODE_EDITOR_MAX_SOURCE_BYTES=max(1024,min(100000,int(os.getenv('CODE_EDITOR_MAX_SOURCE_BYTES','50000'))))
 CODE_EDITOR_MAX_STDIN_BYTES=max(256,min(20000,int(os.getenv('CODE_EDITOR_MAX_STDIN_BYTES','10000'))))
 CODE_EDITOR_QUEUE_LIMIT=max(10,min(500,int(os.getenv('CODE_EDITOR_QUEUE_LIMIT','100'))))
@@ -217,7 +216,6 @@ class CodeRunJob(Base):
     created_at:Mapped[str]=mapped_column(String,nullable=False)
     started_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     completed_at:Mapped[str]=mapped_column(String,nullable=False,default='')
-    runner_claim_token:Mapped[str]=mapped_column(String(64),nullable=False,default='')
 
 class Exam(Base):
     __tablename__='exams'
@@ -1120,7 +1118,6 @@ def run_schema_upgrades():
         ('exam_configs','curriculum_subject_id',"INTEGER"),
         ('exam_configs','ai_review_pending',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('faculty_roles','institution_id',"INTEGER"),
-        ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
     for table_name,column_name,ddl in upgrades:
         _ensure_column(table_name,column_name,ddl)
@@ -2932,18 +2929,9 @@ def ensure_super_admin_identity(s):
 
 
 def init_db():
-    # Multiple web/runner processes can start together during exam scale-up.
-    # Serialize PostgreSQL schema work to prevent concurrent DDL races.
-    if DATABASE_URL.startswith('postgresql'):
-        with engine.begin() as schema_conn:
-            schema_conn.exec_driver_sql('SELECT pg_advisory_xact_lock(250503)')
-            Base.metadata.create_all(schema_conn)
-            _configure_database_reliability()
-            run_schema_upgrades()
-    else:
-        Base.metadata.create_all(engine)
-        _configure_database_reliability()
-        run_schema_upgrades()
+    Base.metadata.create_all(engine)
+    _configure_database_reliability()
+    run_schema_upgrades()
     s=DB()
     try:
         seed_subject_catalog(s)
@@ -2986,7 +2974,7 @@ def csrf_and_session_setup():
             if request.endpoint not in {'home','static','health'}:return redirect(url_for('home'))
         else:web_session['_last_activity']=now_ts
     if '_csrf_token' not in web_session: web_session['_csrf_token']=secrets.token_urlsafe(32)
-    if request.method in {'POST','PUT','PATCH','DELETE'} and not request.path.startswith('/api/code-runner/'):
+    if request.method in {'POST','PUT','PATCH','DELETE'}:
         supplied=request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
         if not supplied or not secrets.compare_digest(str(supplied),str(web_session.get('_csrf_token',''))):
             abort(400,'Security token validation failed. Refresh the page and try again.')
@@ -3307,18 +3295,6 @@ def integration_api_required(fn):
         supplied=request.headers.get('Authorization','')
         token=supplied[7:].strip() if supplied.lower().startswith('bearer ') else ''
         if not token or not secrets.compare_digest(token,INTEGRATION_API_KEY):
-            return jsonify(error='Unauthorized'),401
-        return fn(*a,**kw)
-    return inner
-
-def code_runner_api_required(fn):
-    @wraps(fn)
-    def inner(*a,**kw):
-        if len(CODE_RUNNER_SHARED_TOKEN)<32:
-            return jsonify(error='Code Runner API is disabled.'),503
-        supplied=request.headers.get('Authorization','')
-        token=supplied[7:].strip() if supplied.lower().startswith('bearer ') else ''
-        if not token or not secrets.compare_digest(token,CODE_RUNNER_SHARED_TOKEN):
             return jsonify(error='Unauthorized'),401
         return fn(*a,**kw)
     return inner
@@ -9009,63 +8985,6 @@ def student_dashboard():
 @student_required
 def student_code_editor():
     return render_template('code_editor.html',languages=CODE_EDITOR_LANGUAGES)
-
-@app.get('/api/code-runner/health')
-@code_runner_api_required
-def code_runner_api_health():
-    s=DB()
-    queued=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status=='queued')) or 0
-    running=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status=='running')) or 0
-    return jsonify(ok=True,version=APP_VERSION,queued=queued,running=running)
-
-@app.post('/api/code-runner/claim')
-@code_runner_api_required
-def code_runner_api_claim():
-    """Atomically lease one queued job to an authenticated remote runner."""
-    s=DB();claim_token=secrets.token_urlsafe(32)
-    try:
-        stale_before=(now_dt()-timedelta(seconds=CODE_RUNNER_LEASE_SECONDS)).isoformat(timespec='seconds')
-        s.execute(update(CodeRunJob).where(
-            CodeRunJob.status=='running',CodeRunJob.started_at!='',CodeRunJob.started_at<stale_before
-        ).values(status='queued',started_at='',runner_claim_token=''))
-        stmt=select(CodeRunJob).where(CodeRunJob.status=='queued').order_by(CodeRunJob.id.asc()).limit(1)
-        if DATABASE_URL.startswith('postgresql'):stmt=stmt.with_for_update(skip_locked=True)
-        job=s.scalar(stmt)
-        if not job:s.commit();return '',204
-        job.status='running';job.started_at=now_iso();job.runner_claim_token=claim_token;s.commit()
-        return jsonify(job={
-            'id':job.id,'claim_token':claim_token,'language':job.language,
-            'source':job.source_code,'stdin':job.stdin_text,
-        })
-    except Exception:
-        s.rollback();app.logger.exception('Code runner claim failed')
-        return jsonify(error='Job claim failed.'),503
-
-@app.post('/api/code-runner/jobs/<int:job_id>/complete')
-@code_runner_api_required
-def code_runner_api_complete(job_id):
-    payload=request.get_json(silent=True) or {};supplied=str(payload.get('claim_token') or '')
-    s=DB()
-    try:
-        stmt=select(CodeRunJob).where(CodeRunJob.id==job_id)
-        if DATABASE_URL.startswith('postgresql'):stmt=stmt.with_for_update()
-        job=s.scalar(stmt)
-        if not job:return jsonify(error='Job not found.'),404
-        if job.status!='running' or not supplied or not secrets.compare_digest(supplied,job.runner_claim_token or ''):
-            return jsonify(error='Job lease is no longer valid.'),409
-        error=str(payload.get('error') or '')[:2000]
-        if error:
-            job.status='failed';job.error=error;job.success=False
-        else:
-            job.status='completed';job.output=str(payload.get('output') or '')[:50000]
-            try:job.exit_code=int(payload['exit_code']) if payload.get('exit_code') is not None else None
-            except (TypeError,ValueError):job.exit_code=None
-            job.success=bool(payload.get('success'))
-        job.source_code='';job.stdin_text='';job.runner_claim_token='';job.completed_at=now_iso();s.commit()
-        return jsonify(ok=True)
-    except Exception:
-        s.rollback();app.logger.exception('Code runner completion failed')
-        return jsonify(error='Job completion failed.'),503
 
 @app.route('/student/code-editor/run',methods=['POST'])
 @student_required
