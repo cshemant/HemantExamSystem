@@ -2986,7 +2986,7 @@ def csrf_and_session_setup():
             if request.endpoint not in {'home','static','health'}:return redirect(url_for('home'))
         else:web_session['_last_activity']=now_ts
     if '_csrf_token' not in web_session: web_session['_csrf_token']=secrets.token_urlsafe(32)
-    if request.method in {'POST','PUT','PATCH','DELETE'}:
+    if request.method in {'POST','PUT','PATCH','DELETE'} and not request.path.startswith('/api/code-runner/'):
         supplied=request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
         if not supplied or not secrets.compare_digest(str(supplied),str(web_session.get('_csrf_token',''))):
             abort(400,'Security token validation failed. Refresh the page and try again.')
