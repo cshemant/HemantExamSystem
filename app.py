@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
-from sqlalchemy import create_engine, String, Integer, Boolean, Float, ForeignKey, UniqueConstraint, Text, select, func, or_, delete, inspect, text, event
+from sqlalchemy import create_engine, String, Integer, Boolean, Float, ForeignKey, UniqueConstraint, Text, select, func, or_, delete, update, inspect, text, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, scoped_session, sessionmaker
 from sqlalchemy.exc import IntegrityError
 from openpyxl import load_workbook, Workbook
