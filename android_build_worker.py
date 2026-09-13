@@ -47,7 +47,7 @@ def build_android_apk(source):
         logs.append(_run([aapt2,'compile','--dir',str(root/'res'),'-o',str(compiled)],root))
         flats=[str(p) for p in compiled.glob('*.flat')]
         unsigned=root/'unsigned.apk'
-        logs.append(_run([aapt2,'link','-o',str(unsigned),'-I',str(android_jar),'--manifest',str(root/'AndroidManifest.xml'),'--rename-manifest-package',PACKAGE,'--java',str(gen)]+flats,root))
+        logs.append(_run([aapt2,'link','-o',str(unsigned),'-I',str(android_jar),'--manifest',str(root/'AndroidManifest.xml'),'--rename-manifest-package',PACKAGE,'--min-sdk-version','23','--target-sdk-version','35','--version-code','1','--version-name','1.0','--java',str(gen)]+flats,root))
         java_files=[str(p) for p in (root/'src').rglob('*.java')]+[str(p) for p in gen.rglob('*.java')]
         logs.append(_run(['javac','-encoding','UTF-8','-source','8','-target','8','-classpath',str(android_jar),'-d',str(classes)]+java_files,root))
         class_files=[str(p) for p in classes.rglob('*.class')]
