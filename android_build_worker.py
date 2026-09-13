@@ -22,6 +22,13 @@ def build_android_apk(source):
     try:project=json.loads(source)
     except Exception as exc:raise RuntimeError('The Android project data is invalid.') from exc
     activity=str(project.get('activity') or '');layout=str(project.get('layout') or '');manifest=str(project.get('manifest') or '')
+    opening=re.search(r'<manifest\b[^>]*>',manifest,re.IGNORECASE)
+    if not opening:raise RuntimeError('AndroidManifest.xml must contain a <manifest> root element.')
+    if re.search(r'\bpackage\s*=',opening.group(0),re.IGNORECASE):
+        repaired=re.sub(r'\bpackage\s*=\s*(["\']).*?\1',f'package="{PACKAGE}"',opening.group(0),count=1,flags=re.IGNORECASE)
+        manifest=manifest[:opening.start()]+repaired+manifest[opening.end():]
+    else:
+        manifest=manifest[:opening.start()]+opening.group(0).replace('<manifest',f'<manifest package="{PACKAGE}"',1)+manifest[opening.end():]
     if len(activity)>80000 or len(layout)>40000 or len(manifest)>20000:raise RuntimeError('Android project exceeds the safe build limit.')
     # Keep the first release deterministic and safe: Java/XML only, no arbitrary
     # Gradle scripts, shell hooks, native libraries or downloaded dependencies.
