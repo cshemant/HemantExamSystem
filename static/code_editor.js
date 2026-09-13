@@ -48,7 +48,7 @@
   }
   function load(lang){source.value=drafts[lang]===undefined?examples[lang]:drafts[lang];output.textContent='Run your program to see the output here.';output.className='';status.textContent='Ready';renderEditorGuides();}
   let active=language.value;load(active);
-  language.addEventListener('change',()=>{drafts[active]=source.value;active=language.value;load(active);source.focus();});
+  language.addEventListener('change',()=>{if(language.value==='android_studio'){window.location.href=root.dataset.androidUrl;return;}drafts[active]=source.value;active=language.value;load(active);source.focus();});
   source.addEventListener('keydown',event=>{if(event.key==='Tab'){event.preventDefault();const a=source.selectionStart,b=source.selectionEnd;source.setRangeText('    ',a,b,'end');renderEditorGuides();}});
   source.addEventListener('input',renderEditorGuides);
   source.addEventListener('click',renderEditorGuides);

@@ -1,15 +1,15 @@
 {% extends 'base.html' %}
 {% block content %}
 <div class="page-head code-editor-heading">
-  <div><h1>Code Editor</h1><p class="muted">Write, run and test programs directly in your browser.</p></div>
-  <span class="badge gray">C · C++ · Java · Python · PHP</span>
+  <div><h1>Code Editor</h1><p class="muted">Write, run and test programs—or build an Android application.</p></div>
+  <span class="badge gray">C · C++ · Java · Python · PHP · Android Studio</span>
 </div>
 
-<section class="card code-editor-card" id="student-code-editor" data-run-url="{{ url_for('student_code_editor_run') }}">
+<section class="card code-editor-card" id="student-code-editor" data-run-url="{{ url_for('student_code_editor_run') }}" data-android-url="{{ url_for('student_android_lab') }}">
   <div class="code-editor-toolbar">
     <label for="code-language">Language
       <select id="code-language">
-        {% for key,item in languages.items() %}<option value="{{ key }}"{% if key=='python' %} selected{% endif %}>{{ item.label }}</option>{% endfor %}
+        {% for key,item in languages.items() %}<option value="{{ key }}"{% if key=='python' %} selected{% endif %}>{{ item.label }}</option>{% endfor %}<option value="android_studio">Android Studio</option>
       </select>
     </label>
     <div class="actions">

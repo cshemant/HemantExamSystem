@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.54.0'
+APP_VERSION='2.55.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -9016,10 +9016,15 @@ def student_dashboard():
 def student_code_editor():
     return render_template('code_editor.html',languages=CODE_EDITOR_LANGUAGES)
 
-@app.route('/student/android-lab')
+@app.route('/student/android-studio')
 @student_required
 def student_android_lab():
     return render_template('android_lab.html')
+
+@app.route('/student/android-lab')
+@student_required
+def student_android_lab_legacy():
+    return redirect(url_for('student_android_lab'),code=301)
 
 def _android_apk_share_signature(job,expires):
     message=f'{job.token}:{job.student_id}:{int(expires)}'.encode('utf-8')
