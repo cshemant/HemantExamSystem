@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.53.0'
+APP_VERSION='2.54.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -9137,12 +9137,14 @@ def student_android_lab_build():
     try:
         project={
             'app_name':str(payload.get('app_name') or 'Student App').strip()[:40],
-            'activity':payload.get('activity') if isinstance(payload.get('activity'),str) else '',
-            'layout':payload.get('layout') if isinstance(payload.get('layout'),str) else '',
+            'activities':payload.get('activities') if isinstance(payload.get('activities'),dict) else {},
+            'layouts':payload.get('layouts') if isinstance(payload.get('layouts'),dict) else {},
             'manifest':payload.get('manifest') if isinstance(payload.get('manifest'),str) else '',
         }
         if not project['app_name']:raise ValueError('Enter an application name.')
-        if not project['activity'].strip() or not project['layout'].strip() or not project['manifest'].strip():raise ValueError('Activity, layout and manifest files are required.')
+        if not 1<=len(project['activities'])<=10:raise ValueError('Use between 1 and 10 activity files.')
+        if not 1<=len(project['layouts'])<=15:raise ValueError('Use between 1 and 15 layout files.')
+        if not project['manifest'].strip():raise ValueError('AndroidManifest.xml is required.')
         source=json.dumps(project,separators=(',',':'))
         if len(source.encode('utf-8'))>ANDROID_PROJECT_MAX_BYTES:raise ValueError('The Android project is too large.')
         own_active=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.student_id==student_id,CodeRunJob.status.in_(['queued','running']))) or 0
