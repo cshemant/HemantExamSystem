@@ -7,7 +7,7 @@ PACKAGE='com.learnwithhemant.studentapp'
 def _tool(name):
     sdk=Path(os.environ.get('ANDROID_SDK_ROOT') or os.environ.get('ANDROID_HOME') or '')
     if not sdk.is_dir():raise RuntimeError('Android SDK is not configured. Run INSTALL_CODE_RUNNER.bat again.')
-    suffix='.bat' if os.name=='nt' and name in {'d8'} else ('.exe' if os.name=='nt' else '')
+    suffix='.bat' if os.name=='nt' and name in {'d8','apksigner'} else ('.exe' if os.name=='nt' else '')
     candidates=list((sdk/'build-tools').glob(f'*/{name}{suffix}'))
     if not candidates:raise RuntimeError(f'Android build tool is missing: {name}. Run INSTALL_CODE_RUNNER.bat again.')
     return str(sorted(candidates,key=lambda p:tuple(int(x) if x.isdigit() else 0 for x in re.split(r'[.-]',p.parent.name)))[-1])
