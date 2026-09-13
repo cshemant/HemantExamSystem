@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.52.0'
+APP_VERSION='2.53.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -94,6 +94,7 @@ CODE_EDITOR_QUEUE_LIMIT=max(10,min(500,int(os.getenv('CODE_EDITOR_QUEUE_LIMIT','
 ANDROID_PROJECT_MAX_BYTES=max(4096,min(250000,int(os.getenv('ANDROID_PROJECT_MAX_BYTES','120000'))))
 ANDROID_APK_MAX_BYTES=max(1024*1024,min(9*1024*1024,int(os.getenv('ANDROID_APK_MAX_BYTES',str(7*1024*1024)))))
 ANDROID_APK_RETENTION_HOURS=max(1,min(72,int(os.getenv('ANDROID_APK_RETENTION_HOURS','6'))))
+ANDROID_QR_EXPIRY_MINUTES=max(5,min(60,int(os.getenv('ANDROID_QR_EXPIRY_MINUTES','30'))))
 ANDROID_APK_DIR=DATA_DIR/'android_apks'
 ANDROID_APK_DIR.mkdir(parents=True,exist_ok=True)
 CODE_EDITOR_LANGUAGES={
@@ -9020,6 +9021,15 @@ def student_code_editor():
 def student_android_lab():
     return render_template('android_lab.html')
 
+def _android_apk_share_signature(job,expires):
+    message=f'{job.token}:{job.student_id}:{int(expires)}'.encode('utf-8')
+    return hmac.new(str(app.secret_key).encode('utf-8'),message,hashlib.sha256).hexdigest()
+
+def _android_apk_share_valid(job,expires,signature):
+    now=int(time.time())
+    if expires<now or expires>now+(ANDROID_QR_EXPIRY_MINUTES*60)+120:return False
+    return bool(signature) and secrets.compare_digest(signature,_android_apk_share_signature(job,expires))
+
 @app.get('/api/code-runner/health')
 @code_runner_api_required
 def code_runner_api_health():
@@ -9159,7 +9169,10 @@ def student_code_editor_job(job_token):
         result['position']=position
     elif job.status=='completed':
         result.update({'output':job.output or '(Program finished with no output.)','exit_code':job.exit_code,'success':bool(job.success)})
-        if job.language=='android' and job.success and (ANDROID_APK_DIR/f'{job.token}.apk').is_file():result['download_url']=url_for('student_android_apk_download',job_token=job.token)
+        if job.language=='android' and job.success and (ANDROID_APK_DIR/f'{job.token}.apk').is_file():
+            result['download_url']=url_for('student_android_apk_download',job_token=job.token)
+            result['qr_url']=url_for('student_android_apk_qr',job_token=job.token)
+            result['qr_expires_minutes']=ANDROID_QR_EXPIRY_MINUTES
     elif job.status=='failed':result.update({'error':job.error or 'Code execution failed safely.'})
     return jsonify(result)
 
@@ -9176,6 +9189,36 @@ def student_android_apk_download(job_token):
             apk_path.unlink(missing_ok=True);abort(410,'This APK has expired. Build the project again.')
     except OSError:abort(404)
     return send_file(apk_path,mimetype='application/vnd.android.package-archive',as_attachment=True,download_name='StudentApp-debug.apk',conditional=True)
+
+@app.get('/student/android-lab/apk/<job_token>/qr.png')
+@student_required
+def student_android_apk_qr(job_token):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{20,80}',job_token or ''):abort(404)
+    s=DB();student_id=int(web_session.get('user_id') or 0)
+    job=s.scalar(select(CodeRunJob).where(CodeRunJob.token==job_token,CodeRunJob.student_id==student_id,CodeRunJob.language=='android',CodeRunJob.status=='completed',CodeRunJob.success==True))
+    if not job or not (ANDROID_APK_DIR/f'{job_token}.apk').is_file():abort(404)
+    expires=int(time.time())+ANDROID_QR_EXPIRY_MINUTES*60;signature=_android_apk_share_signature(job,expires)
+    share_url=url_for('android_apk_qr_download',job_token=job.token,expires=expires,sig=signature,_external=True)
+    image=qrcode.make(share_url);buffer=io.BytesIO();image.save(buffer,format='PNG');buffer.seek(0)
+    response=send_file(buffer,mimetype='image/png',max_age=0)
+    response.headers['Cache-Control']='no-store, private';return response
+
+@app.get('/android-apk/<job_token>')
+def android_apk_qr_download(job_token):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{20,80}',job_token or ''):abort(404)
+    try:expires=int(request.args.get('expires','0'))
+    except (TypeError,ValueError):abort(403)
+    signature=str(request.args.get('sig') or '');s=DB()
+    job=s.scalar(select(CodeRunJob).where(CodeRunJob.token==job_token,CodeRunJob.language=='android',CodeRunJob.status=='completed',CodeRunJob.success==True))
+    if not job or not _android_apk_share_valid(job,expires,signature):abort(403,'This QR download link is invalid or has expired.')
+    apk_path=ANDROID_APK_DIR/f'{job_token}.apk'
+    if not apk_path.is_file():abort(404)
+    try:
+        if time.time()-apk_path.stat().st_mtime>ANDROID_APK_RETENTION_HOURS*3600:
+            apk_path.unlink(missing_ok=True);abort(410,'This APK has expired. Build the project again.')
+    except OSError:abort(404)
+    response=send_file(apk_path,mimetype='application/vnd.android.package-archive',as_attachment=True,download_name='StudentApp-debug.apk',conditional=True)
+    response.headers['Cache-Control']='no-store, private';return response
 
 
 @app.route('/student/practical-code',methods=['GET','POST'])
