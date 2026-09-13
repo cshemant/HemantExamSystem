@@ -7,8 +7,7 @@ from urllib.parse import urlparse
 from urllib.request import Request as URLRequest, urlopen
 from urllib.error import HTTPError, URLError
 
-from flask import Flask, render_template, request, redirect, url_for, Response, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
-from flask import Response
+from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -36,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.51.0'
+APP_VERSION='2.52.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -92,6 +91,11 @@ CODE_RUNNER_LEASE_SECONDS=max(30,min(600,int(os.getenv('CODE_RUNNER_LEASE_SECOND
 CODE_EDITOR_MAX_SOURCE_BYTES=max(1024,min(100000,int(os.getenv('CODE_EDITOR_MAX_SOURCE_BYTES','50000'))))
 CODE_EDITOR_MAX_STDIN_BYTES=max(256,min(20000,int(os.getenv('CODE_EDITOR_MAX_STDIN_BYTES','10000'))))
 CODE_EDITOR_QUEUE_LIMIT=max(10,min(500,int(os.getenv('CODE_EDITOR_QUEUE_LIMIT','100'))))
+ANDROID_PROJECT_MAX_BYTES=max(4096,min(250000,int(os.getenv('ANDROID_PROJECT_MAX_BYTES','120000'))))
+ANDROID_APK_MAX_BYTES=max(1024*1024,min(9*1024*1024,int(os.getenv('ANDROID_APK_MAX_BYTES',str(7*1024*1024)))))
+ANDROID_APK_RETENTION_HOURS=max(1,min(72,int(os.getenv('ANDROID_APK_RETENTION_HOURS','6'))))
+ANDROID_APK_DIR=DATA_DIR/'android_apks'
+ANDROID_APK_DIR.mkdir(parents=True,exist_ok=True)
 CODE_EDITOR_LANGUAGES={
     'c':{'label':'C','runner':'c','filename':'main.c'},
     'cpp':{'label':'C++','runner':'c++','filename':'main.cpp'},
@@ -9011,6 +9015,11 @@ def student_dashboard():
 def student_code_editor():
     return render_template('code_editor.html',languages=CODE_EDITOR_LANGUAGES)
 
+@app.route('/student/android-lab')
+@student_required
+def student_android_lab():
+    return render_template('android_lab.html')
+
 @app.get('/api/code-runner/health')
 @code_runner_api_required
 def code_runner_api_health():
@@ -9062,6 +9071,14 @@ def code_runner_api_complete(job_id):
             try:job.exit_code=int(payload['exit_code']) if payload.get('exit_code') is not None else None
             except (TypeError,ValueError):job.exit_code=None
             job.success=bool(payload.get('success'))
+            if job.language=='android' and job.success:
+                encoded=payload.get('apk_base64') if isinstance(payload.get('apk_base64'),str) else ''
+                if not encoded:raise ValueError('Android worker did not return an APK.')
+                try:apk_bytes=base64.b64decode(encoded,validate=True)
+                except Exception as exc:raise ValueError('Android worker returned an invalid APK.') from exc
+                if len(apk_bytes)>ANDROID_APK_MAX_BYTES:raise ValueError('Generated APK exceeds the configured size limit.')
+                if len(apk_bytes)<4 or apk_bytes[:2]!=b'PK':raise ValueError('Generated Android package is invalid.')
+                (ANDROID_APK_DIR/f'{job.token}.apk').write_bytes(apk_bytes)
         job.source_code='';job.stdin_text='';job.runner_claim_token='';job.completed_at=now_iso();s.commit()
         return jsonify(ok=True)
     except Exception:
@@ -9103,6 +9120,33 @@ def student_code_editor_run():
         s.rollback();app.logger.exception('Student code queue failed')
         return jsonify({'ok':False,'error':'The program could not be queued safely. Please try again.'}),503
 
+@app.post('/student/android-lab/build')
+@student_required
+def student_android_lab_build():
+    payload=request.get_json(silent=True) or {};student_id=int(web_session.get('user_id') or 0);s=DB()
+    try:
+        project={
+            'app_name':str(payload.get('app_name') or 'Student App').strip()[:40],
+            'activity':payload.get('activity') if isinstance(payload.get('activity'),str) else '',
+            'layout':payload.get('layout') if isinstance(payload.get('layout'),str) else '',
+            'manifest':payload.get('manifest') if isinstance(payload.get('manifest'),str) else '',
+        }
+        if not project['app_name']:raise ValueError('Enter an application name.')
+        if not project['activity'].strip() or not project['layout'].strip() or not project['manifest'].strip():raise ValueError('Activity, layout and manifest files are required.')
+        source=json.dumps(project,separators=(',',':'))
+        if len(source.encode('utf-8'))>ANDROID_PROJECT_MAX_BYTES:raise ValueError('The Android project is too large.')
+        own_active=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.student_id==student_id,CodeRunJob.status.in_(['queued','running']))) or 0
+        if own_active>=2:return jsonify({'ok':False,'error':'You already have two builds waiting or running.'}),429
+        queue_size=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status.in_(['queued','running']))) or 0
+        if queue_size>=CODE_EDITOR_QUEUE_LIMIT:return jsonify({'ok':False,'error':'The classroom build queue is full. Please try again shortly.'}),503
+        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language='android',source_code=source,stdin_text='',status='queued',created_at=now_iso())
+        s.add(job);s.commit()
+        return jsonify({'ok':True,'job_id':job.token,'status':'queued','position':queue_size+1,'status_url':url_for('student_code_editor_job',job_token=job.token)}),202
+    except ValueError as exc:s.rollback();return jsonify({'ok':False,'error':str(exc)}),400
+    except Exception:
+        s.rollback();app.logger.exception('Android build queue failed')
+        return jsonify({'ok':False,'error':'The Android project could not be queued safely.'}),503
+
 @app.route('/student/code-editor/jobs/<job_token>')
 @student_required
 def student_code_editor_job(job_token):
@@ -9113,9 +9157,25 @@ def student_code_editor_job(job_token):
     if job.status=='queued':
         position=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status=='queued',CodeRunJob.id<=job.id)) or 1
         result['position']=position
-    elif job.status=='completed':result.update({'output':job.output or '(Program finished with no output.)','exit_code':job.exit_code,'success':bool(job.success)})
+    elif job.status=='completed':
+        result.update({'output':job.output or '(Program finished with no output.)','exit_code':job.exit_code,'success':bool(job.success)})
+        if job.language=='android' and job.success and (ANDROID_APK_DIR/f'{job.token}.apk').is_file():result['download_url']=url_for('student_android_apk_download',job_token=job.token)
     elif job.status=='failed':result.update({'error':job.error or 'Code execution failed safely.'})
     return jsonify(result)
+
+@app.get('/student/android-lab/apk/<job_token>')
+@student_required
+def student_android_apk_download(job_token):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{20,80}',job_token or ''):abort(404)
+    s=DB();student_id=int(web_session.get('user_id') or 0)
+    job=s.scalar(select(CodeRunJob).where(CodeRunJob.token==job_token,CodeRunJob.student_id==student_id,CodeRunJob.language=='android',CodeRunJob.status=='completed',CodeRunJob.success==True))
+    apk_path=ANDROID_APK_DIR/f'{job_token}.apk'
+    if not job or not apk_path.is_file():abort(404)
+    try:
+        if time.time()-apk_path.stat().st_mtime>ANDROID_APK_RETENTION_HOURS*3600:
+            apk_path.unlink(missing_ok=True);abort(410,'This APK has expired. Build the project again.')
+    except OSError:abort(404)
+    return send_file(apk_path,mimetype='application/vnd.android.package-archive',as_attachment=True,download_name='StudentApp-debug.apk',conditional=True)
 
 
 @app.route('/student/practical-code',methods=['GET','POST'])

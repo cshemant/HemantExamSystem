@@ -114,7 +114,7 @@
     </details>
   </nav>
   {% elif web_session.get('role') == 'student' %}
-  <nav class="nav-links desktop-nav" aria-label="Student navigation"><a href="{{ url_for('student_dashboard') }}">My Exams</a><a href="{{ url_for('practice_centre') }}">Practice</a><a href="{{ url_for('student_skill_passport') }}">Skill Passport</a><a href="{{ url_for('student_attendance') }}">Attendance</a>{% if practical_code_available %}<a href="{{ url_for('student_practical_code') }}">Practical Marks</a>{% endif %}<a href="{{ url_for('student_code_editor') }}">Code Editor</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}</nav>
+  <nav class="nav-links desktop-nav" aria-label="Student navigation"><a href="{{ url_for('student_dashboard') }}">My Exams</a><a href="{{ url_for('practice_centre') }}">Practice</a><a href="{{ url_for('student_skill_passport') }}">Skill Passport</a><a href="{{ url_for('student_attendance') }}">Attendance</a>{% if practical_code_available %}<a href="{{ url_for('student_practical_code') }}">Practical Marks</a>{% endif %}<a href="{{ url_for('student_code_editor') }}">Code Editor</a><a href="{{ url_for('student_android_lab') }}">Android Lab</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}</nav>
   {% endif %}
   <span class="nav-spacer"></span>
   {% if web_session.get('role') %}
@@ -166,7 +166,7 @@
           <span class="mobile-menu-section-label">Placement</span>
           <a href="{{ url_for('mock_test_drive_exams') }}">Mock Test Drive</a><a href="{{ url_for('placement_command_center') }}">Placement Readiness</a>
         {% endif %}
-      {% elif web_session.get('role') == 'student' %}<a href="{{ url_for('student_dashboard') }}">My Exams</a><a href="{{ url_for('practice_centre') }}">Practice</a><a href="{{ url_for('student_skill_passport') }}">Skill Passport</a><a href="{{ url_for('student_attendance') }}">Attendance</a>{% if practical_code_available %}<a href="{{ url_for('student_practical_code') }}">Practical Marks</a>{% endif %}<a href="{{ url_for('student_code_editor') }}">Code Editor</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}{% endif %}
+      {% elif web_session.get('role') == 'student' %}<a href="{{ url_for('student_dashboard') }}">My Exams</a><a href="{{ url_for('practice_centre') }}">Practice</a><a href="{{ url_for('student_skill_passport') }}">Skill Passport</a><a href="{{ url_for('student_attendance') }}">Attendance</a>{% if practical_code_available %}<a href="{{ url_for('student_practical_code') }}">Practical Marks</a>{% endif %}<a href="{{ url_for('student_code_editor') }}">Code Editor</a><a href="{{ url_for('student_android_lab') }}">Android Lab</a>{% if answer_review_exam_id %}<a href="{{ url_for('submitted_answers',exam_id=answer_review_exam_id) }}">View Answers</a>{% endif %}{% endif %}
       <a class="mobile-logout" href="{{ url_for('logout') }}">Logout</a>
     </nav>
   </aside>

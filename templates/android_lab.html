@@ -1,0 +1,20 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-head code-editor-heading">
+  <div><h1>Android App Lab</h1><p class="muted">Edit a Java Android app, build its APK, then download and install it on your phone.</p></div>
+  <span class="badge gray">Java · XML · APK</span>
+</div>
+<section class="card android-lab" id="android-lab" data-build-url="{{ url_for('student_android_lab_build') }}">
+  <div class="android-toolbar">
+    <label>Application name<input id="android-app-name" maxlength="40" value="My First App"></label>
+    <div class="actions"><button class="btn secondary" type="button" id="android-reset">Reset</button><button class="btn" type="button" id="android-build">Build APK</button></div>
+  </div>
+  <div class="android-flow"><span>1. Edit files</span><b>→</b><span>2. Build APK</span><b>→</b><span>3. Download</span><b>→</b><span>4. Install</span></div>
+  <div class="android-workspace">
+    <aside class="android-files"><strong>StudentApp</strong><button class="active" type="button" data-file="activity">MainActivity.java</button><button type="button" data-file="layout">activity_main.xml</button><button type="button" data-file="manifest">AndroidManifest.xml</button></aside>
+    <div class="android-editor-pane"><div class="code-pane-title"><span id="android-current-file">MainActivity.java</span><small id="android-status">Ready</small></div><textarea id="android-source" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Android source code"></textarea></div>
+  </div>
+  <div class="android-result"><div><strong>Build output</strong><small>APK files remain available for a limited time.</small></div><pre id="android-output" aria-live="polite">Select Build APK when your project is ready.</pre><a class="btn android-download" id="android-download" hidden>Download APK</a><p id="android-install-help" hidden><strong>Install on phone:</strong> open the downloaded APK and allow “Install unknown apps” for your browser if Android requests it.</p></div>
+</section>
+<script src="{{ url_for('static',filename='android_lab.js') }}?v={{ app_version }}"></script>
+{% endblock %}
