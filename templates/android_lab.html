@@ -1,8 +1,8 @@
 {% extends 'base.html' %}
 {% block content %}
 <div class="page-head code-editor-heading">
-  <div><h1>Android Studio</h1><p class="muted">Edit a Java Android app, build its APK, then download and install it on your phone.</p></div>
-  <span class="badge gray">Java · XML · APK</span>
+  <div><h1>Android Studio</h1><p class="muted">Build controlled Java/XML AndroidX projects locally with Gradle, then install the signed APK from a secure QR code.</p></div>
+  <span class="badge gray">Java · XML · AndroidX · Gradle</span>
 </div>
 <section class="card android-lab" id="android-lab" data-build-url="{{ url_for('student_android_lab_build') }}">
   <div class="android-toolbar">
@@ -11,7 +11,7 @@
   </div>
   <div class="android-flow"><span>1. Edit files</span><b>→</b><span>2. Build APK</span><b>→</b><span>3. Download</span><b>→</b><span>4. Install</span></div>
   <div class="android-workspace">
-    <aside class="android-files"><strong>StudentApp</strong><div class="android-file-actions"><button type="button" id="android-new-activity">+ New Activity</button><button type="button" id="android-new-layout">+ New Layout</button></div><div id="android-file-tree"></div><div class="android-selected-actions"><button type="button" id="android-rename-file">Rename</button><button type="button" id="android-delete-file">Delete</button></div><small id="android-file-counts">1/10 activities · 1/15 layouts</small></aside>
+    <aside class="android-files"><strong>StudentApp</strong><div class="android-file-actions"><button type="button" id="android-new-activity">+ New Activity</button><button type="button" id="android-new-receiver">+ New Receiver</button><button type="button" id="android-new-service">+ New Service</button><button type="button" id="android-new-class">+ New Java Class</button><button type="button" id="android-new-layout">+ New Layout</button></div><div id="android-file-tree"></div><div class="android-selected-actions"><button type="button" id="android-rename-file">Rename</button><button type="button" id="android-delete-file">Delete</button></div><small id="android-file-counts">1/10 activities · 1/15 layouts</small></aside>
     <div class="android-editor-pane"><div class="code-pane-title"><span id="android-current-file">MainActivity.java</span><small id="android-status">Ready</small></div><textarea id="android-source" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Android source code"></textarea></div>
   </div>
   <div class="android-result"><div><strong>Build output</strong><small>APK files remain available for a limited time.</small></div><pre id="android-output" aria-live="polite">Select Build APK when your project is ready.</pre><div class="android-install-options"><a class="btn android-download" id="android-download" hidden>Download APK</a><div class="android-qr" id="android-qr" hidden><img id="android-qr-image" alt="Secure QR code for APK download"><div><strong>Scan with your Android phone</strong><small id="android-qr-expiry">This secure link expires in 30 minutes.</small></div></div></div><p id="android-install-help" hidden><strong>Install on phone:</strong> scan the QR with the phone camera, download the APK, open it and allow “Install unknown apps” if Android requests it.</p></div>

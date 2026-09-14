@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.55.0'
+APP_VERSION='2.56.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -91,8 +91,8 @@ CODE_RUNNER_LEASE_SECONDS=max(30,min(600,int(os.getenv('CODE_RUNNER_LEASE_SECOND
 CODE_EDITOR_MAX_SOURCE_BYTES=max(1024,min(100000,int(os.getenv('CODE_EDITOR_MAX_SOURCE_BYTES','50000'))))
 CODE_EDITOR_MAX_STDIN_BYTES=max(256,min(20000,int(os.getenv('CODE_EDITOR_MAX_STDIN_BYTES','10000'))))
 CODE_EDITOR_QUEUE_LIMIT=max(10,min(500,int(os.getenv('CODE_EDITOR_QUEUE_LIMIT','100'))))
-ANDROID_PROJECT_MAX_BYTES=max(4096,min(250000,int(os.getenv('ANDROID_PROJECT_MAX_BYTES','120000'))))
-ANDROID_APK_MAX_BYTES=max(1024*1024,min(9*1024*1024,int(os.getenv('ANDROID_APK_MAX_BYTES',str(7*1024*1024)))))
+ANDROID_PROJECT_MAX_BYTES=max(4096,min(400000,int(os.getenv('ANDROID_PROJECT_MAX_BYTES','260000'))))
+ANDROID_APK_MAX_BYTES=max(1024*1024,min(15*1024*1024,int(os.getenv('ANDROID_APK_MAX_BYTES',str(12*1024*1024)))))
 ANDROID_APK_RETENTION_HOURS=max(1,min(72,int(os.getenv('ANDROID_APK_RETENTION_HOURS','6'))))
 ANDROID_QR_EXPIRY_MINUTES=max(5,min(60,int(os.getenv('ANDROID_QR_EXPIRY_MINUTES','30'))))
 ANDROID_APK_DIR=DATA_DIR/'android_apks'
@@ -9143,12 +9143,20 @@ def student_android_lab_build():
         project={
             'app_name':str(payload.get('app_name') or 'Student App').strip()[:40],
             'activities':payload.get('activities') if isinstance(payload.get('activities'),dict) else {},
+            'receivers':payload.get('receivers') if isinstance(payload.get('receivers'),dict) else {},
+            'services':payload.get('services') if isinstance(payload.get('services'),dict) else {},
+            'java_classes':payload.get('java_classes') if isinstance(payload.get('java_classes'),dict) else {},
             'layouts':payload.get('layouts') if isinstance(payload.get('layouts'),dict) else {},
+            'values':payload.get('values') if isinstance(payload.get('values'),dict) else {},
             'manifest':payload.get('manifest') if isinstance(payload.get('manifest'),str) else '',
         }
         if not project['app_name']:raise ValueError('Enter an application name.')
         if not 1<=len(project['activities'])<=10:raise ValueError('Use between 1 and 10 activity files.')
+        if len(project['receivers'])>10:raise ValueError('Use no more than 10 receiver files.')
+        if len(project['services'])>10:raise ValueError('Use no more than 10 service files.')
+        if len(project['java_classes'])>20:raise ValueError('Use no more than 20 helper Java files.')
         if not 1<=len(project['layouts'])<=15:raise ValueError('Use between 1 and 15 layout files.')
+        if not 1<=len(project['values'])<=10:raise ValueError('Use between 1 and 10 values XML files.')
         if not project['manifest'].strip():raise ValueError('AndroidManifest.xml is required.')
         source=json.dumps(project,separators=(',',':'))
         if len(source.encode('utf-8'))>ANDROID_PROJECT_MAX_BYTES:raise ValueError('The Android project is too large.')
