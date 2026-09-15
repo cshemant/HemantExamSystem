@@ -1,7 +1,7 @@
 (function(){
   const root=document.getElementById('android-lab');if(!root)return;
   const $=id=>document.getElementById(id),editor=$('android-source'),status=$('android-status'),output=$('android-output'),build=$('android-build'),download=$('android-download'),help=$('android-install-help'),title=$('android-current-file'),tree=$('android-file-tree'),counts=$('android-file-counts'),qr=$('android-qr'),qrImage=$('android-qr-image'),qrExpiry=$('android-qr-expiry');
-  const PACKAGE='com.learnwithhemant.studentapp';
+  let PACKAGE='com.learnwithhemant.studentapp';
   const manifest=`<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="${PACKAGE}">
     <application android:allowBackup="true" android:label="@string/app_name" android:theme="@style/Theme.StudentApp">
@@ -53,7 +53,7 @@ public class MainActivity extends AppCompatActivity {
   let project=clone(defaults),selected={type:'activity',name:'MainActivity.java'};
   function clone(x){return JSON.parse(JSON.stringify(x));}
   function bucket(type){return project[groups[type]];}
-  function save(){if(selected.type==='manifest')project.manifest=editor.value;else bucket(selected.type)[selected.name]=editor.value;}
+  function save(){if(selected.type==='manifest')project.manifest=editor.value;else bucket(selected.type)[selected.name]=editor.value;if(selected.type==='activity'&&selected.name==='MainActivity.java'){const match=editor.value.match(/^\s*package\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\s*;/m);if(match)PACKAGE=match[1];}}
   function content(){return selected.type==='manifest'?project.manifest:bucket(selected.type)[selected.name];}
   function select(type,name){save();selected={type,name};editor.value=content();title.textContent=name;renderTree();editor.focus();}
   function fileButton(type,name){const b=document.createElement('button');b.type='button';b.textContent=name;b.className=selected.type===type&&selected.name===name?'active':'';b.onclick=()=>select(type,name);return b;}
