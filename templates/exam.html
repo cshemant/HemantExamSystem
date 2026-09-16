@@ -38,4 +38,4 @@
 </div>{% endif %}</form>
 <script>{% if mock_drive %}startSectionTimer({{ end_epoch }},{{ server_now_epoch }},'{{ url_for('expire_mock_drive_section',exam_id=exam.id) }}');{% else %}startTimer({{ end_epoch }},{{ server_now_epoch }});{% endif %}startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 25 }});{% if (sequential_mode or mock_drive) and current_position < total_questions %}startSequentialNextCountdown();{% endif %}</script>
 {% if mock_drive and mock_active_section=='technical' %}<script src="{{ url_for('static',filename='code_editor.js') }}?v={{ app_version }}"></script>{% endif %}
-{% endblock %}
+{% endblock %}  

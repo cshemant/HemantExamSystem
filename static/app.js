@@ -699,3 +699,4 @@ function startSecureExamFullscreenLock(){
   document.addEventListener('fullscreenchange',sync);
   sync();
 }
+

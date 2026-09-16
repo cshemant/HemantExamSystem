@@ -16,4 +16,4 @@
   {% endif %}
 </section></div>
 <script>startTimer({{ end_epoch }},{{ server_now_epoch }});startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 25 }});</script>
-{% endblock %}
+{% endblock %} 

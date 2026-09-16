@@ -41,4 +41,4 @@
   ['one-off-question-form','question-csv-import-form'].forEach(id=>{const form=document.getElementById(id);if(!form)return;form.addEventListener('submit',event=>{sync();if(!section.value){event.preventDefault();section.focus();window.alert('Choose a Mock Drive section first.');}});});
 })();
 </script>{% endif %}
-{% endblock %}
+{% endblock %} 
