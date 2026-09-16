@@ -20,6 +20,17 @@
   <h3>Time allocated to each section</h3>
   <div class="grid mock-section-time-grid">{% for key,label in mock_sections.items() %}<div><label>{{ label }}</label><div class="input-with-suffix"><input name="mock_{{ key }}_minutes" type="number" min="0" max="240" value="{{ mock_durations[key] if mock_durations[key] else '' }}" placeholder="Auto"><span>minutes</span></div></div>{% endfor %}</div>
   <div class="mini-meta">Section limits are optional. Unset populated sections share the remaining total time equally. The scheduled start/end window takes priority; otherwise total time is questions × minutes per question.</div>
+  <h3>Exam Network Check</h3>
+  <div class="grid">
+    <div><label>Allowed student network</label><select name="network_mode">
+      <option value="any" {% if not security or not security.network_mode or security.network_mode=='any' %}selected{% endif %}>No network restriction</option>
+      <option value="wifi" {% if security and security.network_mode=='wifi' %}selected{% endif %}>Same Wi-Fi as admin</option>
+      <option value="cidr" {% if security and security.network_mode=='cidr' %}selected{% endif %}>Approved IP/CIDR network</option>
+      <option value="lan" {% if security and security.network_mode=='lan' %}selected{% endif %}>Same LAN (offline server only)</option>
+    </select></div>
+    <div><label>Approved IP/CIDR <span class="mini-meta">(CIDR mode only)</span></label><input name="allowed_cidrs" value="{{ security.allowed_cidrs if security and security.network_mode=='cidr' else '' }}" placeholder="Example: 203.0.113.0/24"></div>
+  </div>
+  <div class="mini-meta">Same Wi-Fi records the network visible when you save. Students outside the selected network will not see this exam, and direct exam/PIN links are blocked. Use Approved IP/CIDR for campus networks with multiple internet gateways.</div>
   <h3>Important student rules / messages (optional)</h3>
   <div class="grid"><div><label>Message line 1 <span class="mini-meta">(maximum 30 words)</span></label><input name="mock_student_message_line1" value="{{ cfg.mock_student_message_line1 or '' }}" maxlength="500" placeholder="Example: Keep your webcam visible and contact the invigilator if you face a technical issue."></div><div><label>Message line 2 <span class="mini-meta">(maximum 30 words)</span></label><input name="mock_student_message_line2" value="{{ cfg.mock_student_message_line2 or '' }}" maxlength="500" placeholder="Example: Review each answer before completing a section because completed sections cannot be reopened."></div></div>
   <div class="mini-meta">Only non-empty lines appear above the section choices. The server enforces the 30-word limit per line.</div>

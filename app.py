@@ -735,6 +735,10 @@ class ExamSecurityPolicy(Base):
     defer_results_until_end:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     result_release_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     block_ip_roll_switch:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    # Optional exam-centre network restriction. Online "wifi" mode uses the
+    # public IP/CIDR visible to the server because browsers cannot expose SSIDs.
+    network_mode:Mapped[str]=mapped_column(String,nullable=False,default='any')  # any | wifi | lan | cidr
+    allowed_cidrs:Mapped[str]=mapped_column(Text,nullable=False,default='')
     practical_defaults_applied:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
@@ -1125,6 +1129,8 @@ def run_schema_upgrades():
         ('exam_configs','institution_id',"INTEGER"),
         ('exam_configs','curriculum_subject_id',"INTEGER"),
         ('exam_configs','ai_review_pending',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_policies','network_mode',"VARCHAR NOT NULL DEFAULT 'any'"),
+        ('exam_security_policies','allowed_cidrs',"TEXT NOT NULL DEFAULT ''"),
         ('faculty_roles','institution_id',"INTEGER"),
         ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
@@ -1145,7 +1151,8 @@ def get_exam_security_policy(s,exam_id,create=False):
         row=ExamSecurityPolicy(
             exam_id=exam_id,require_candidate_checkin=False,require_exam_pin=False,heartbeat_seconds=25,
             strict_start_window=False,start_grace_minutes=5,auto_submit_on_integrity_limit=False,
-            defer_results_until_end=False,result_release_at='',block_ip_roll_switch=False,practical_defaults_applied=False,
+            defer_results_until_end=False,result_release_at='',block_ip_roll_switch=False,
+            network_mode='any',allowed_cidrs='',practical_defaults_applied=False,
             updated_at=now_iso()
         )
         s.add(row);s.flush()
@@ -2358,6 +2365,10 @@ def exam_access_for_student(s,student_id,exam):
     sessions=window['sessions'];matched=window['matched']
     if sessions and not window['assigned']:
         return False,'Not assigned to your batch/section',None
+    if security:
+        network_ok,network_message=_exam_network_check(security)
+        if not network_ok:
+            return False,network_message,matched
     now=now_dt().replace(tzinfo=None);start=window.get('start');end=window.get('end')
     if security and security.strict_start_window:
         cfg=get_exam_config(s,exam.id,create=False)
@@ -2535,6 +2546,34 @@ def _attendance_network_check(row):
             except ValueError:continue
         return False,'Connect to an approved campus/classroom network.'
     return False,'Unknown attendance network policy.'
+
+
+def _exam_network_check(security):
+    """Validate the current request against an exam's optional network policy."""
+    mode=(getattr(security,'network_mode','any') or 'any').strip().lower()
+    if mode=='any':return True,'Network restriction disabled'
+    ip_text=_attendance_client_ip()
+    try:client=ipaddress.ip_address(ip_text)
+    except ValueError:return False,'This exam is available only on the approved classroom network.'
+    if client.is_loopback:return True,'Local server'
+    if mode=='lan':
+        if APP_MODE!='offline':
+            return False,'This exam requires the classroom LAN and is available only from the offline campus server.'
+        try:
+            server=ipaddress.ip_address(local_lan_ip())
+            network=ipaddress.ip_network(f'{server}/{24 if server.version==4 else 64}',strict=False)
+            return (client in network),('Classroom LAN verified' if client in network else 'Connect to the classroom LAN to access this exam.')
+        except ValueError:return False,'The classroom LAN could not be verified.'
+    raw=(getattr(security,'allowed_cidrs','') or '').strip()
+    items=[value for value in re.split(r'[\s,;]+',raw) if value]
+    for value in items:
+        try:
+            if client in ipaddress.ip_network(value,strict=False):
+                return True,'Approved exam network verified'
+        except ValueError:continue
+    if mode=='wifi':
+        return False,'Connect to the same Wi-Fi used by the faculty member when this exam was configured. Turn off mobile data, VPN or Private Relay and try again.'
+    return False,'Connect to an approved campus/classroom network to access this exam.'
 
 
 def _attendance_token_key(row):
@@ -3831,7 +3870,7 @@ def edge_exam_payload(s,exam):
             'randomize_questions':bool(cfg.randomize_questions),'shuffle_options':bool(cfg.shuffle_options),'require_fullscreen':bool(cfg.require_fullscreen),'tab_switch_limit':cfg.tab_switch_limit,
             'exam_type':cfg.exam_type,'practical_experiment_no':cfg.practical_experiment_no,'practical_code_start_at':cfg.practical_code_start_at,'practical_code_end_at':cfg.practical_code_end_at,'mock_drive_start_at':cfg.mock_drive_start_at,'mock_drive_end_at':cfg.mock_drive_end_at,'mock_section_minutes':cfg.mock_section_minutes,'mock_minutes_per_question':cfg.mock_minutes_per_question,'sequential_min_seconds':cfg.sequential_min_seconds,'mock_student_message_line1':cfg.mock_student_message_line1 or '','mock_student_message_line2':cfg.mock_student_message_line2 or ''
         } if cfg else {}),
-        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'require_exam_pin':bool(security.require_exam_pin),'heartbeat_seconds':security.heartbeat_seconds,'strict_start_window':bool(security.strict_start_window),'start_grace_minutes':security.start_grace_minutes,'auto_submit_on_integrity_limit':bool(security.auto_submit_on_integrity_limit),'defer_results_until_end':bool(security.defer_results_until_end),'result_release_at':security.result_release_at or '','block_ip_roll_switch':bool(security.block_ip_roll_switch),'practical_defaults_applied':bool(security.practical_defaults_applied)} if security else {}),
+        'security':({'require_candidate_checkin':bool(security.require_candidate_checkin),'require_exam_pin':bool(security.require_exam_pin),'heartbeat_seconds':security.heartbeat_seconds,'strict_start_window':bool(security.strict_start_window),'start_grace_minutes':security.start_grace_minutes,'auto_submit_on_integrity_limit':bool(security.auto_submit_on_integrity_limit),'defer_results_until_end':bool(security.defer_results_until_end),'result_release_at':security.result_release_at or '','block_ip_roll_switch':bool(security.block_ip_roll_switch),'network_mode':security.network_mode or 'any','allowed_cidrs':security.allowed_cidrs or '','practical_defaults_applied':bool(security.practical_defaults_applied)} if security else {}),
         'questions':[{'question':q.question,'question_type':canonical_question_type(q.question_type),'option_a':q.option_a,'option_b':q.option_b,'option_c':q.option_c,'option_d':q.option_d,'correct_answer':q.correct_answer,'answer_key':q.answer_key,'answer_tolerance':q.answer_tolerance,'answer_case_sensitive':bool(q.answer_case_sensitive),'marks':q.marks,'practical_experiment_no':q.practical_experiment_no or '','mock_section':q.mock_section or ''} for q in questions],
     }
 
@@ -7618,7 +7657,7 @@ def import_edge_exam_package():
         easy=int(cfg_data.get('easy_pct') or 30);medium=int(cfg_data.get('medium_pct') or 50);hard=int(cfg_data.get('hard_pct') or 20)
         if easy+medium+hard!=100:easy,medium,hard=30,50,20
         cfg.easy_pct=max(0,easy);cfg.medium_pct=max(0,medium);cfg.hard_pct=max(0,hard);cfg.unit_weights=str(cfg_data.get('unit_weights') or '')[:2000];cfg.randomize_questions=bool(cfg_data.get('randomize_questions',True));cfg.shuffle_options=bool(cfg_data.get('shuffle_options',True));cfg.require_fullscreen=bool(cfg_data.get('require_fullscreen',False));cfg.tab_switch_limit=max(0,min(100,int(cfg_data.get('tab_switch_limit') or 3)));cfg.exam_type=str(cfg_data.get('exam_type') or 'regular')[:30];cfg.practical_experiment_no=normalize_practical_exam_no(cfg_data.get('practical_experiment_no'));cfg.practical_code_start_at=str(cfg_data.get('practical_code_start_at') or '')[:40];cfg.practical_code_end_at=str(cfg_data.get('practical_code_end_at') or '')[:40];cfg.mock_drive_start_at=str(cfg_data.get('mock_drive_start_at') or '')[:40];cfg.mock_drive_end_at=str(cfg_data.get('mock_drive_end_at') or '')[:40];cfg.mock_section_minutes=str(cfg_data.get('mock_section_minutes') or json.dumps(MOCK_SECTION_DEFAULT_MINUTES,separators=(',',':')))[:500];cfg.mock_minutes_per_question=max(1,min(60,int(cfg_data.get('mock_minutes_per_question') or 1)));cfg.mock_student_message_line1=str(cfg_data.get('mock_student_message_line1') or '')[:500];cfg.mock_student_message_line2=str(cfg_data.get('mock_student_message_line2') or '')[:500];cfg.sequential_min_seconds=max(0,min(120,int(cfg_data.get('sequential_min_seconds') or 10)));cfg.last_generation_summary=f'Imported from encrypted Edge package {pid}.';cfg.updated_at=now_iso()
-        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(20,min(60,int(security_data.get('heartbeat_seconds') or 25)));security.strict_start_window=bool(security_data.get('strict_start_window',False));security.start_grace_minutes=max(0,min(60,int(security_data.get('start_grace_minutes') or 5)));security.auto_submit_on_integrity_limit=bool(security_data.get('auto_submit_on_integrity_limit',False));security.defer_results_until_end=bool(security_data.get('defer_results_until_end',False));security.result_release_at=str(security_data.get('result_release_at') or '');security.block_ip_roll_switch=bool(security_data.get('block_ip_roll_switch',False));security.practical_defaults_applied=bool(security_data.get('practical_defaults_applied',False));security.updated_at=now_iso()
+        security_data=payload.get('security') or {};security=get_exam_security_policy(s,exam.id,create=True);security.require_candidate_checkin=bool(security_data.get('require_candidate_checkin',False));security.require_exam_pin=bool(security_data.get('require_exam_pin',False));security.heartbeat_seconds=max(20,min(60,int(security_data.get('heartbeat_seconds') or 25)));security.strict_start_window=bool(security_data.get('strict_start_window',False));security.start_grace_minutes=max(0,min(60,int(security_data.get('start_grace_minutes') or 5)));security.auto_submit_on_integrity_limit=bool(security_data.get('auto_submit_on_integrity_limit',False));security.defer_results_until_end=bool(security_data.get('defer_results_until_end',False));security.result_release_at=str(security_data.get('result_release_at') or '');security.block_ip_roll_switch=bool(security_data.get('block_ip_roll_switch',False));security.network_mode=str(security_data.get('network_mode') or 'any') if str(security_data.get('network_mode') or 'any') in {'any','wifi','lan','cidr'} else 'any';security.allowed_cidrs=str(security_data.get('allowed_cidrs') or '')[:2000];security.practical_defaults_applied=bool(security_data.get('practical_defaults_applied',False));security.updated_at=now_iso()
         if cfg.exam_type=='practical_exam' and not security.practical_defaults_applied:apply_practical_exam_security_defaults(s,exam.id,cfg,security)
         for idx,item in enumerate(qrows,1):
             if not isinstance(item,dict):raise ValueError(f'Question {idx} is malformed.')
@@ -7720,7 +7759,24 @@ def exam_builder(exam_id):
         except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
         try:result_release_at=parse_local_schedule(request.form.get('result_release_at','')) if request.form.get('defer_results_until_end')=='on' else ''
         except ValueError as exc:flash(str(exc),'error');return redirect(url_for('exam_builder',exam_id=exam_id))
+        network_mode=(request.form.get('network_mode') or 'any').strip().lower()
+        if network_mode not in {'any','wifi','lan','cidr'}:network_mode='any'
+        allowed_cidrs=(request.form.get('allowed_cidrs') or '').strip()
+        if network_mode=='wifi':
+            allowed_cidrs=_attendance_wifi_anchor(_attendance_client_ip())
+            if not allowed_cidrs:
+                flash('Your current network could not be identified. Choose Approved IP/CIDR or try again from the classroom Wi-Fi.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+        elif network_mode=='cidr':
+            cidr_values=[value for value in re.split(r'[\s,;]+',allowed_cidrs) if value]
+            if not cidr_values:
+                flash('Enter at least one approved IP/CIDR network.','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+            try:
+                allowed_cidrs=','.join(str(ipaddress.ip_network(value,strict=False)) for value in cidr_values)
+            except ValueError:
+                flash('Approved network contains an invalid IP/CIDR value. Example: 203.0.113.0/24','error');return redirect(url_for('exam_builder',exam_id=exam_id))
+        else:allowed_cidrs=''
         cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.secure_sequential=request.form.get('secure_sequential')=='on';cfg.sequential_min_seconds=sequential_min_seconds;cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.strict_start_window=request.form.get('strict_start_window')=='on';security.start_grace_minutes=start_grace_minutes;security.auto_submit_on_integrity_limit=request.form.get('auto_submit_on_integrity_limit')=='on';security.defer_results_until_end=request.form.get('defer_results_until_end')=='on';security.result_release_at=result_release_at or '';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.practical_defaults_applied=True if (cfg.exam_type or '').strip().lower()=='practical_exam' else security.practical_defaults_applied;security.updated_at=now_iso();
+        security.network_mode=network_mode;security.allowed_cidrs=allowed_cidrs
         if cfg.exam_type=='mock_drive':
             try:
                 mock_start=parse_local_schedule(request.form.get('mock_drive_start_at',''));mock_end=parse_local_schedule(request.form.get('mock_drive_end_at',''))
@@ -8970,10 +9026,15 @@ def student_dashboard():
         web_session.clear();flash('Your student login is no longer available. Please sign in again.','error');return redirect(url_for('home'))
     dashboard_now=now_dt();dashboard_now_naive=dashboard_now.astimezone(DISPLAY_TZ).replace(tzinfo=None);auto_refresh_epochs=[]
     for e in exams_list:
+        security=get_exam_security_policy(s,e.id,create=False)
         allowed,access_label,session_row=exam_access_for_student(s,st.id,e)
         if access_label=='Not assigned to your batch/section':continue
+        # A network-restricted exam is intentionally not advertised outside
+        # the approved classroom network. Direct URLs remain protected by the
+        # same exam_access_for_student check in PIN/start routes.
+        if security and not _exam_network_check(security)[0]:continue
         pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=normalize_legacy_manual_subject_exam(s,e.id,get_exam_config(s,e.id));display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
-        subject,unit_label=student_exam_subject_unit(s,e,cfg);security=get_exam_security_policy(s,e.id,create=False)
+        subject,unit_label=student_exam_subject_unit(s,e,cfg)
 
         # Do not poll Render just to discover that a scheduled exam has opened.
         # The dashboard knows the next server-side start time already, so the
