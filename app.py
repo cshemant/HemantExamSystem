@@ -9036,17 +9036,15 @@ def student_dashboard():
         pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==e.id)) or 0;cfg=normalize_legacy_manual_subject_exam(s,e.id,get_exam_config(s,e.id));display_count=min(cfg.question_count,pool_count) if cfg and cfg.question_count else pool_count;att=get_attempt(s,st.id,e.id)
         subject,unit_label=student_exam_subject_unit(s,e,cfg)
 
-        # Do not poll Render just to discover that a scheduled exam has opened.
-        # The dashboard knows the next server-side start time already, so the
-        # browser performs one staggered reload at that transition.  This makes
-        # the Start button appear automatically with one request per student,
-        # instead of repeated requests every few seconds for the whole class.
-        start_value=(session_row.scheduled_start or '').strip() if session_row else ''
-        if not start_value and cfg and security and security.strict_start_window:
-            if (cfg.exam_type or '').strip().lower()=='practical_exam':start_value=(cfg.practical_code_start_at or '').strip()
-            elif (cfg.exam_type or '').strip().lower()=='mock_drive':start_value=(cfg.mock_drive_start_at or '').strip()
-        try:dashboard_start=datetime.fromisoformat(start_value) if start_value else None
-        except Exception:dashboard_start=None
+        # Use the exact same resolved window that exam_access_for_student uses.
+        # In particular, a Mock Test Drive's exam-wide clock intentionally
+        # overrides any older batch-session clock.  Reading the session first
+        # here used to leave the dashboard frozen on "Scheduled" even though
+        # the access check had already moved to the Mock Drive start time.
+        # The browser performs one staggered reload at that transition, making
+        # the Start button appear without recurring dashboard polling.
+        dashboard_window=resolved_exam_window_for_student(s,st.id,e,session_row)
+        dashboard_start=dashboard_window.get('start')
         if not allowed and dashboard_start and dashboard_start>dashboard_now_naive:
             auto_refresh_epochs.append(int(dashboard_start.replace(tzinfo=DISPLAY_TZ).timestamp()))
 
