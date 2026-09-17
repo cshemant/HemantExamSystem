@@ -1,97 +1,23 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><div><h1>Practical Marks</h1></div></div>
-{% for row in rows %}
-{% set exam=row.exam %}{% set target=row.target %}{% set submission=row.submission %}{% set mark=row.practical_mark %}{% set maxima=row.mark_maxima %}
-<div class="card" {% if selected_exam_id==exam.id %}id="practical-code-current"{% endif %}>
-  <p class="muted">Experiment {{ row.meta.experiment_no }}{% if target.ok %} · {{ target.experiment.title }}{% endif %}</p>
-  {% if target.ok %}
-    <div class="table-wrap" style="margin:14px 0 18px">
-      <table aria-label="Practical marks breakdown">
-        <thead>
-          <tr>
-            <th>Attendance / {{ maxima.attendance }}</th>
-            <th>Record / {{ maxima.record }}</th>
-            <th>Performance / {{ maxima.performance }}</th>
-            <th>Viva / {{ maxima.viva }}</th>
-            <th>Total / {{ row.mark_total_max }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>
-              {% if mark and mark.attendance=='P' %}
-                <strong>Present · {{ '%g'|format(mark.attendance_marks if mark.attendance_marks is not none else maxima.attendance) }}</strong>
-              {% elif mark and mark.attendance=='A' %}
-                <strong>Absent · 0</strong>
-              {% elif mark and mark.attendance_marks is not none %}
-                <strong>{{ '%g'|format(mark.attendance_marks) }}</strong>
-              {% else %}
-                <strong>—</strong>
-              {% endif %}
-            </td>
-            <td><strong>{{ '%g'|format(mark.record_marks) if mark and mark.record_marks is not none else '—' }}</strong></td>
-            <td><strong>{{ '%g'|format(mark.performance_marks) if mark and mark.performance_marks is not none else '—' }}</strong></td>
-            <td><strong>{{ '%g'|format(mark.viva_marks) if mark and mark.viva_marks is not none else '—' }}</strong></td>
-            <td><strong>{{ '%g'|format(mark.marks) if mark and mark.marks is not none else '—' }}</strong></td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-    {% if target.experiment.reference_code %}
-      {% if row.can_submit %}
-        <form method="post" action="{{ url_for('student_practical_code') }}" data-practical-code-form data-practical-end-epoch-ms="{{ row.code_window.end_epoch_ms or '' }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <input type="hidden" name="exam_id" value="{{ exam.id }}">
-          <label>Your Code</label>
-          <textarea name="source_code" rows="20" spellcheck="false" required autocomplete="off" data-practical-code-editor placeholder="Type your practical code here...">{{ submission.source_code if submission else '' }}</textarea>
-          <p class="muted" data-practical-paste-warning hidden>Clipboard paste is disabled for Practical Code. Type the code yourself.</p>
-          <div class="actions"><button type="submit">Evaluate &amp; Save Performance</button></div>
-        </form>
-      {% else %}
-        {% if row.access_label %}<p class="muted">{{ row.access_label }}</p>{% endif %}
-        <label>Your Code</label>
-        <textarea rows="20" spellcheck="false" readonly aria-readonly="true">{{ submission.source_code if submission else '' }}</textarea>
-      {% endif %}
-      {% if submission %}<p class="muted">Performance Marks: <strong>{{ '%g'|format(submission.performance_marks) }}</strong> / {{ target.register.performance_max_marks }}</p>{% endif %}
-    {% else %}
-      {% if row.access_label %}<p class="muted">{{ row.access_label }}</p>{% endif %}
-    {% endif %}
-  {% else %}
-    <p class="muted">Your Roll No. and Experiment No. could not be mapped safely to one practical register.</p>
-  {% endif %}
-</div>
-{% endfor %}
-<script>
-document.addEventListener('DOMContentLoaded',()=>{
-  document.querySelectorAll('[data-practical-code-editor]').forEach(editor=>{
-    const warning=editor.parentElement.querySelector('[data-practical-paste-warning]');
-    const blockPaste=(event)=>{
-      event.preventDefault();
-      if(warning){warning.hidden=false;clearTimeout(warning._hideTimer);warning._hideTimer=setTimeout(()=>warning.hidden=true,3500);}
-    };
-    editor.addEventListener('paste',blockPaste);
-    editor.addEventListener('drop',blockPaste);
-    editor.addEventListener('beforeinput',event=>{
-      if(event.inputType==='insertFromPaste'||event.inputType==='insertFromDrop')blockPaste(event);
-    });
-  });
-
-  document.querySelectorAll('[data-practical-code-form]').forEach(form=>{
-    const endMs=Number(form.dataset.practicalEndEpochMs||0);
-    if(!endMs)return;
-    const editor=form.querySelector('[data-practical-code-editor]');
-    const button=form.querySelector('button[type="submit"]');
-    const lockEditor=()=>{
-      if(editor)editor.readOnly=true;
-      if(button){button.disabled=true;button.textContent='Editing Closed';}
-    };
-    const scheduleLock=()=>{
-      const remaining=endMs-Date.now();
-      if(remaining<=0){lockEditor();return;}
-      window.setTimeout(scheduleLock,Math.min(remaining,60000));
-    };
-    scheduleLock();
-  });
-});
-</script>
+<div class="page-head"><div><h1>Practical Marks</h1><p class="muted">Select an experiment to view its marks.</p></div></div>
+{% if marks_rows %}
+<div class="card practical-experiment-picker"><label for="practical-experiment-select">Experiment</label><select id="practical-experiment-select" onchange="if(this.value) window.location.href=this.value">
+{% for item in marks_rows %}<option value="{{ url_for('student_practical_code',register_id=item.register.id,experiment_id=item.experiment.id) }}" {% if selected_mark_row and selected_mark_row.register.id==item.register.id and selected_mark_row.experiment.id==item.experiment.id %}selected{% endif %}>{{ item.register.subject }}{% if item.register.section %} · {{ item.register.section }}{% endif %} — Experiment {{ item.experiment.experiment_no }} · {{ item.experiment.title }}</option>{% endfor %}
+</select></div>{% endif %}
+{% if selected_mark_row %}{% set item=selected_mark_row %}{% set mark=item.mark %}{% set maxima=item.maxima %}
+<div class="card" id="practical-marks-current"><p class="muted">Experiment {{ item.experiment.experiment_no }} · {{ item.experiment.title }}</p>
+<div class="table-wrap" style="margin:14px 0 18px"><table aria-label="Practical marks breakdown"><thead><tr><th>Attendance / {{ maxima.attendance }}</th><th>Record / {{ maxima.record }}</th><th>Performance / {{ maxima.performance }}</th><th>Viva / {{ maxima.viva }}</th><th>Total / {{ item.total_max }}</th></tr></thead><tbody><tr>
+<td><strong>{% if mark and mark.attendance=='P' %}Present · {{ '%g'|format(mark.attendance_marks if mark.attendance_marks is not none else maxima.attendance) }}{% elif mark and mark.attendance=='A' %}Absent · 0{% elif mark and mark.attendance_marks is not none %}{{ '%g'|format(mark.attendance_marks) }}{% else %}—{% endif %}</strong></td>
+<td><strong>{{ '%g'|format(mark.record_marks) if mark and mark.record_marks is not none else '—' }}</strong></td><td><strong>{{ '%g'|format(mark.performance_marks) if mark and mark.performance_marks is not none else '—' }}</strong></td><td><strong>{{ '%g'|format(mark.viva_marks) if mark and mark.viva_marks is not none else '—' }}</strong></td><td><strong>{{ '%g'|format(mark.marks) if mark and mark.marks is not none else '—' }}</strong></td></tr></tbody></table></div>
+{% if item.window_state.can_edit %}<div class="notice"><strong>Faculty has enabled editing for this experiment.</strong> {{ item.window_state.label }}</div>
+<form method="post" action="{{ url_for('student_practical_marks_save') }}" data-student-marks-form data-window-end="{{ item.window_state.end_epoch_ms }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="register_id" value="{{ item.register.id }}"><input type="hidden" name="experiment_id" value="{{ item.experiment.id }}">
+<div class="grid practical-student-marks-grid"><div><label>Attendance</label><select name="attendance"><option value="">Not entered</option><option value="P" {% if mark and mark.attendance=='P' %}selected{% endif %}>Present</option><option value="A" {% if mark and mark.attendance=='A' %}selected{% endif %}>Absent</option></select></div>
+<div><label>Record / {{ maxima.record }}</label><input type="number" name="record_marks" min="0" max="{{ maxima.record }}" step="0.5" value="{{ '%g'|format(mark.record_marks) if mark and mark.record_marks is not none else '' }}"></div>
+<div><label>Performance / {{ maxima.performance }}</label><input type="number" name="performance_marks" min="0" max="{{ maxima.performance }}" step="0.5" value="{{ '%g'|format(mark.performance_marks) if mark and mark.performance_marks is not none else '' }}"></div>
+<div><label>Viva / {{ maxima.viva }}</label><input type="number" name="viva_marks" min="0" max="{{ maxima.viva }}" step="0.5" value="{{ '%g'|format(mark.viva_marks) if mark and mark.viva_marks is not none else '' }}"></div></div>
+<div class="actions"><button type="submit">Save My Marks</button></div></form>
+{% else %}<p class="muted">{{ item.window_state.label }} Your marks are view-only.</p>{% endif %}</div>{% endif %}
+{% if code_row %}{% set row=code_row %}{% set target=row.target %}{% set exam=row.exam %}{% set submission=row.submission %}
+{% if target.ok %}{% if target.experiment.reference_code %}<div class="card"><h2>Practical Code</h2>{% if row.can_submit %}<form method="post" action="{{ url_for('student_practical_code') }}" data-practical-code-form><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="exam_id" value="{{ exam.id }}"><label>Your Code</label><textarea name="source_code" rows="20" spellcheck="false" required autocomplete="off" data-practical-code-editor placeholder="Type your practical code here...">{{ submission.source_code if submission else '' }}</textarea><p class="muted" data-practical-paste-warning hidden>Clipboard paste is disabled for Practical Code. Type the code yourself.</p><div class="actions"><button type="submit">Evaluate &amp; Save Performance</button></div></form>{% else %}<p class="muted">{{ row.access_label }}</p><label>Your Code</label><textarea rows="20" readonly aria-readonly="true">{{ submission.source_code if submission else '' }}</textarea>{% endif %}{% if submission %}<p class="muted">Performance Marks: <strong>{{ '%g'|format(submission.performance_marks) }}</strong> / {{ target.register.performance_max_marks }}</p>{% endif %}</div>{% endif %}{% endif %}{% endif %}
+<script>document.addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('[data-practical-code-editor]').forEach(editor=>{const warning=editor.parentElement.querySelector('[data-practical-paste-warning]');const block=e=>{e.preventDefault();if(warning){warning.hidden=false;setTimeout(()=>warning.hidden=true,3500);}};editor.addEventListener('paste',block);editor.addEventListener('drop',block);});document.querySelectorAll('[data-student-marks-form]').forEach(form=>{const end=Number(form.dataset.windowEnd||0);if(!end)return;const lock=()=>{if(Date.now()>=end){form.querySelectorAll('input,select,button').forEach(el=>el.disabled=true);return;}setTimeout(lock,Math.min(end-Date.now(),60000));};lock();});});</script>
 {% endblock %}

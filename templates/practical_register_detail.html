@@ -74,8 +74,17 @@
 
 <div class="card">
   <div class="import-header"><div><h2>Experiments</h2></div>{% if experiments and students %}<a class="btn" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=experiments[0].id) }}">Start Live Entry</a>{% endif %}</div>
-  <div class="table-wrap"><table><tr><th>No.</th><th>Experiment</th><th>Reference Code</th><th>Total Marks</th><th>Live Entry</th></tr>
-  {% for e in experiments %}<tr><td><strong>{{ e.experiment_no }}</strong></td><td>{{ e.title }}</td><td><a class="btn secondary small" href="{{ url_for('practical_reference_code',register_id=register.id,experiment_id=e.id) }}">{{ 'Edit Code' if e.reference_code else 'Add Code' }}</a></td><td>{{ e.max_marks }}</td><td>{% if students %}<a class="btn secondary small" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=e.id) }}">Enter Marks</a>{% else %}<span class="muted">Upload students first</span>{% endif %}</td></tr>{% else %}<tr><td colspan="5">No experiments uploaded yet.</td></tr>{% endfor %}
+  <div class="table-wrap"><table><tr><th>No.</th><th>Experiment</th><th>Reference Code</th><th>Total</th><th>Faculty Entry</th><th>Student Editing Window</th><th>Export</th></tr>
+  {% for e in experiments %}{% set window_item=edit_window_map.get(e.id) %}{% set window=window_item.row if window_item else none %}{% set window_state=window_item.state if window_item else none %}<tr><td><strong>{{ e.experiment_no }}</strong></td><td>{{ e.title }}</td><td><a class="btn secondary small" href="{{ url_for('practical_reference_code',register_id=register.id,experiment_id=e.id) }}">{{ 'Edit Code' if e.reference_code else 'Add Code' }}</a></td><td>{{ e.max_marks }}</td><td>{% if students %}<a class="btn secondary small" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=e.id) }}">Enter Marks</a>{% else %}<span class="muted">Upload students first</span>{% endif %}</td><td>
+    <form method="post" action="{{ url_for('practical_student_edit_window_update',register_id=register.id,experiment_id=e.id) }}" class="student-window-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="checkbox"><input type="checkbox" name="is_enabled" value="1" {% if window and window.is_enabled %}checked{% endif %}> Allow students</label>
+      <input type="datetime-local" name="starts_at" value="{{ window.starts_at[:16] if window and window.starts_at else '' }}" aria-label="Editing starts">
+      <input type="datetime-local" name="ends_at" value="{{ window.ends_at[:16] if window and window.ends_at else '' }}" aria-label="Editing ends">
+      <button class="btn secondary small" type="submit">Save Window</button>
+      {% if window_state %}<small class="muted">{{ window_state.label }}</small>{% endif %}
+    </form>
+  </td><td><a class="btn secondary small" href="{{ url_for('practical_export',register_id=register.id,fmt='xlsx',experiment_id=e.id) }}">Excel</a></td></tr>{% else %}<tr><td colspan="7">No experiments uploaded yet.</td></tr>{% endfor %}
   </table></div>
 </div>
 

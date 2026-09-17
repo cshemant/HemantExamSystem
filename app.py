@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.57.3'
+APP_VERSION='2.58.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -935,6 +935,24 @@ class PracticalExperiment(Base):
     max_marks:Mapped[int]=mapped_column(Integer,nullable=False,default=10)
     sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     created_at:Mapped[str]=mapped_column(String,nullable=False)
+
+
+class PracticalStudentEditWindow(Base):
+    """A faculty-controlled window in which students may enter their own marks.
+
+    The unique experiment key guarantees that opening one experiment never
+    accidentally unlocks another experiment in the same register.
+    """
+    __tablename__='practical_student_edit_windows'
+    __table_args__=(UniqueConstraint('practical_experiment_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
+    practical_experiment_id:Mapped[int]=mapped_column(ForeignKey('practical_experiments.id'),nullable=False)
+    starts_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    ends_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    is_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    updated_by:Mapped[str]=mapped_column(String,nullable=False,default='')
+    updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 
 class PracticalMark(Base):
@@ -2022,6 +2040,46 @@ def practical_register_stmt(s):
         owner_type,owner_id,_=current_practical_owner(s)
         stmt=stmt.where(PracticalRegister.owner_type==owner_type,PracticalRegister.owner_id==owner_id)
     return stmt
+
+
+def practical_student_edit_window_state(window,at_time=None):
+    """Return a server-authoritative state for an experiment marks window."""
+    if not window or not bool(window.is_enabled):
+        return {'can_edit':False,'status':'disabled','label':'Student marks editing is closed.','end_epoch_ms':0}
+    try:
+        start=parse_dt(window.starts_at);end=parse_dt(window.ends_at);current=at_time or now_dt()
+    except (TypeError,ValueError):
+        return {'can_edit':False,'status':'invalid','label':'Student marks editing is closed.','end_epoch_ms':0}
+    if current<start:
+        return {'can_edit':False,'status':'upcoming','label':f'Editing opens on {format_dt(window.starts_at)}.','end_epoch_ms':int(end.timestamp()*1000)}
+    if current>=end:
+        return {'can_edit':False,'status':'closed','label':f'Editing closed on {format_dt(window.ends_at)}.','end_epoch_ms':int(end.timestamp()*1000)}
+    return {'can_edit':True,'status':'open','label':f'Editing is open until {format_dt(window.ends_at)}.','end_epoch_ms':int(end.timestamp()*1000)}
+
+
+def practical_marks_rows_for_student(s,student):
+    """Find all practical experiments mapped to the signed-in student's roll."""
+    if not student:return []
+    identity_keys={_roll_identity_key(student.roll_no),_roll_identity_key(student.registration_no)}-{''}
+    if not identity_keys:return []
+    practical_students=s.scalars(select(PracticalStudent).order_by(PracticalStudent.register_id,PracticalStudent.sequence)).all()
+    matched=[row for row in practical_students if _roll_identity_key(row.roll_no) in identity_keys]
+    rows=[]
+    for practical_student in matched:
+        register=s.get(PracticalRegister,practical_student.register_id)
+        if not register:continue
+        experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all()
+        marks=s.scalars(select(PracticalMark).where(PracticalMark.practical_student_id==practical_student.id)).all()
+        mark_map={mark.practical_experiment_id:mark for mark in marks}
+        windows=s.scalars(select(PracticalStudentEditWindow).where(PracticalStudentEditWindow.register_id==register.id)).all()
+        window_map={window.practical_experiment_id:window for window in windows}
+        maxima=practical_marks_maxima(register)
+        for experiment in experiments:
+            window=window_map.get(experiment.id)
+            rows.append({'register':register,'practical_student':practical_student,'experiment':experiment,
+                         'mark':mark_map.get(experiment.id),'maxima':maxima,'total_max':sum(maxima.values()),
+                         'edit_window':window,'window_state':practical_student_edit_window_state(window)})
+    return rows
 
 def theory_register_access(s,register_id):
     row=s.get(TheoryRegister,register_id)
@@ -4606,6 +4664,7 @@ def delete_practical_register(register_id):
     )
     # Delete dependent practical data explicitly so this works consistently on
     # both PostgreSQL production databases and SQLite/LAN deployments.
+    s.execute(delete(PracticalStudentEditWindow).where(PracticalStudentEditWindow.register_id==register.id))
     s.execute(delete(PracticalCodeSubmission).where(PracticalCodeSubmission.register_id==register.id))
     s.execute(delete(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id))
     s.execute(delete(PracticalMark).where(PracticalMark.register_id==register.id))
@@ -4643,7 +4702,34 @@ def practical_register_detail(register_id):
         student_marks=by_student.get(st.id,[]);scored=sum(float(m.marks or 0) for m in student_marks if m.marks is not None);evaluated=sum(1 for m in student_marks if m.marks is not None or m.attendance=='A')
         summary.append({'student':st,'scored':round(scored,2),'possible':possible,'evaluated':evaluated,'percent':round(scored*100/possible,1) if possible else 0,'record_received':receipt_count_by_student.get(st.id,0)})
     total_receipt_slots=len(students)*len(experiments);received_receipt_count=sum(receipt_count_by_experiment.values())
-    return render_template('practical_register_detail.html',register=register,students=students,experiments=experiments,summary=summary,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register),file_submissions=file_submissions,submission_by_student=submission_by_student,receipt_map=receipt_map,receipt_count_by_student=receipt_count_by_student,receipt_count_by_experiment=receipt_count_by_experiment,received_receipt_count=received_receipt_count,total_receipt_slots=total_receipt_slots,missing_receipt_count=max(0,total_receipt_slots-received_receipt_count),legacy_receipt_count=len({x.id for x in legacy_receipts}))
+    edit_windows=s.scalars(select(PracticalStudentEditWindow).where(PracticalStudentEditWindow.register_id==register.id)).all()
+    edit_window_map={row.practical_experiment_id:{'row':row,'state':practical_student_edit_window_state(row)} for row in edit_windows}
+    return render_template('practical_register_detail.html',register=register,students=students,experiments=experiments,summary=summary,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register),file_submissions=file_submissions,submission_by_student=submission_by_student,receipt_map=receipt_map,receipt_count_by_student=receipt_count_by_student,receipt_count_by_experiment=receipt_count_by_experiment,received_receipt_count=received_receipt_count,total_receipt_slots=total_receipt_slots,missing_receipt_count=max(0,total_receipt_slots-received_receipt_count),legacy_receipt_count=len({x.id for x in legacy_receipts}),edit_window_map=edit_window_map)
+
+
+@app.route('/admin/practicals/<int:register_id>/experiments/<int:experiment_id>/student-edit-window',methods=['POST'])
+@practical_required
+def practical_student_edit_window_update(register_id,experiment_id):
+    s=DB();register=practical_register_access(s,register_id);experiment=s.get(PracticalExperiment,experiment_id)
+    if not experiment or experiment.register_id!=register.id:abort(404)
+    enabled=(request.form.get('is_enabled') or '').lower() in {'1','true','yes','on'}
+    start_raw=(request.form.get('starts_at') or '').strip();end_raw=(request.form.get('ends_at') or '').strip()
+    if enabled:
+        if not start_raw or not end_raw:
+            flash('Choose both the opening and closing time before allowing student editing.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
+        try:start=parse_local_schedule(start_raw);end=parse_local_schedule(end_raw)
+        except (TypeError,ValueError):
+            flash('Enter a valid student editing period.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
+        if parse_dt(end)<=parse_dt(start):
+            flash('The closing time must be later than the opening time.','error');return redirect(url_for('practical_register_detail',register_id=register.id))
+    else:start='';end=''
+    row=s.scalar(select(PracticalStudentEditWindow).where(PracticalStudentEditWindow.practical_experiment_id==experiment.id))
+    if not row:
+        row=PracticalStudentEditWindow(register_id=register.id,practical_experiment_id=experiment.id);s.add(row)
+    row.starts_at=start;row.ends_at=end;row.is_enabled=enabled;row.updated_by=actor_label(s);row.updated_at=now_iso();register.updated_at=now_iso()
+    audit_event(s,'practical_student_marks_window_updated','practical_experiment',experiment.id,f'register={register.id}, enabled={enabled}, starts={start or "-"}, ends={end or "-"}')
+    s.commit();flash(f'Student marks editing {"opened/scheduled" if enabled else "closed"} for Experiment {experiment.experiment_no}.')
+    return redirect(url_for('practical_register_detail',register_id=register.id))
 
 
 def _practical_file_receipts(row):
@@ -5564,7 +5650,7 @@ def practical_code_exam_rows_for_student(s,student):
 
 def student_practical_code_available(s,student_id):
     student=s.get(Student,student_id) if student_id else None
-    return bool(practical_code_exam_rows_for_student(s,student))
+    return bool(practical_marks_rows_for_student(s,student) or practical_code_exam_rows_for_student(s,student))
 
 def sync_practical_attendance_from_attempt(s,attempt):
     """Award Practical Exam attendance only for a clean, on-time submission.
@@ -5802,29 +5888,41 @@ def practical_template(register_id,kind,fmt):
 def practical_export(register_id,fmt):
     s=DB();register=practical_register_access(s,register_id);repair_practical_experiment_numbers(s,register)
     students=s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id).order_by(PracticalStudent.sequence,PracticalStudent.roll_no)).all();experiments=s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id).order_by(PracticalExperiment.sort_order,PracticalExperiment.id)).all();marks=s.scalars(select(PracticalMark).where(PracticalMark.register_id==register.id)).all();mark_map={(m.practical_student_id,m.practical_experiment_id):m for m in marks}
+    requested_experiment_id=request.args.get('experiment_id',type=int)
+    if requested_experiment_id:
+        experiments=[e for e in experiments if e.id==requested_experiment_id]
+        if not experiments:abort(404)
     file_rows=s.scalars(select(PracticalFileSubmission).where(PracticalFileSubmission.register_id==register.id)).all();file_map={x.practical_student_id:_practical_file_receipts(x) for x in file_rows}
-    record_headers=[f'Record {e.experiment_no}' for e in experiments];mark_headers=[f'Marks {e.experiment_no}' for e in experiments]
-    headers=['S.No','Roll No','Student Name','Record Count']+record_headers+mark_headers+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
-    for idx,st in enumerate(students,start=1):
-        receipts=file_map.get(st.id,{})
-        record_cells=['Received' if str(e.id) in receipts else 'Missing' for e in experiments]
-        record_count=sum(1 for e in experiments if str(e.id) in receipts)
-        mark_cells=[];total=0.0
-        for e in experiments:
-            m=mark_map.get((st.id,e.id))
-            if not m:mark_cells.append('')
-            elif m.attendance=='A':mark_cells.append('A')
-            elif m.marks is None:mark_cells.append('P')
-            else:mark_cells.append(m.marks);total+=float(m.marks)
-        matrix.append([idx,st.roll_no,st.name,f'{record_count}/{len(experiments)}']+record_cells+mark_cells+[round(total,2),possible,round(total*100/possible,1) if possible else 0])
-    safe=''.join(ch if ch.isalnum() else '_' for ch in register.title).strip('_')[:60] or 'practical_marks'
+    if requested_experiment_id and experiments:
+        experiment=experiments[0];headers=['S.No','Roll No','Student Name','Attendance','Attendance Marks','Record','Performance','Viva','Total','Updated By','Updated At'];matrix=[]
+        for idx,st in enumerate(students,start=1):
+            mark=mark_map.get((st.id,experiment.id))
+            matrix.append([idx,st.roll_no,st.name,mark.attendance if mark else '',mark.attendance_marks if mark else '',mark.record_marks if mark else '',mark.performance_marks if mark else '',mark.viva_marks if mark else '',mark.marks if mark else '',mark.updated_by if mark else '',format_dt(mark.updated_at) if mark and mark.updated_at else ''])
+        possible=practical_total_max(register);record_headers=[];mark_headers=[]
+    else:
+        record_headers=[f'Record {e.experiment_no}' for e in experiments];mark_headers=[f'Marks {e.experiment_no}' for e in experiments]
+        headers=['S.No','Roll No','Student Name','Record Count']+record_headers+mark_headers+['Total','Possible','Percentage'];possible=sum(e.max_marks for e in experiments);matrix=[]
+        for idx,st in enumerate(students,start=1):
+            receipts=file_map.get(st.id,{})
+            record_cells=['Received' if str(e.id) in receipts else 'Missing' for e in experiments]
+            record_count=sum(1 for e in experiments if str(e.id) in receipts)
+            mark_cells=[];total=0.0
+            for e in experiments:
+                m=mark_map.get((st.id,e.id))
+                if not m:mark_cells.append('')
+                elif m.attendance=='A':mark_cells.append('A')
+                elif m.marks is None:mark_cells.append('P')
+                else:mark_cells.append(m.marks);total+=float(m.marks)
+            matrix.append([idx,st.roll_no,st.name,f'{record_count}/{len(experiments)}']+record_cells+mark_cells+[round(total,2),possible,round(total*100/possible,1) if possible else 0])
+    suffix=(f'_Experiment_{experiments[0].experiment_no}' if requested_experiment_id and experiments else '')
+    safe=(''.join(ch if ch.isalnum() else '_' for ch in register.title).strip('_')[:50] or 'practical_marks')+suffix
     if fmt=='csv':
         out=io.StringIO(newline='');w=csv.writer(out);w.writerow(headers);w.writerows(matrix);data=io.BytesIO(out.getvalue().encode('utf-8-sig'));return send_file(data,mimetype='text/csv',as_attachment=True,download_name=f'{safe}.csv')
     if fmt=='xlsx':
         wb=Workbook();ws=wb.active;ws.title='Practical Marks';ws.append([register.title]);ws.append([f'Subject: {register.subject}',f'Section: {register.section}',f'Academic Year: {register.academic_year}']);ws.append(headers)
         for row in matrix:ws.append(row)
         for cell in ws[3]:cell.font=Font(bold=True)
-        ws.freeze_panes='E4';ws.column_dimensions['A'].width=8;ws.column_dimensions['B'].width=18;ws.column_dimensions['C'].width=30;ws.column_dimensions['D'].width=14
+        ws.freeze_panes='D4' if requested_experiment_id else 'E4';ws.column_dimensions['A'].width=8;ws.column_dimensions['B'].width=18;ws.column_dimensions['C'].width=30;ws.column_dimensions['D'].width=18
         for col in range(5,5+len(record_headers)):ws.column_dimensions[ws.cell(3,col).column_letter].width=15
         for col in range(5+len(record_headers),5+len(record_headers)+len(mark_headers)):ws.column_dimensions[ws.cell(3,col).column_letter].width=13
         data=io.BytesIO();wb.save(data);data.seek(0);return send_file(data,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',as_attachment=True,download_name=f'{safe}.xlsx')
@@ -9316,8 +9414,9 @@ def student_practical_code():
             try:app.logger.exception('Practical attendance repair failed for student %s attempt %s',student.id,submitted_attempt.id)
             except Exception:pass
     rows=practical_code_exam_rows_for_student(s,student)
-    if not rows:
-        flash('Practical Marks are available only when a Practical Exam is assigned.','error')
+    marks_rows=practical_marks_rows_for_student(s,student)
+    if not rows and not marks_rows:
+        flash('No practical register is currently mapped to your Roll No.','error')
         return redirect(url_for('student_dashboard'))
 
     selected_exam_id=request.args.get('exam_id',type=int)
@@ -9465,18 +9564,39 @@ def student_practical_code():
         flash(f'Practical code evaluated. Performance marks: {performance_value:g} / {performance_max:g}.')
         return redirect(url_for('student_practical_code',exam_id=exam.id))
 
-    # Keep the Practical Marks page focused on one practical at a time.  The
-    # previous implementation rendered every assigned/closed Practical Exam,
-    # which produced multiple marks cards and multiple code editors on the same
-    # page.  A direct ?exam_id= link still opens that exact historical exam; the
-    # menu/default view shows only the newest/current practical.
-    if selected_exam_id:
-        selected_row=next((row for row in rows if row['exam'].id==selected_exam_id),None)
-        rows=[selected_row] if selected_row else rows[:1]
-    else:
-        rows=rows[:1]
-        if rows:selected_exam_id=rows[0]['exam'].id
-    return render_template('practical_code.html',student=student,rows=rows,selected_exam_id=selected_exam_id)
+    selected_register_id=request.args.get('register_id',type=int)
+    selected_experiment_id=request.args.get('experiment_id',type=int)
+    selected_mark_row=next((row for row in marks_rows if row['register'].id==selected_register_id and row['experiment'].id==selected_experiment_id),None)
+    if not selected_mark_row and marks_rows:selected_mark_row=marks_rows[0]
+    code_row=None
+    if selected_mark_row:
+        code_row=next((row for row in rows if row.get('target',{}).get('ok') and row['target']['register'].id==selected_mark_row['register'].id and row['target']['experiment'].id==selected_mark_row['experiment'].id),None)
+    elif selected_exam_id:
+        code_row=next((row for row in rows if row['exam'].id==selected_exam_id),None)
+    return render_template('practical_code.html',student=student,marks_rows=marks_rows,selected_mark_row=selected_mark_row,code_row=code_row,selected_exam_id=selected_exam_id)
+
+
+@app.route('/student/practical-marks/save',methods=['POST'])
+@student_required
+def student_practical_marks_save():
+    s=DB();student=s.get(Student,web_session['user_id'])
+    try:register_id=int(request.form.get('register_id') or 0);experiment_id=int(request.form.get('experiment_id') or 0)
+    except (TypeError,ValueError):abort(400)
+    selected=next((row for row in practical_marks_rows_for_student(s,student) if row['register'].id==register_id and row['experiment'].id==experiment_id),None)
+    if not selected:abort(403)
+    state=practical_student_edit_window_state(selected['edit_window'])
+    if not state.get('can_edit'):
+        flash(state.get('label') or 'Student marks editing is closed.','error')
+        return redirect(url_for('student_practical_code',register_id=register_id,experiment_id=experiment_id))
+    try:
+        existing=selected.get('mark')
+        row=_save_practical_mark(s,selected['register'],selected['practical_student'].id,experiment_id,request.form.get('attendance',''),request.form.get('attendance_marks',''),request.form.get('record_marks',''),request.form.get('performance_marks',''),request.form.get('viva_marks',''),existing.remarks if existing else '')
+    except ValueError as exc:
+        s.rollback();flash(str(exc),'error');return redirect(url_for('student_practical_code',register_id=register_id,experiment_id=experiment_id))
+    row.updated_by=f'Student: {student.roll_no}'[:120];row.updated_at=now_iso();selected['register'].updated_at=now_iso()
+    audit_event(s,'student_practical_marks_updated','practical_mark',row.id or '',f'student={student.id}, roll={student.roll_no}, register={register_id}, experiment={experiment_id}, total={row.marks}')
+    s.commit();flash('Your marks were saved. They are now available to faculty for review and Excel export.')
+    return redirect(url_for('student_practical_code',register_id=register_id,experiment_id=experiment_id))
 
 @app.route('/student/exam/<int:exam_id>/current-pin')
 @student_required
