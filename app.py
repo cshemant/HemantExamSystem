@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.58.2'
+APP_VERSION='2.61.0'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -88,6 +88,7 @@ CODE_RUNNER_API_URL=(os.getenv('CODE_RUNNER_API_URL','http://127.0.0.1:2000/api/
 CODE_RUNNER_TIMEOUT_SECONDS=max(5,min(30,int(os.getenv('CODE_RUNNER_TIMEOUT_SECONDS','15'))))
 CODE_RUNNER_SHARED_TOKEN=os.getenv('CODE_RUNNER_SHARED_TOKEN','').strip()
 CODE_RUNNER_LEASE_SECONDS=max(30,min(600,int(os.getenv('CODE_RUNNER_LEASE_SECONDS','120'))))
+ANDROID_RUNNER_LEASE_SECONDS=max(300,min(1200,int(os.getenv('ANDROID_RUNNER_LEASE_SECONDS','600'))))
 CODE_EDITOR_MAX_SOURCE_BYTES=max(1024,min(100000,int(os.getenv('CODE_EDITOR_MAX_SOURCE_BYTES','50000'))))
 CODE_EDITOR_MAX_STDIN_BYTES=max(256,min(20000,int(os.getenv('CODE_EDITOR_MAX_STDIN_BYTES','10000'))))
 CODE_EDITOR_QUEUE_LIMIT=max(10,min(500,int(os.getenv('CODE_EDITOR_QUEUE_LIMIT','100'))))
@@ -9214,17 +9215,29 @@ def code_runner_api_claim():
     """Atomically lease one queued job to an authenticated remote runner."""
     s=DB();claim_token=secrets.token_urlsafe(32)
     try:
+        known_capabilities={'c','c++','java','python','php','android'}
+        advertised=request.headers.get('X-Runner-Capabilities','').strip()
+        # Compatibility: workers from older packages did not advertise their
+        # capabilities and historically supported every editor language.
+        capabilities={item.strip().lower() for item in advertised.split(',') if item.strip().lower() in known_capabilities} if advertised else known_capabilities
+        if not capabilities:return jsonify(error='Runner advertised no supported capabilities.'),400
+        eligible_languages=set(capabilities)
+        if 'c++' in eligible_languages:eligible_languages.add('cpp') # queued by older web releases
         stale_before=(now_dt()-timedelta(seconds=CODE_RUNNER_LEASE_SECONDS)).isoformat(timespec='seconds')
+        android_stale_before=(now_dt()-timedelta(seconds=ANDROID_RUNNER_LEASE_SECONDS)).isoformat(timespec='seconds')
         s.execute(update(CodeRunJob).where(
-            CodeRunJob.status=='running',CodeRunJob.started_at!='',CodeRunJob.started_at<stale_before
+            CodeRunJob.status=='running',CodeRunJob.started_at!='',or_(
+                (CodeRunJob.language=='android') & (CodeRunJob.started_at<android_stale_before),
+                (CodeRunJob.language!='android') & (CodeRunJob.started_at<stale_before),
+            )
         ).values(status='queued',started_at='',runner_claim_token=''))
-        stmt=select(CodeRunJob).where(CodeRunJob.status=='queued').order_by(CodeRunJob.id.asc()).limit(1)
+        stmt=select(CodeRunJob).where(CodeRunJob.status=='queued',CodeRunJob.language.in_(eligible_languages)).order_by(CodeRunJob.id.asc()).limit(1)
         if DATABASE_URL.startswith('postgresql'):stmt=stmt.with_for_update(skip_locked=True)
         job=s.scalar(stmt)
         if not job:s.commit();return '',204
         job.status='running';job.started_at=now_iso();job.runner_claim_token=claim_token;s.commit()
         return jsonify(job={
-            'id':job.id,'claim_token':claim_token,'language':job.language,
+            'id':job.id,'claim_token':claim_token,'language':'c++' if job.language=='cpp' else job.language,
             'source':job.source_code,'stdin':job.stdin_text,
         })
     except Exception:
@@ -9292,7 +9305,7 @@ def student_code_editor_run():
         if own_active>=2:return jsonify({'ok':False,'error':'You already have two programs waiting or running. Please wait for one to finish.'}),429
         queue_size=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status.in_(['queued','running']))) or 0
         if queue_size>=CODE_EDITOR_QUEUE_LIMIT:return jsonify({'ok':False,'error':'The classroom code queue is full. Please try again shortly.'}),503
-        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language=language,source_code=source,stdin_text=stdin_text,status='queued',created_at=now_iso())
+        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language=cfg['runner'],source_code=source,stdin_text=stdin_text,status='queued',created_at=now_iso())
         s.add(job);s.commit()
         return jsonify({'ok':True,'job_id':job.token,'status':'queued','position':queue_size+1,'status_url':url_for('student_code_editor_job',job_token=job.token)}),202
     except ValueError as exc:s.rollback();return jsonify({'ok':False,'error':str(exc)}),400
