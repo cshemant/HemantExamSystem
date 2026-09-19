@@ -1,7 +1,7 @@
 {% extends 'base.html' %}{% block content %}
 <div class="page-head"><div><h1>Practical Marks</h1><p class="muted">Select an experiment to view its marks.</p></div></div>
 {% if marks_rows %}
-<div class="card practical-experiment-picker"><label for="practical-experiment-select">Experiment</label><select id="practical-experiment-select" onchange="if(this.value) window.location.href=this.value">
+<div class="card practical-experiment-picker"><label for="student-practical-experiment-select">Experiment</label><select id="student-practical-experiment-select" onchange="if(this.value) window.location.href=this.value">
 {% for item in marks_rows %}<option value="{{ url_for('student_practical_code',register_id=item.register.id,experiment_id=item.experiment.id) }}" {% if selected_mark_row and selected_mark_row.register.id==item.register.id and selected_mark_row.experiment.id==item.experiment.id %}selected{% endif %}>{{ item.register.subject }}{% if item.register.section %} · {{ item.register.section }}{% endif %} — Experiment {{ item.experiment.experiment_no }} · {{ item.experiment.title }}</option>{% endfor %}
 </select></div>{% endif %}
 {% if selected_mark_row %}{% set item=selected_mark_row %}{% set mark=item.mark %}{% set maxima=item.maxima %}
