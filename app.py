@@ -35,7 +35,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.58.1'
+APP_VERSION='2.58.2'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -3038,15 +3038,19 @@ def init_db():
     # Multiple web/runner processes can start together during exam scale-up.
     # Serialize PostgreSQL schema work to prevent concurrent DDL races.
     if DATABASE_URL.startswith('postgresql'):
-        with engine.begin() as schema_conn:
-            # Consume the SELECT result before COMMIT. Leaving the advisory-lock
-            # result pending can make psycopg (notably on Render/Python 3.14)
-            # receive both the SELECT and COMMIT command results together and
-            # abort startup with: "received 2 results from command 'COMMIT'".
-            schema_conn.exec_driver_sql('SELECT pg_advisory_xact_lock(250503)').scalar_one()
-            Base.metadata.create_all(schema_conn)
-            _configure_database_reliability()
-            run_schema_upgrades()
+        # Some managed PostgreSQL proxies return duplicate command results when
+        # transactional DDL is followed by the enclosing COMMIT.  Use a
+        # session-level advisory lock on an AUTOCOMMIT connection instead: DDL
+        # remains serialized across Gunicorn workers, but there is no final
+        # schema transaction COMMIT for psycopg to mis-handle.
+        with engine.connect().execution_options(isolation_level='AUTOCOMMIT') as schema_conn:
+            schema_conn.exec_driver_sql('SELECT pg_advisory_lock(250503)').scalar_one()
+            try:
+                Base.metadata.create_all(schema_conn)
+            finally:
+                schema_conn.exec_driver_sql('SELECT pg_advisory_unlock(250503)').scalar_one()
+        _configure_database_reliability()
+        run_schema_upgrades()
     else:
         Base.metadata.create_all(engine)
         _configure_database_reliability()
