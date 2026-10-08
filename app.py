@@ -214,6 +214,7 @@ class CodeRunJob(Base):
     token:Mapped[str]=mapped_column(String(64),unique=True,nullable=False)
     student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False,index=True)
     language:Mapped[str]=mapped_column(String(20),nullable=False)
+    practical_experiment_id:Mapped[int|None]=mapped_column(Integer,nullable=True)
     source_code:Mapped[str]=mapped_column(Text,nullable=False)
     stdin_text:Mapped[str]=mapped_column(Text,nullable=False,default='')
     status:Mapped[str]=mapped_column(String(20),nullable=False,default='queued',index=True)
@@ -930,6 +931,7 @@ class PracticalExperiment(Base):
     # Faculty reference program used for deterministic Practical Code evaluation.
     # It is never shown to students.
     reference_code:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    android_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     # Optional faculty-defined exact-match penalty rules for Practical Code.
     # One rule per line; rules are never exposed to students.
     penalty_rules:Mapped[str]=mapped_column(Text,nullable=False,default='')
@@ -1132,6 +1134,8 @@ def run_schema_upgrades():
         ('practical_registers','performance_max_marks','INTEGER NOT NULL DEFAULT 10'),
         ('practical_registers','viva_max_marks','INTEGER NOT NULL DEFAULT 10'),
         ('practical_experiments','reference_code',"TEXT NOT NULL DEFAULT ''"),
+        ('practical_experiments','android_enabled','BOOLEAN NOT NULL DEFAULT FALSE'),
+        ('code_run_jobs','practical_experiment_id','INTEGER'),
         ('practical_experiments','penalty_rules',"TEXT NOT NULL DEFAULT ''"),
         ('practical_file_submissions','experiment_receipts_json',"TEXT NOT NULL DEFAULT '{}'"),
         ('practical_marks','attendance_marks','FLOAT'),
@@ -9185,7 +9189,89 @@ def student_code_editor():
 @app.route('/student/android-studio')
 @student_required
 def student_android_lab():
-    return render_template('android_lab.html')
+    s=DB(); student=s.get(Student,web_session['user_id'])
+    enabled=[row for row in practical_marks_rows_for_student(s,student) if row['experiment'].android_enabled]
+    return render_template('android_lab.html',enabled_experiments=enabled)
+
+@app.post('/admin/practicals/<int:register_id>/experiment/<int:experiment_id>/android-enabled')
+@practical_required
+def practical_android_enabled(register_id,experiment_id):
+    s=DB();register=practical_register_access(s,register_id)
+    experiment=s.get(PracticalExperiment,experiment_id)
+    if not experiment or experiment.register_id!=register.id:abort(404)
+    experiment.android_enabled=request.form.get('android_enabled')=='1'
+    register.updated_at=now_iso()
+    audit_event(s,'android_experiment_visibility','practical_experiment',experiment.id,
+                f'enabled={experiment.android_enabled}, register={register.id}')
+    s.commit()
+    flash('Android Studio experiment '+('enabled.' if experiment.android_enabled else 'disabled.'))
+    return redirect(url_for('practical_register_detail',register_id=register.id))
+
+
+def _android_reference_line_similarity(reference,project):
+    """Fraction of reference nonblank code lines found in uploaded project; order-independent.
+
+    Treat Java/XML as code, not presentation whitespace. Never compare against UI-provided
+    similarity values. The reference may contain multiple files separated by headings.
+    """
+    from collections import Counter
+    def normalized(value):
+        lines=[]
+        for line in str(value or '').splitlines():
+            line=re.sub(r'\s+','',line).lower()
+            if line and not line.startswith('//') and not line.startswith('<!--'):
+                lines.append(line)
+        return Counter(lines)
+    expected=normalized(reference)
+    if not expected:return 0.0
+    segments=[]
+    for key in ('activities','receivers','services','java_classes','layouts','values'):
+        value=project.get(key) or {}
+        if isinstance(value,dict):segments.extend(v for v in value.values() if isinstance(v,str))
+    segments.append(project.get('manifest') or '')
+    actual=normalized('\n'.join(segments))
+    return sum(min(amount,actual[line]) for line,amount in expected.items())/sum(expected.values())
+
+
+def _award_android_performance(s,job):
+    """Called by authenticated runner completion, never from student QR request."""
+    if not job.practical_experiment_id:return
+    experiment=s.get(PracticalExperiment,job.practical_experiment_id)
+    student=s.get(Student,job.student_id)
+    if not experiment or not student or not experiment.android_enabled:return
+    mapped=next((r for r in practical_marks_rows_for_student(s,student)
+                 if r['experiment'].id==experiment.id),None)
+    if not mapped or not (experiment.reference_code or '').strip():return
+    try:project=json.loads(job.source_code or '{}')
+    except (ValueError,TypeError):return
+    if not isinstance(project,dict):return
+    ratio=_android_reference_line_similarity(experiment.reference_code,project)
+    # 90%+ = 10, 70-89% = 9, 50-69% = 8, below 50% = 7.
+    raw_score=10 if ratio>=.9 else 9 if ratio>=.7 else 8 if ratio>=.5 else 7
+    maxima=practical_marks_maxima(mapped['register'])
+    score=min(float(raw_score),float(maxima['performance']))
+    old=mapped['mark']
+    if old and old.updated_by not in ('Android Studio Auto','') and old.performance_marks is not None:
+        # Don't overwrite faculty-reviewed or manually entered performance.
+        audit_event(s,'android_performance_review_required','practical_mark',old.id,
+                    f'job={job.id}, similarity={ratio:.3f}, proposed={score}')
+        return
+    if not old:
+        old=PracticalMark(register_id=mapped['register'].id,
+             practical_student_id=mapped['practical_student'].id,
+             practical_experiment_id=experiment.id,attendance='',attendance_marks=None,
+             record_marks=None,viva_marks=None,remarks='')
+        s.add(old)
+    old.performance_marks=score
+    old.marks=(0.0 if (old.attendance or '').upper()=='A' else
+              sum((getattr(old,field) or 0) for field in
+                  ('attendance_marks','record_marks','performance_marks','viva_marks')))
+    old.updated_by='Android Studio Auto';old.updated_at=now_iso()
+    mapped['register'].updated_at=now_iso()
+    s.flush()
+    audit_event(s,'android_performance_auto_awarded','practical_mark',old.id,
+                f'job={job.id}, student={student.id}, experiment={experiment.id}, similarity={ratio:.3f}, score={score}')
+
 
 @app.route('/student/android-lab')
 @student_required
@@ -9272,6 +9358,7 @@ def code_runner_api_complete(job_id):
                 if len(apk_bytes)>ANDROID_APK_MAX_BYTES:raise ValueError('Generated APK exceeds the configured size limit.')
                 if len(apk_bytes)<4 or apk_bytes[:2]!=b'PK':raise ValueError('Generated Android package is invalid.')
                 (ANDROID_APK_DIR/f'{job.token}.apk').write_bytes(apk_bytes)
+                _award_android_performance(s,job)
         job.source_code='';job.stdin_text='';job.runner_claim_token='';job.completed_at=now_iso();s.commit()
         return jsonify(ok=True)
     except Exception:
@@ -9336,13 +9423,24 @@ def student_android_lab_build():
         if not 1<=len(project['layouts'])<=15:raise ValueError('Use between 1 and 15 layout files.')
         if not 1<=len(project['values'])<=10:raise ValueError('Use between 1 and 10 values XML files.')
         if not project['manifest'].strip():raise ValueError('AndroidManifest.xml is required.')
+        experiment_id=payload.get('experiment_id')
+        try:experiment_id=int(experiment_id) if experiment_id else None
+        except (TypeError,ValueError):raise ValueError('Invalid experiment selection.')
+        student=s.get(Student,student_id)
+        enabled=[r for r in practical_marks_rows_for_student(s,student) if r['experiment'].android_enabled]
+        if enabled and experiment_id is None:raise ValueError('Select an enabled practical experiment before building.')
+        if experiment_id is not None:
+            mapping=next((r for r in enabled if r['experiment'].id==experiment_id),None)
+            if mapping is None:raise ValueError('This experiment is not enabled or mapped to your roll number.')
+            if not (mapping['experiment'].reference_code or '').strip():
+                raise ValueError('Faculty must configure reference code before this experiment can be built for marks.')
         source=json.dumps(project,separators=(',',':'))
         if len(source.encode('utf-8'))>ANDROID_PROJECT_MAX_BYTES:raise ValueError('The Android project is too large.')
         own_active=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.student_id==student_id,CodeRunJob.status.in_(['queued','running']))) or 0
         if own_active>=2:return jsonify({'ok':False,'error':'You already have two builds waiting or running.'}),429
         queue_size=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status.in_(['queued','running']))) or 0
         if queue_size>=CODE_EDITOR_QUEUE_LIMIT:return jsonify({'ok':False,'error':'The classroom build queue is full. Please try again shortly.'}),503
-        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language='android',source_code=source,stdin_text='',status='queued',created_at=now_iso())
+        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language='android',practical_experiment_id=experiment_id,source_code=source,stdin_text='',status='queued',created_at=now_iso())
         s.add(job);s.commit()
         return jsonify({'ok':True,'job_id':job.token,'status':'queued','position':queue_size+1,'status_url':url_for('student_code_editor_job',job_token=job.token)}),202
     except ValueError as exc:s.rollback();return jsonify({'ok':False,'error':str(exc)}),400
