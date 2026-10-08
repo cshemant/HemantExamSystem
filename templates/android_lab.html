@@ -6,6 +6,12 @@
 </div>
 <section class="card android-lab" id="android-lab" data-build-url="{{ url_for('student_android_lab_build') }}">
   <div class="android-toolbar">
+    <label>Practical experiment
+      <select id="android-experiment" {% if enabled_experiments %}required{% endif %}>
+        <option value="">{% if enabled_experiments %}Select experiment{% else %}No enabled practical experiments (free practice){% endif %}</option>
+        {% for item in enabled_experiments %}<option value="{{ item.experiment.id }}">{{ item.register.subject }} · {{ item.register.section }} — {{ item.experiment.experiment_no }} · {{ item.experiment.title }}</option>{% endfor %}
+      </select>
+    </label>
     <label>Application name<input id="android-app-name" maxlength="40" value="My First App"></label>
     <div class="actions"><button class="btn secondary" type="button" id="android-reset">Reset</button><button class="btn" type="button" id="android-build">Build APK</button></div>
   </div>
