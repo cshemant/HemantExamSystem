@@ -73,9 +73,10 @@
 </div>
 
 <div class="card">
-  <div class="import-header"><div><h2>Experiments</h2></div>{% if experiments and students %}<a class="btn" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=experiments[0].id) }}">Start Live Entry</a>{% endif %}</div>
+  <div class="import-header"><div><h2>Experiments</h2><span class="muted">Select the Android Studio experiments, then click Save All.</span></div><div class="actions">{% if experiments %}<button type="submit" class="btn" form="android-experiments-bulk-form">Save All</button>{% endif %}{% if experiments and students %}<a class="btn secondary" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=experiments[0].id) }}">Start Live Entry</a>{% endif %}</div></div>
+  {% if experiments %}<form id="android-experiments-bulk-form" method="post" action="{{ url_for('practical_android_enabled_bulk',register_id=register.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"></form>{% endif %}
   <div class="table-wrap"><table><tr><th>No.</th><th>Experiment</th><th>Reference Code</th><th>Android Studio</th><th>Total</th><th>Faculty Entry</th><th>Student Editing Window</th><th>Export</th></tr>
-  {% for e in experiments %}{% set window_item=edit_window_map.get(e.id) %}{% set window=window_item.row if window_item else none %}{% set window_state=window_item.state if window_item else none %}<tr><td><strong>{{ e.experiment_no }}</strong></td><td>{{ e.title }}</td><td><a class="btn secondary small" href="{{ url_for('practical_reference_code',register_id=register.id,experiment_id=e.id) }}">{{ 'Edit Code' if e.reference_code else 'Add Code' }}</a></td><td><form method="post" action="{{ url_for('practical_android_enabled',register_id=register.id,experiment_id=e.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label class="checkbox"><input type="checkbox" name="android_enabled" value="1" {% if e.android_enabled %}checked{% endif %}> Enabled</label><button class="btn secondary small" type="submit">Save</button></form></td><td>{{ e.max_marks }}</td><td>{% if students %}<a class="btn secondary small" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=e.id) }}">Enter Marks</a>{% else %}<span class="muted">Upload students first</span>{% endif %}</td><td>
+  {% for e in experiments %}{% set window_item=edit_window_map.get(e.id) %}{% set window=window_item.row if window_item else none %}{% set window_state=window_item.state if window_item else none %}<tr><td><strong>{{ e.experiment_no }}</strong></td><td>{{ e.title }}</td><td><a class="btn secondary small" href="{{ url_for('practical_reference_code',register_id=register.id,experiment_id=e.id) }}">{{ 'Edit Code' if e.reference_code else 'Add Code' }}</a></td><td><form method="post" action="{{ url_for('practical_android_enabled',register_id=register.id,experiment_id=e.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label class="checkbox"><input type="checkbox" name="android_enabled" value="1" data-android-experiment-id="{{ e.id }}" {% if e.android_enabled %}checked{% endif %}> Enabled</label><button class="btn secondary small" type="submit">Save</button></form></td><td>{{ e.max_marks }}</td><td>{% if students %}<a class="btn secondary small" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=e.id) }}">Enter Marks</a>{% else %}<span class="muted">Upload students first</span>{% endif %}</td><td>
     <form method="post" action="{{ url_for('practical_student_edit_window_update',register_id=register.id,experiment_id=e.id) }}" class="student-window-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <label class="checkbox"><input type="checkbox" name="is_enabled" value="1" {% if window and window.is_enabled %}checked{% endif %}> Allow students</label>
@@ -86,6 +87,7 @@
     </form>
   </td><td><a class="btn secondary small" href="{{ url_for('practical_export',register_id=register.id,fmt='xlsx',experiment_id=e.id) }}">Excel</a></td></tr>{% else %}<tr><td colspan="8">No experiments uploaded yet.</td></tr>{% endfor %}
   </table></div>
+  {% if experiments %}<div class="actions" style="justify-content:flex-end;margin-top:1rem"><button type="submit" class="btn" form="android-experiments-bulk-form">Save All</button></div>{% endif %}
 </div>
 
 <div class="card practical-record-tracker-card" id="record-submission-tracker">
@@ -105,6 +107,26 @@
   {% for row in summary %}<tr data-practical-student-row="{{ row.student.id }}"><td>{{ loop.index }}</td><td><strong>{{ row.student.roll_no }}</strong></td><td>{{ row.student.name }}</td><td data-record-summary-cell data-student-id="{{ row.student.id }}"><strong>{{ row.record_received }}</strong> / {{ experiments|length }}</td><td>{{ row.evaluated }} / {{ experiments|length }}</td><td>{{ row.scored }} / {{ row.possible }}</td><td>{{ row.percent }}%</td></tr>{% else %}<tr><td colspan="7">No students uploaded yet.</td></tr>{% endfor %}
   </table></div>
 </div>
+<script>
+(function () {
+  const bulkForm = document.getElementById('android-experiments-bulk-form');
+  if (!bulkForm) return;
+  bulkForm.addEventListener('submit', function (event) {
+    const boxes = Array.from(document.querySelectorAll('input[data-android-experiment-id]'));
+    if (!boxes.length) { event.preventDefault(); return; }
+    bulkForm.querySelectorAll('input[data-bulk-selection]').forEach(el => el.remove());
+    for (const checkbox of boxes) {
+      const id = checkbox.dataset.androidExperimentId;
+      for (const [name, value] of [['experiment_ids', id], ...(checkbox.checked ? [['enabled_ids', id]] : [])]) {
+        const input = document.createElement('input');
+        input.type = 'hidden'; input.name = name; input.value = value;
+        input.setAttribute('data-bulk-selection', '1');
+        bulkForm.appendChild(input);
+      }
+    }
+  });
+})();
+</script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js" defer onerror="this.onerror=null;this.src='https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js';"></script>
 <script src="{{ url_for('static',filename='practical_file_scanner.js') }}" defer></script>
 {% endblock %}

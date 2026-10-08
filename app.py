@@ -9193,6 +9193,33 @@ def student_android_lab():
     enabled=[row for row in practical_marks_rows_for_student(s,student) if row['experiment'].android_enabled]
     return render_template('android_lab.html',enabled_experiments=enabled)
 
+@app.post('/admin/practicals/<int:register_id>/android-enabled-bulk')
+@practical_required
+def practical_android_enabled_bulk(register_id):
+    s=DB();register=practical_register_access(s,register_id)
+    experiments=s.query(PracticalExperiment).filter(PracticalExperiment.register_id==register.id).all()
+    valid_ids={str(e.id) for e in experiments}
+    received_ids=request.form.getlist('experiment_ids')
+    selected_ids=set(request.form.getlist('enabled_ids'))
+    # The submitted form must describe every experiment in this register.
+    # Never allow a stale/incomplete page to silently disable the others.
+    if len(received_ids)!=len(valid_ids) or set(received_ids)!=valid_ids or not selected_ids.issubset(valid_ids):
+        abort(400,'Experiment selection is incomplete. Reload and try again.')
+    changed=0
+    for experiment in experiments:
+        enabled=str(experiment.id) in selected_ids
+        if bool(experiment.android_enabled)!=enabled:
+            experiment.android_enabled=enabled
+            changed+=1
+            audit_event(s,'android_experiment_visibility','practical_experiment',experiment.id,
+                        f'enabled={enabled}, register={register.id}, bulk=true')
+    if changed:
+        register.updated_at=now_iso()
+    s.commit()
+    flash(f'Android Studio visibility saved for {len(experiments)} experiments ({changed} changed).')
+    return redirect(url_for('practical_register_detail',register_id=register.id))
+
+
 @app.post('/admin/practicals/<int:register_id>/experiment/<int:experiment_id>/android-enabled')
 @practical_required
 def practical_android_enabled(register_id,experiment_id):
