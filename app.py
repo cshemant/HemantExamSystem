@@ -9209,28 +9209,43 @@ def practical_android_enabled(register_id,experiment_id):
 
 
 def _android_reference_line_similarity(reference,project):
-    """Fraction of reference nonblank code lines found in uploaded project; order-independent.
+    """Match reference-line coverage within submitted Java/XML source files.
 
-    Treat Java/XML as code, not presentation whitespace. Never compare against UI-provided
-    similarity values. The reference may contain multiple files separated by headings.
+    Each nonblank reference line may match a complete student line or a substring
+    of a longer student line. Whitespace and capitalization are ignored. This
+    intentionally permits faculty to provide a single significant statement or
+    many statements, without requiring them to paste the whole project.
+    A student source line can satisfy at most one reference line; repeated
+    reference lines therefore require repeated corresponding student lines.
     """
-    from collections import Counter
-    def normalized(value):
-        lines=[]
+    def normalized_lines(value):
+        result=[]
         for line in str(value or '').splitlines():
             line=re.sub(r'\s+','',line).lower()
             if line and not line.startswith('//') and not line.startswith('<!--'):
-                lines.append(line)
-        return Counter(lines)
-    expected=normalized(reference)
+                result.append(line)
+        return result
+
+    expected=normalized_lines(reference)
     if not expected:return 0.0
     segments=[]
     for key in ('activities','receivers','services','java_classes','layouts','values'):
         value=project.get(key) or {}
-        if isinstance(value,dict):segments.extend(v for v in value.values() if isinstance(v,str))
+        if isinstance(value,dict):
+            segments.extend(v for v in value.values() if isinstance(v,str))
     segments.append(project.get('manifest') or '')
-    actual=normalized('\n'.join(segments))
-    return sum(min(amount,actual[line]) for line,amount in expected.items())/sum(expected.values())
+    actual=normalized_lines('\n'.join(segments))
+
+    # Longest reference lines first avoids short fragments consuming lines
+    # needed by longer, more specific statements.
+    available=set(range(len(actual)))
+    matched=0
+    for expected_line in sorted(expected,key=len,reverse=True):
+        candidate=next((i for i in available if expected_line in actual[i]),None)
+        if candidate is not None:
+            matched+=1
+            available.remove(candidate)
+    return matched/len(expected)
 
 
 def _award_android_performance(s,job):
@@ -9246,8 +9261,8 @@ def _award_android_performance(s,job):
     except (ValueError,TypeError):return
     if not isinstance(project,dict):return
     ratio=_android_reference_line_similarity(experiment.reference_code,project)
-    # 90%+ = 10, 70-89% = 9, 50-69% = 8, below 50% = 7.
-    raw_score=10 if ratio>=.9 else 9 if ratio>=.7 else 8 if ratio>=.5 else 7
+    # >90% = 10, 70-90% = 9, 50-69% = 8, below 50% = 7.
+    raw_score=10 if ratio>.9 else 9 if ratio>=.7 else 8 if ratio>=.5 else 7
     maxima=practical_marks_maxima(mapped['register'])
     score=min(float(raw_score),float(maxima['performance']))
     old=mapped['mark']
