@@ -4129,6 +4129,34 @@ def integration_results():
     return jsonify(results=[{'attempt_id':r.attempt_id,'roll_no':r.roll_no,'name':r.name,'batch_section':r.group_label,'exam_id':r.exam_id,'exam':r.title,'status':r.status,'grading_status':r.grading_status,'score':r.score,'total_marks':r.total_marks,'percentage':r.percentage if r.status=='submitted' else None,'grade':r.grade if r.status=='submitted' else None,'integrity_events':r.violations,'started_at':r.started_at,'submitted_at':r.submitted_at} for r in rows])
 
 
+
+
+@app.post('/admin/compiler-queue/clear')
+@admin_required
+def admin_compiler_queue_clear():
+    """Invalidate all outstanding compiler jobs without removing any history."""
+    s=DB()
+    try:
+        # One database transaction; active worker completion then fails its lease check.
+        count=s.scalar(select(func.count()).select_from(CodeRunJob).where(
+            CodeRunJob.status.in_(['queued','running']))) or 0
+        s.execute(update(CodeRunJob).where(
+            CodeRunJob.status.in_(['queued','running'])
+        ).values(
+            status='failed', success=False, error='Compilation queue cleared by super administrator',
+            runner_claim_token='', completed_at=now_iso(), source_code='', stdin_text=''
+        ))
+        audit_event(s,'compiler_queue_cleared','code_run_jobs','',f'cancelled={count}')
+        s.commit()
+        flash(f'Compilation queue cleared: {count} pending/running job(s) cancelled.')
+    except Exception:
+        s.rollback()
+        app.logger.exception('Super admin compilation queue clear failed')
+        flash('Unable to clear the compilation queue. Check server logs.','error')
+    finally:
+        s.close()
+    return redirect(url_for('admin_dashboard'))
+
 @app.route('/admin')
 @staff_required
 def admin_dashboard():
