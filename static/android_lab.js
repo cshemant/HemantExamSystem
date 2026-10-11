@@ -89,8 +89,44 @@ public class MainActivity extends AppCompatActivity {
   $('android-new-class').onclick=()=>addJava('java_class','Java class name:','Utility',helper);
   $('android-new-layout').onclick=()=>{save();if(Object.keys(project.layouts).length>=15)return alert('Maximum 15 layouts allowed.');const name=xmlName(prompt('Layout filename:','activity_second'));if(!name)return alert('Use lowercase letters, numbers and underscores.');const file=name+'.xml';if(project.layouts[file])return alert('That layout already exists.');project.layouts[file]=`<?xml version="1.0" encoding="utf-8"?>\n<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:gravity="center">\n    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="${name}" />\n</LinearLayout>`;select('layout',file);};
   $('android-new-resource').onclick=()=>{save();const folder=prompt('Resource folder: drawable, mipmap, raw, xml, anim, animator, menu or font','drawable');if(!folder||!project.resources[folder])return alert('Choose a supported resource folder.');const filename=xmlName(prompt('Resource XML filename (without .xml):','custom_background'));if(!filename)return alert('Use lowercase letters, numbers and underscores.');const file=filename+'.xml';if(project.resources[folder][file])return alert('That file already exists.');project.resources[folder][file]=folder==='drawable'?'<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">\n    <solid android:color="#6750A4" />\n</shape>':folder==='mipmap'?'<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n    <background android:drawable="@color/purple_500" />\n    <foreground android:drawable="@drawable/ic_launcher_foreground" />\n</adaptive-icon>':'<?xml version="1.0" encoding="utf-8"?>\n<resources />';select(folder,file);};
-  $('android-upload-image').onclick=()=>{$('android-image-file').click();};
-  $('android-image-file').onchange=async e=>{const file=e.target.files[0];if(!file)return;save();const folder=prompt('Image resource folder (drawable or mipmap)','drawable');if(!['drawable','mipmap','raw'].includes(folder))return alert('Choose drawable, mipmap, or raw.');const ext=(file.name.split('.').pop()||'').toLowerCase();if(!['png','jpg','jpeg','webp'].includes(ext)||!['image/png','image/jpeg','image/webp'].includes(file.type))return alert('Upload PNG, JPG, or WebP images only.');if(file.size>350000)return alert('Image must be under 350 KB. Resize or compress it first.');const base=prompt('Resource filename (without extension)',file.name.replace(/\.[^.]+$/,'').toLowerCase().replace(/[^a-z0-9_]/g,'_'));if(!base||!(/^[a-z][a-z0-9_]{0,49}$/).test(base))return alert('Use a lowercase resource name.');const name=base+'.'+ext;const encoded=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file);});project.resources[folder][name]=encoded;selected={type:folder,name};editor.value='[Image asset — upload a new image to replace this file]';editor.readOnly=true;title.textContent='res/'+folder+'/'+name;renderTree();e.target.value='';};
+  // Both upload actions use the same resource transport already supported by the APK worker.
+  // Only the dedicated launcher-icon action is allowed to edit the manifest automatically.
+  let imageMode='drawable';
+  $('android-upload-image').onclick=()=>{imageMode='drawable';$('android-image-file').click();};
+  $('android-set-icon').onclick=()=>{imageMode='launcher';$('android-image-file').click();};
+  function setLauncherIcon(name){
+    const resource='@mipmap/'+name.replace(/\.(png|jpe?g|webp)$/i,'');
+    const opening=project.manifest.match(/<application\b[^>]*>/i);
+    if(!opening)throw Error('AndroidManifest.xml has no <application> tag. Add the tag before setting an app icon.');
+    let tag=opening[0];
+    if(/\bandroid:icon\s*=/.test(tag))tag=tag.replace(/\bandroid:icon\s*=\s*(["']).*?\1/i,'android:icon="'+resource+'"');
+    else tag=tag.replace(/>$/,' android:icon="'+resource+'">');
+    // Set both normal and round launcher icons. Other application attributes are untouched.
+    if(/\bandroid:roundIcon\s*=/.test(tag))tag=tag.replace(/\bandroid:roundIcon\s*=\s*(["']).*?\1/i,'android:roundIcon="'+resource+'"');
+    else tag=tag.replace(/>$/,' android:roundIcon="'+resource+'">');
+    project.manifest=project.manifest.replace(opening[0],tag);
+  }
+  $('android-image-file').onchange=async e=>{
+    const file=e.target.files[0];if(!file)return;
+    const mode=imageMode;e.target.value='';save();
+    const ext=(file.name.split('.').pop()||'').toLowerCase();
+    if(!['png','jpg','jpeg','webp'].includes(ext)||!['image/png','image/jpeg','image/webp'].includes(file.type))return alert('Upload PNG, JPG, or WebP images only.');
+    if(file.size>350000)return alert('Image must be under 350 KB. Resize or compress it first.');
+    const folder=mode==='launcher'?'mipmap':'drawable';
+    const suggested=mode==='launcher'?'ic_launcher':file.name.replace(/\.[^.]+$/,'').toLowerCase().replace(/[^a-z0-9_]/g,'_');
+    const base=prompt(mode==='launcher'?'Launcher icon name (without extension):':'Image resource name (without extension):',suggested);
+    if(base===null)return;
+    if(!(/^[a-z][a-z0-9_]{0,49}$/).test(base))return alert('Use lowercase letters, numbers and underscores; start with a letter.');
+    const name=base+'.'+ext;
+    if(project.resources[folder][name]&&!confirm('Replace existing res/'+folder+'/'+name+'?'))return;
+    if(mode==='launcher'&&!/<application\b[^>]*>/i.test(project.manifest))return alert('AndroidManifest.xml needs an <application> tag before the launcher icon can be set.');
+    try{
+      const encoded=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file);});
+      project.resources[folder][name]=encoded;
+      if(mode==='launcher'){setLauncherIcon(name);select('manifest','AndroidManifest.xml');status.textContent='Launcher icon set — rebuild APK';}
+      else{select(folder,name);status.textContent='Image added to res/drawable';}
+    }catch(error){alert('Unable to read image: '+error.message);}
+  };
   $('android-rename-file').onclick=()=>{save();const old=selected.name;if(['activity','receiver','service','java_class'].includes(selected.type)){const name=javaName(prompt('New Java class name:',old.slice(0,-5)));if(!name)return;const file=name+'.java';if(javaExists(file)&&file!==old)return alert('That Java filename already exists.');const target=bucket(selected.type);target[file]=target[old].replace(new RegExp(`\\bpublic\\s+class\\s+${old.slice(0,-5)}\\b`),`public class ${name}`);delete target[old];if(selected.type!=='java_class')project.manifest=project.manifest.replace(new RegExp(`\\.${old.slice(0,-5)}(?=["'])`,'g'),'.'+name);selected.name=file;}else if(selected.type==='layout'||project.resources[selected.type]){const name=xmlName(prompt('New XML filename:',old.slice(0,-4)));if(!name)return;const file=name+'.xml';const target=bucket(selected.type);if(target[file]&&file!==old)return alert('That XML filename already exists.');target[file]=target[old];delete target[old];if(selected.type==='layout'){for(const group of ['activities','receivers','services','java_classes'])for(const key of Object.keys(project[group]))project[group][key]=project[group][key].replace(new RegExp(`R\\.layout\\.${old.slice(0,-4)}\\b`,'g'),'R.layout.'+name);}selected.name=file;}editor.value=content();editor.readOnly=false;title.textContent=selected.name;renderTree();};
   $('android-delete-file').onclick=()=>{save();if(!confirm(`Delete ${selected.name}?`))return;const old=selected.name;if(['activity','receiver','service'].includes(selected.type)){removeManifest({activity:'activity',receiver:'receiver',service:'service'}[selected.type],old.slice(0,-5));}delete bucket(selected.type)[old];selected={type:'activity',name:'MainActivity.java'};editor.value=content();editor.readOnly=false;title.textContent=selected.name;renderTree();};
   editor.onkeydown=e=>{if(e.key==='Tab'){e.preventDefault();editor.setRangeText('    ',editor.selectionStart,editor.selectionEnd,'end');}};
