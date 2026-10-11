@@ -1,10 +1,9 @@
 """Token-authenticated remote compiler worker; never connects to the database."""
-import json, os, platform, signal, subprocess, tempfile, threading, time, traceback
+import json, os, platform, signal, subprocess, tempfile, threading, time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from android_build_worker import build_android_apk
-
 
 SERVER_URL=os.getenv('CODE_RUNNER_SERVER_URL','').strip().rstrip('/')
 RUNNER_TOKEN=os.getenv('CODE_RUNNER_TOKEN','').strip()
@@ -20,12 +19,12 @@ CAPABILITIES=tuple(dict.fromkeys(
     if item.strip().lower() in ALL_CAPABILITIES
 ))
 stop_event=threading.Event()
-# Android project resources are base64 encoded in the claim JSON.
-# Reading only 250 KB truncates that JSON and raises JSONDecodeError.
-MAX_API_RESPONSE_BYTES=16*1024*1024
-
 
 def api(path,payload=None,allow_empty=False):
+    # Large Android projects and APK results require complete JSON messages.
+    # Limit the full response size rather than silently truncating JSON.
+    max_response_bytes=32*1024*1024
+    timeout_seconds=120 if path.endswith("/complete") else 60
     data=None if payload is None else json.dumps(payload).encode()
     req=Request(SERVER_URL+path,data=data,headers={
         'Authorization':'Bearer '+RUNNER_TOKEN,'Content-Type':'application/json',
@@ -33,21 +32,15 @@ def api(path,payload=None,allow_empty=False):
         'X-Runner-Capabilities':','.join(CAPABILITIES),
     },method='GET' if payload is None else 'POST')
     try:
-        with urlopen(req,timeout=25) as response:
-            # Read the complete response (up to a safe limit), not just 250 KB.
-            # A large image or audio resource can make the JSON claim much larger.
-            raw=response.read(MAX_API_RESPONSE_BYTES + 1)
-            if len(raw)>MAX_API_RESPONSE_BYTES:
-                raise RuntimeError('Worker API response exceeds 16 MiB; check project limits.')
+        with urlopen(req,timeout=timeout_seconds) as response:
+            raw=response.read(max_response_bytes+1)
+            if len(raw)>max_response_bytes:
+                raise RuntimeError("Server response exceeded 32 MB; reduce Android resource/APK size.")
             if allow_empty and not raw:return None
-            if not raw:raise RuntimeError('Worker API returned an empty JSON response.')
             try:
-                return json.loads(raw.decode('utf-8'))
-            except (ValueError, UnicodeError) as exc:
-                raise RuntimeError(
-                    f'Invalid JSON response from {path}: {len(raw)} bytes, '
-                    f'HTTP {response.status}; {exc}'
-                ) from exc
+                return json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Server returned incomplete or invalid JSON ({len(raw)} bytes): {exc}") from exc
     except HTTPError as exc:
         if allow_empty and exc.code==204:return None
         detail=exc.read(500).decode('utf-8','replace')
@@ -110,7 +103,6 @@ def run_worker(number):
         except Exception as exc:
             failures=min(failures+1,6)
             print(f'[worker {number}] {exc}',flush=True)
-            traceback.print_exc()
             stop_event.wait(min(30,2**failures))
 
 def stop_worker(*_):stop_event.set()
