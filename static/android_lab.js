@@ -54,9 +54,9 @@ public class MainActivity extends AppCompatActivity {
   function clone(x){return JSON.parse(JSON.stringify(x));}
   function bucket(type){return project.resources[type] || project[groups[type]];}
   function save(){if(isBinary(selected))return;if(selected.type==='manifest')project.manifest=editor.value;else bucket(selected.type)[selected.name]=editor.value;if(selected.type==='activity'&&selected.name==='MainActivity.java'){const match=editor.value.match(/^\s*package\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+)\s*;/m);if(match)PACKAGE=match[1];}}
-  function isBinary(file){return /\.(png|jpe?g|webp)$/i.test(file.name);}
+  function isBinary(file){return /\.(png|jpe?g|webp|mp3|wav|ogg|mp4|m4a)$/i.test(file.name);}
   function content(){return selected.type==='manifest'?project.manifest:bucket(selected.type)[selected.name];}
-  function select(type,name){save();selected={type,name};editor.value=isBinary(selected)?'[Image asset — upload a new image to replace this file]':content();editor.readOnly=isBinary(selected);title.textContent=(project.resources[selected.type]?'res/'+selected.type+'/':'')+name;renderTree();editor.focus();}
+  function select(type,name){save();selected={type,name};editor.value=isBinary(selected)?'[Binary resource — upload a new asset to replace this file]':content();editor.readOnly=isBinary(selected);title.textContent=(project.resources[selected.type]?'res/'+selected.type+'/':'')+name;renderTree();editor.focus();}
   function fileButton(type,name){const b=document.createElement('button');b.type='button';b.textContent=name;b.className=selected.type===type&&selected.name===name?'active':'';b.onclick=()=>select(type,name);return b;}
   function renderTree(){
     tree.replaceChildren();
@@ -126,6 +126,30 @@ public class MainActivity extends AppCompatActivity {
       if(mode==='launcher'){setLauncherIcon(name);/* Do not call select(): it saves the stale manifest editor text over the updated project.manifest. */selected={type:'manifest',name:'AndroidManifest.xml'};editor.value=project.manifest;editor.readOnly=false;title.textContent='AndroidManifest.xml';renderTree();status.textContent='Launcher icon set — rebuild APK';}
       else{select(folder,name);status.textContent='Image added to res/drawable';}
     }catch(error){alert('Unable to read image: '+error.message);}
+  };
+  // Binary audio/video resources share the existing project's base64 resource transport.
+  // The worker authenticates their file signatures and enforces the same limits.
+  $('android-upload-media').onclick=()=>$('android-media-file').click();
+  $('android-media-file').onchange=async e=>{
+    const file=e.target.files[0];e.target.value='';if(!file)return;
+    save();
+    const ext=(file.name.split('.').pop()||'').toLowerCase();
+    if(!['mp3','wav','ogg','mp4','m4a'].includes(ext))return alert('Choose an MP3, WAV, OGG, MP4 or M4A file.');
+    if(file.size>3000000)return alert('Audio / video file exceeds 3 MB. Use a shorter or compressed sample.');
+    const suggested=file.name.replace(/\.[^.]+$/,'').toLowerCase().replace(/[^a-z0-9_]/g,'_');
+    const base=prompt('Media resource name (without extension):',suggested);
+    if(base===null)return;
+    if(!/^[a-z][a-z0-9_]{0,49}$/.test(base))return alert('Use lowercase letters, numbers and underscores; start with a letter.');
+    const name=base+'.'+ext;
+    if(project.resources.raw[name]&&!confirm('Replace existing res/raw/'+name+'?'))return;
+    const sizeExisting=Object.entries(project.resources).flatMap(([group,items])=>Object.entries(items).filter(([key])=>!(group==='raw'&&key===name)).map(([key,value])=>/\.xml$/i.test(key)?new TextEncoder().encode(value).length:Math.floor(value.length*3/4))).reduce((a,b)=>a+b,0);
+    if(sizeExisting+file.size>5000000)return alert('All resources together must be under 5 MB. Remove unused assets first.');
+    try{
+      const encoded=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file);});
+      project.resources.raw[name]=encoded;
+      selected={type:'raw',name};editor.value='[Binary media resource — '+file.name+']';editor.readOnly=true;title.textContent='res/raw/'+name;renderTree();
+      status.textContent='Media added to res/raw — use R.raw.'+base+' in Java, then Build APK';
+    }catch(error){alert('Unable to read media file: '+error.message);}
   };
   $('android-rename-file').onclick=()=>{save();const old=selected.name;if(['activity','receiver','service','java_class'].includes(selected.type)){const name=javaName(prompt('New Java class name:',old.slice(0,-5)));if(!name)return;const file=name+'.java';if(javaExists(file)&&file!==old)return alert('That Java filename already exists.');const target=bucket(selected.type);target[file]=target[old].replace(new RegExp(`\\bpublic\\s+class\\s+${old.slice(0,-5)}\\b`),`public class ${name}`);delete target[old];if(selected.type!=='java_class')project.manifest=project.manifest.replace(new RegExp(`\\.${old.slice(0,-5)}(?=["'])`,'g'),'.'+name);selected.name=file;}else if(selected.type==='layout'||project.resources[selected.type]){const name=xmlName(prompt('New XML filename:',old.slice(0,-4)));if(!name)return;const file=name+'.xml';const target=bucket(selected.type);if(target[file]&&file!==old)return alert('That XML filename already exists.');target[file]=target[old];delete target[old];if(selected.type==='layout'){for(const group of ['activities','receivers','services','java_classes'])for(const key of Object.keys(project[group]))project[group][key]=project[group][key].replace(new RegExp(`R\\.layout\\.${old.slice(0,-4)}\\b`,'g'),'R.layout.'+name);}selected.name=file;}editor.value=content();editor.readOnly=false;title.textContent=selected.name;renderTree();};
   $('android-delete-file').onclick=()=>{save();if(!confirm(`Delete ${selected.name}?`))return;const old=selected.name;if(['activity','receiver','service'].includes(selected.type)){removeManifest({activity:'activity',receiver:'receiver',service:'service'}[selected.type],old.slice(0,-5));}delete bucket(selected.type)[old];selected={type:'activity',name:'MainActivity.java'};editor.value=content();editor.readOnly=false;title.textContent=selected.name;renderTree();};

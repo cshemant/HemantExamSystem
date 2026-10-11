@@ -46,8 +46,9 @@ def _declared(app,tag,namespace):
     return found
 
 RESOURCE_GROUPS=('drawable','mipmap','raw','xml','anim','animator','menu','font')
-RESOURCE_NAME_RE=re.compile(r'^[a-z][a-z0-9_]{0,49}\.(?:xml|png|jpg|jpeg|webp)$')
+RESOURCE_NAME_RE=re.compile(r'^[a-z][a-z0-9_]{0,49}\.(?:xml|png|jpg|jpeg|webp|mp3|wav|ogg|mp4|m4a)$')
 BINARY_IMAGE_EXTS={'.png','.jpg','.jpeg','.webp'}
+BINARY_MEDIA_EXTS={'.mp3','.wav','.ogg','.mp4','.m4a'}
 
 def _project_resources(project):
     """Validate controlled res/ folders, including base64-encoded uploaded images."""
@@ -66,16 +67,22 @@ def _project_resources(project):
                 _xml(filename,value); content=value.encode('utf-8')
             else:
                 if folder in ('xml','anim','animator','menu'):raise RuntimeError(f'Only XML is supported in res/{folder}.')
-                if not isinstance(value,str):raise RuntimeError(f'{filename} must be a base64 image.')
+                if not isinstance(value,str):raise RuntimeError(f'{filename} must contain a base64-encoded binary asset.')
                 try:content=base64.b64decode(value,validate=True)
-                except (ValueError,binascii.Error):raise RuntimeError(f'Invalid base64 image in {filename}.')
-                detected=('png' if content.startswith(b'\x89PNG\r\n\x1a\n') else 'jpeg' if content.startswith(b'\xff\xd8\xff') else 'webp' if content[:4]==b'RIFF' and content[8:12]==b'WEBP' else None)
-                if detected not in ('png','jpeg','webp') or (ext=='.png' and detected!='png') or (ext in ('.jpg','.jpeg') and detected!='jpeg') or (ext=='.webp' and detected!='webp'):
-                    raise RuntimeError(f'{filename} is not a valid image matching its extension.')
-            if len(content)>350000:raise RuntimeError(f'{filename} exceeds the 350 KB per-resource limit.')
+                except (ValueError,binascii.Error):raise RuntimeError(f'Invalid base64 resource in {filename}.')
+                if ext in BINARY_MEDIA_EXTS:
+                    if folder!='raw':raise RuntimeError(f'Media files must be placed under res/raw: {filename}.')
+                    valid=(ext=='.mp3' and (content.startswith(b'ID3') or (len(content)>2 and content[0]==0xff and (content[1]&0xe0)==0xe0))) or (ext=='.wav' and content.startswith(b'RIFF') and content[8:12]==b'WAVE') or (ext=='.ogg' and content.startswith(b'OggS')) or (ext in ('.mp4','.m4a') and len(content)>12 and content[4:8]==b'ftyp')
+                    if not valid:raise RuntimeError(f'{filename} does not match its supported media format.')
+                else:
+                    detected=('png' if content.startswith(b'\x89PNG\r\n\x1a\n') else 'jpeg' if content.startswith(b'\xff\xd8\xff') else 'webp' if content[:4]==b'RIFF' and content[8:12]==b'WEBP' else None)
+                    if detected not in ('png','jpeg','webp') or (ext=='.png' and detected!='png') or (ext in ('.jpg','.jpeg') and detected!='jpeg') or (ext=='.webp' and detected!='webp'):
+                        raise RuntimeError(f'{filename} is not a valid image matching its extension.')
+            limit=3000000 if ext in BINARY_MEDIA_EXTS else 350000
+            if len(content)>limit:raise RuntimeError(f'{filename} exceeds the {limit//1000} KB per-resource limit.')
             total+=len(content);clean[filename]=content
         checked[folder]=clean
-    if total>1200000:raise RuntimeError('Android resource files exceed 1.2 MB total.')
+    if total>5000000:raise RuntimeError('Android resource files exceed 5 MB total.')
     return checked
 
 def _project(source):
