@@ -92,7 +92,7 @@ ANDROID_RUNNER_LEASE_SECONDS=max(300,min(1200,int(os.getenv('ANDROID_RUNNER_LEAS
 CODE_EDITOR_MAX_SOURCE_BYTES=max(1024,min(100000,int(os.getenv('CODE_EDITOR_MAX_SOURCE_BYTES','50000'))))
 CODE_EDITOR_MAX_STDIN_BYTES=max(256,min(20000,int(os.getenv('CODE_EDITOR_MAX_STDIN_BYTES','10000'))))
 CODE_EDITOR_QUEUE_LIMIT=max(10,min(500,int(os.getenv('CODE_EDITOR_QUEUE_LIMIT','100'))))
-ANDROID_PROJECT_MAX_BYTES=max(4096,min(400000,int(os.getenv('ANDROID_PROJECT_MAX_BYTES','260000'))))
+ANDROID_PROJECT_MAX_BYTES=max(4096,min(2000000,int(os.getenv('ANDROID_PROJECT_MAX_BYTES','1600000'))))
 ANDROID_APK_MAX_BYTES=max(1024*1024,min(15*1024*1024,int(os.getenv('ANDROID_APK_MAX_BYTES',str(12*1024*1024)))))
 ANDROID_APK_RETENTION_HOURS=max(1,min(72,int(os.getenv('ANDROID_APK_RETENTION_HOURS','6'))))
 ANDROID_QR_EXPIRY_MINUTES=max(5,min(60,int(os.getenv('ANDROID_QR_EXPIRY_MINUTES','30'))))
@@ -9455,6 +9455,7 @@ def student_android_lab_build():
             'java_classes':payload.get('java_classes') if isinstance(payload.get('java_classes'),dict) else {},
             'layouts':payload.get('layouts') if isinstance(payload.get('layouts'),dict) else {},
             'values':payload.get('values') if isinstance(payload.get('values'),dict) else {},
+            'resources':payload.get('resources') if isinstance(payload.get('resources'),dict) else {},
             'manifest':payload.get('manifest') if isinstance(payload.get('manifest'),str) else '',
         }
         if not project['app_name']:raise ValueError('Enter an application name.')

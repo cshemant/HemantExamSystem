@@ -1,5 +1,5 @@
-"""Controlled Java/XML AndroidX APK builder executed by the local worker."""
-import base64,json,os,re,subprocess,tempfile
+"""Controlled Java/XML AndroidX APK builder executed by a local or cloud worker."""
+import base64,binascii,json,os,re,subprocess,tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -7,7 +7,7 @@ PACKAGE='com.learnwithhemant.studentapp'  # Default for newly created projects o
 ANDROID_NAME='{http://schemas.android.com/apk/res/android}name'
 JAVA_RE=re.compile(r'^[A-Z][A-Za-z0-9_]{0,49}\.java$');XML_RE=re.compile(r'^[a-z][a-z0-9_]{0,49}\.xml$')
 GROUP_LIMITS={'activities':10,'receivers':10,'services':10,'java_classes':20}
-ANDROIDX_DEPENDENCIES=('androidx.appcompat:appcompat:1.7.0','androidx.activity:activity:1.9.3','androidx.constraintlayout:constraintlayout:2.2.0','com.google.android.material:material:1.12.0')
+ANDROIDX_DEPENDENCIES=('androidx.appcompat:appcompat:1.7.0','androidx.activity:activity:1.9.3','androidx.constraintlayout:constraintlayout:2.2.0','com.google.android.material:material:1.12.0','androidx.recyclerview:recyclerview:1.3.2','androidx.cardview:cardview:1.0.0','androidx.core:core:1.15.0','com.google.android.gms:play-services-maps:19.0.0','com.google.android.gms:play-services-location:21.3.0')
 
 def _run(args,cwd,timeout=240,env=None):
     done=subprocess.run(args,cwd=cwd,capture_output=True,text=True,timeout=timeout,env=env,creationflags=(subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0))
@@ -44,6 +44,39 @@ def _declared(app,tag,namespace):
         raw=(node.get(ANDROID_NAME) or '').strip();resolved=namespace+raw if raw.startswith('.') else (namespace+'.'+raw if '.' not in raw else raw)
         if resolved:found.add(resolved)
     return found
+
+RESOURCE_GROUPS=('drawable','mipmap','raw','xml','anim','animator','menu','font')
+RESOURCE_NAME_RE=re.compile(r'^[a-z][a-z0-9_]{0,49}\.(?:xml|png|jpg|jpeg|webp)$')
+BINARY_IMAGE_EXTS={'.png','.jpg','.jpeg','.webp'}
+
+def _project_resources(project):
+    """Validate controlled res/ folders, including base64-encoded uploaded images."""
+    raw=project.get('resources') or {}
+    if not isinstance(raw,dict) or any(k not in RESOURCE_GROUPS for k in raw):
+        raise RuntimeError('Unsupported Android resource folder.')
+    checked={}; total=0
+    for folder,items in raw.items():
+        if not isinstance(items,dict) or len(items)>30:raise RuntimeError(f'Use no more than 30 files in res/{folder}.')
+        clean={}
+        for filename,value in items.items():
+            if not RESOURCE_NAME_RE.fullmatch(filename):raise RuntimeError(f'Invalid resource file: res/{folder}/{filename}.')
+            ext=Path(filename).suffix.lower()
+            if ext=='.xml':
+                if not isinstance(value,str):raise RuntimeError(f'{filename} must contain XML text.')
+                _xml(filename,value); content=value.encode('utf-8')
+            else:
+                if folder in ('xml','anim','animator','menu'):raise RuntimeError(f'Only XML is supported in res/{folder}.')
+                if not isinstance(value,str):raise RuntimeError(f'{filename} must be a base64 image.')
+                try:content=base64.b64decode(value,validate=True)
+                except (ValueError,binascii.Error):raise RuntimeError(f'Invalid base64 image in {filename}.')
+                detected=('png' if content.startswith(b'\x89PNG\r\n\x1a\n') else 'jpeg' if content.startswith(b'\xff\xd8\xff') else 'webp' if content[:4]==b'RIFF' and content[8:12]==b'WEBP' else None)
+                if detected not in ('png','jpeg','webp') or (ext=='.png' and detected!='png') or (ext in ('.jpg','.jpeg') and detected!='jpeg') or (ext=='.webp' and detected!='webp'):
+                    raise RuntimeError(f'{filename} is not a valid image matching its extension.')
+            if len(content)>350000:raise RuntimeError(f'{filename} exceeds the 350 KB per-resource limit.')
+            total+=len(content);clean[filename]=content
+        checked[folder]=clean
+    if total>1200000:raise RuntimeError('Android resource files exceed 1.2 MB total.')
+    return checked
 
 def _project(source):
     try:p=json.loads(source)
@@ -90,6 +123,7 @@ def _project(source):
     if not launcher:raise RuntimeError('Manifest requires one MAIN/LAUNCHER activity.')
     total=sum(len(body) for files in groups.values() for body in files.values())+sum(map(len,clean_layouts.values()))+sum(map(len,clean_values.values()))+len(manifest)
     if total>260000:raise RuntimeError('Android project exceeds the 260 KB source limit.')
+    _project_resources(p)  # Validate resources before the job reaches Gradle.
     return groups,clean_layouts,clean_values,manifest,namespace
 
 def _gradle_executable():
@@ -116,10 +150,14 @@ dependencies {{
 """
 
 def build_android_apk(source):
-    groups,layouts,values,manifest,namespace=_project(source);sdk=os.environ.get('ANDROID_SDK_ROOT') or os.environ.get('ANDROID_HOME');key=os.environ.get('ANDROID_DEBUG_KEYSTORE')
-    if not sdk or not Path(sdk).is_dir():raise RuntimeError('Android SDK is missing. Run INSTALL_CODE_RUNNER.bat once.')
-    if not key or not Path(key).is_file():raise RuntimeError('Android debug signing key is missing.')
-    with tempfile.TemporaryDirectory(prefix='lwh-androidx-') as td:
+    groups,layouts,values,manifest,namespace=_project(source)
+    resource_files=_project_resources(json.loads(source))
+    docker_image=os.environ.get('ANDROID_DOCKER_IMAGE','').strip()
+    sdk=os.environ.get('ANDROID_SDK_ROOT') or os.environ.get('ANDROID_HOME');key=os.environ.get('ANDROID_DEBUG_KEYSTORE')
+    if not docker_image and (not sdk or not Path(sdk).is_dir()):raise RuntimeError('Android SDK is missing. Run INSTALL_CODE_RUNNER.bat once.')
+    if not docker_image and (not key or not Path(key).is_file()):raise RuntimeError('Android debug signing key is missing.')
+    work_root=os.environ.get('ANDROID_WORK_ROOT','').strip() or None
+    with tempfile.TemporaryDirectory(prefix='lwh-androidx-',dir=work_root) as td:
         root=Path(td);app=root/'app';java_root=app/'src/main/java';layout=app/'src/main/res/layout';value_dir=app/'src/main/res/values'
         for folder in (java_root,layout,value_dir):folder.mkdir(parents=True,exist_ok=True)
         for files in groups.values():
@@ -127,13 +165,24 @@ def build_android_apk(source):
                 java=java_root/Path(_package_of(body).replace('.','/'));java.mkdir(parents=True,exist_ok=True);(java/name).write_text(body,encoding='utf-8')
         for name,body in layouts.items():(layout/name).write_text(body,encoding='utf-8')
         for name,body in values.items():(value_dir/name).write_text(body,encoding='utf-8')
+        for folder,files in resource_files.items():
+            directory=app/'src/main/res'/folder;directory.mkdir(parents=True,exist_ok=True)
+            for filename,content in files.items():(directory/filename).write_bytes(content)
         (app/'src/main/AndroidManifest.xml').write_text(manifest,encoding='utf-8')
         (root/'settings.gradle').write_text("pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name='StudentApp'\ninclude ':app'\n",encoding='utf-8')
         (root/'build.gradle').write_text('// System managed. Students cannot modify this file.\n',encoding='utf-8')
         (app/'build.gradle').write_text(_build_gradle(namespace),encoding='utf-8')
         (root/'gradle.properties').write_text('org.gradle.daemon=false\norg.gradle.jvmargs=-Xmx1536m -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\n',encoding='utf-8')
-        env=os.environ.copy();env.update({'ANDROID_HOME':sdk,'ANDROID_SDK_ROOT':sdk,'ANDROID_DEBUG_KEYSTORE':key})
-        log=_run([_gradle_executable(),'--offline','--no-daemon','--console=plain',':app:assembleDebug'],root,300,env)
+        env=os.environ.copy()
+        if docker_image:
+            args=['docker','run','--rm','--network','none','--memory','3g','--cpus','2',
+                  '--pids-limit','512','--security-opt','no-new-privileges','--cap-drop','ALL',
+                  '-v',f'{root}:/workspace:rw','-w','/workspace',docker_image,
+                  'gradle','--offline','--no-daemon','--console=plain',':app:assembleDebug']
+            log=_run(args,root,540,env)
+        else:
+            env.update({'ANDROID_HOME':sdk,'ANDROID_SDK_ROOT':sdk,'ANDROID_DEBUG_KEYSTORE':key})
+            log=_run([_gradle_executable(),'--offline','--no-daemon','--console=plain',':app:assembleDebug'],root,300,env)
         apk=app/'build/outputs/apk/debug/app-debug.apk'
         if not apk.is_file():raise RuntimeError('Gradle completed without producing the debug APK.')
         data=apk.read_bytes()
