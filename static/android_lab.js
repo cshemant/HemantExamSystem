@@ -123,7 +123,7 @@ public class MainActivity extends AppCompatActivity {
     try{
       const encoded=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file);});
       project.resources[folder][name]=encoded;
-      if(mode==='launcher'){setLauncherIcon(name);select('manifest','AndroidManifest.xml');status.textContent='Launcher icon set — rebuild APK';}
+      if(mode==='launcher'){setLauncherIcon(name);/* Do not call select(): it saves the stale manifest editor text over the updated project.manifest. */selected={type:'manifest',name:'AndroidManifest.xml'};editor.value=project.manifest;editor.readOnly=false;title.textContent='AndroidManifest.xml';renderTree();status.textContent='Launcher icon set — rebuild APK';}
       else{select(folder,name);status.textContent='Image added to res/drawable';}
     }catch(error){alert('Unable to read image: '+error.message);}
   };
