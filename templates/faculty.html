@@ -18,6 +18,13 @@
   <td><div class="actions staff-account-actions">
     {% if viewer_role=='super_admin' %}
     <form method="post" action="{{ url_for('update_faculty_role',faculty_id=f.id) }}" class="inline-role-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><select name="staff_role"><option value="faculty" {% if target_role=='faculty' %}selected{% endif %}>Faculty</option><option value="hod" {% if target_role=='hod' %}selected{% endif %}>HOD</option><option value="exam_controller" {% if target_role=='exam_controller' %}selected{% endif %}>Exam Controller</option></select><input name="department" value="{{ role.department if role else '' }}" placeholder="Dept"><select name="institution_id"><option value="">Global</option>{% for inst in institutions %}<option value="{{ inst.id }}" {% if role and role.institution_id==inst.id %}selected{% endif %}>{{ inst.short_name or inst.name }}</option>{% endfor %}</select><button class="btn small secondary">Update</button></form>
+    {% set eg=exam_permission_map.get(f.id) %}
+    <form method="post" action="{{ url_for('update_staff_exam_permissions',faculty_id=f.id) }}" class="inline-role-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label><input type="checkbox" name="can_edit_own" {% if eg and eg.can_edit_own %}checked{% endif %}> Edit Own Exams</label>
+      <label><input type="checkbox" name="can_delete_own" {% if eg and eg.can_delete_own %}checked{% endif %}> Delete Own Exams</label>
+      <button class="btn small secondary">Save Exam Permissions</button>
+    </form>
     <form method="post" action="{{ url_for('toggle_faculty',faculty_id=f.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">{% if f.is_active %}Disable{% else %}Enable{% endif %}</button></form>
     {% endif %}
     {% if (viewer_role=='super_admin' or (viewer_role=='hod' and target_role=='faculty')) and f.mfa_enabled %}<form method="post" action="{{ url_for('reset_faculty_mfa',faculty_id=f.id) }}" onsubmit="return confirm('Reset MFA for {{ f.username }}?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn small secondary">Reset MFA</button></form>{% endif %}

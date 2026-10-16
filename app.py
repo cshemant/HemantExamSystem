@@ -589,6 +589,12 @@ class FacultyRole(Base):
     institution_id:Mapped[int|None]=mapped_column(Integer,nullable=True,default=None)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
+class StaffExamPermission(Base):
+    __tablename__='staff_exam_permissions'
+    faculty_id:Mapped[int]=mapped_column(ForeignKey('faculty_users.id'),primary_key=True)
+    can_edit_own:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    can_delete_own:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+
 class AcademicGroup(Base):
     __tablename__='academic_groups'
     __table_args__=(UniqueConstraint('department','program','semester','section','academic_year'),)
@@ -2147,6 +2153,19 @@ def exam_owner_actor(s,exam_id):
         return owner
     approval=get_exam_approval(s,exam_id,create=False)
     return (approval.requested_by or '') if approval else ''
+
+def may_manage_own_exam(s,exam_id,action):
+    """Server-side ownership and explicit super-admin grant, fail closed."""
+    if current_staff_role(s)=='super_admin':return True
+    if web_session.get('role')!='faculty' or action not in {'edit','delete'}:return False
+    uid=web_session.get('user_id')
+    if not uid:return False
+    member=s.get(Faculty,int(uid))
+    grant=s.get(StaffExamPermission,int(uid))
+    if not member or not member.is_active or not grant:return False
+    allowed=grant.can_edit_own if action=='edit' else grant.can_delete_own
+    if not allowed:return False
+    return bool(exam_owner_actor(s,exam_id)==f'faculty:{member.username}')
 
 def _stored_local_date(value):
     value=(value or '').strip()
@@ -7391,7 +7410,7 @@ def build_admin_exam_rows(s, mock_drive_only=False):
         practical_code_start_at=(getattr(cfg,'practical_code_start_at','') or '') if cfg else ''
         practical_code_end_at=(getattr(cfg,'practical_code_end_at','') or '') if cfg else ''
         display_duration=mock_drive_total_minutes(cfg,count,e.duration_minutes) if is_mock else e.duration_minutes
-        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':display_duration,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no,'practical_code_start_at':practical_code_start_at,'practical_code_end_at':practical_code_end_at,'mock_drive_start_at':getattr(cfg,'mock_drive_start_at','') or '','mock_drive_end_at':getattr(cfg,'mock_drive_end_at','') or '','mock_section_minutes':json.dumps(mock_section_minutes(cfg),separators=(',',':')),'mock_minutes_per_question':int(getattr(cfg,'mock_minutes_per_question',1) or 1),'sequential_min_seconds':int(getattr(cfg,'sequential_min_seconds',10) or 0),'ai_review_pending':bool(getattr(cfg,'ai_review_pending',False))})())
+        rows.append(type('ExamRow',(),{'id':e.id,'title':e.title,'duration_minutes':display_duration,'is_active':e.is_active,'question_count':count,'student_question_count':min(target,count) if count else 0,'approval_status':approval.status,'session_count':session_count,'self_approval_allowed':policy['self_approval_allowed'],'external_approval_required':policy['external_approval_required'],'approval_policy_message':policy['message'],'daily_exam_count':policy['daily_exam_count'],'subject':subject,'unit_label':unit_label,'exam_type':exam_type,'practical_experiment_no':practical_experiment_no,'practical_code_start_at':practical_code_start_at,'practical_code_end_at':practical_code_end_at,'mock_drive_start_at':getattr(cfg,'mock_drive_start_at','') or '','mock_drive_end_at':getattr(cfg,'mock_drive_end_at','') or '','mock_section_minutes':json.dumps(mock_section_minutes(cfg),separators=(',',':')),'mock_minutes_per_question':int(getattr(cfg,'mock_minutes_per_question',1) or 1),'sequential_min_seconds':int(getattr(cfg,'sequential_min_seconds',10) or 0),'can_edit':may_manage_own_exam(s,e.id,'edit'),'can_delete':may_manage_own_exam(s,e.id,'delete'),'ai_review_pending':bool(getattr(cfg,'ai_review_pending',False))})())
     return rows
 
 
@@ -7497,10 +7516,10 @@ def mock_test_drive_exams():
     return render_template('exams.html',exams=rows,exam_groups=exam_groups,subject_exam_options=[],catalog_subjects=[],voice_subject_catalog=[],curriculum_exam_options=[],active_curriculum_institution=current_curriculum_institution(s),ai=ai_status(),mock_drive_page=True)
 
 @app.route('/admin/exam/<int:exam_id>/edit-metadata',methods=['POST'])
-@admin_required
+@staff_required
 def edit_exam_metadata(exam_id):
     s=DB()
-    if current_staff_role(s)!='super_admin':
+    if not may_manage_own_exam(s,exam_id,'edit'):
         abort(403)
     exam=s.get(Exam,exam_id)
     if not exam:
@@ -7637,13 +7656,20 @@ def edit_exam_metadata(exam_id):
     return redirect((request.referrer or fallback).split('#',1)[0]+f'#exam-{exam.id}')
 
 @app.route('/admin/exam/<int:exam_id>/delete',methods=['POST'])
-@admin_required
+@staff_required
 def delete_exam(exam_id):
     # Permanently delete one exam and only data owned by that exam.
     # The reusable BankQuestion library is intentionally not touched.
     s=DB();exam=s.get(Exam,exam_id)
-    if not exam:
-        abort(404)
+    if not exam:abort(404)
+    if not may_manage_own_exam(s,exam_id,'delete'):abort(403)
+    # Preserve existing exam results: only empty, inactive drafts may be removed by staff.
+    if current_staff_role(s)!='super_admin':
+        has_attempt=s.scalar(select(Attempt.id).where(Attempt.exam_id==exam_id).limit(1))
+        has_session=s.scalar(select(ExamSession.id).where(ExamSession.exam_id==exam_id).limit(1))
+        if exam.is_active or has_attempt or has_session:
+            flash('This exam has been activated or has sessions/results. Ask the Super Admin to review deletion.','error')
+            return redirect(url_for('exams'))
 
     title=exam.title or f'Exam {exam.id}'
     question_ids=list(s.scalars(select(Question.id).where(Question.exam_id==exam.id)).all())
@@ -8695,7 +8721,21 @@ def faculty_users():
     # manage another HOD, an Exam Controller, or the Super Admin account here.
     if viewer_role=='hod':
         rows=[f for f in rows if (role_map.get(f.id).role if role_map.get(f.id) else 'faculty')=='faculty']
-    institutions=s.scalars(select(AcademicInstitution).where(AcademicInstitution.is_active==True).order_by(AcademicInstitution.name)).all();institution_map={x.id:x for x in institutions};return render_template('faculty.html',faculty=rows,role_map=role_map,role_labels=ROLE_LABELS,viewer_role=viewer_role,institutions=institutions,institution_map=institution_map)
+    institutions=s.scalars(select(AcademicInstitution).where(AcademicInstitution.is_active==True).order_by(AcademicInstitution.name)).all();institution_map={x.id:x for x in institutions};return render_template('faculty.html',faculty=rows,role_map=role_map,role_labels=ROLE_LABELS,viewer_role=viewer_role,institutions=institutions,institution_map=institution_map,exam_permission_map={r.faculty_id:r for r in s.scalars(select(StaffExamPermission)).all()})
+
+@app.route('/admin/faculty/<int:faculty_id>/exam-permissions',methods=['POST'])
+@admin_required
+def update_staff_exam_permissions(faculty_id):
+    s=DB();member=s.get(Faculty,faculty_id)
+    if not member:abort(404)
+    row=s.get(StaffExamPermission,faculty_id)
+    if row is None:row=StaffExamPermission(faculty_id=faculty_id);s.add(row)
+    row.can_edit_own=request.form.get('can_edit_own')=='on'
+    row.can_delete_own=request.form.get('can_delete_own')=='on'
+    audit_event(s,'staff_exam_permissions_changed','faculty',faculty_id,
+                f'edit_own={row.can_edit_own}; delete_own={row.can_delete_own}')
+    s.commit();flash('Own-exam permissions updated for '+member.username+'.')
+    return redirect(url_for('faculty_users'))
 
 @app.route('/admin/faculty/<int:faculty_id>/password',methods=['POST'])
 @staff_required
