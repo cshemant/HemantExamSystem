@@ -5,7 +5,7 @@
   <span class="badge gray">C · C++ · Java · Python · PHP · Android Studio</span>
 </div>
 
-<section class="card code-editor-card" id="student-code-editor" data-run-url="{{ url_for('student_code_editor_run') }}" data-android-url="{{ url_for('student_android_lab') }}">
+<section class="card code-editor-card" id="student-code-editor" data-run-url="{{ url_for('student_code_editor_run') }}" data-android-url="{{ url_for('student_android_lab') }}" data-practical-submit-url="{{ url_for('student_code_editor_practical_submit') }}">
   <div class="code-editor-toolbar">
     <label for="code-language">Language
       <select id="code-language">
@@ -18,6 +18,15 @@
     </div>
   </div>
 
+  <div class="code-editor-toolbar" style="padding-top:0">
+    <label for="code-practical-experiment">Assigned practical experiment
+      <select id="code-practical-experiment"><option value="">General practice (no marks submission)</option>
+        {% for row in code_experiments %}<option value="{{ row.experiment.id }}" data-language="{{ row.experiment.code_language }}">{{ row.register.subject }} — {{ row.experiment.experiment_no }} — {{ row.experiment.title }}</option>{% endfor %}
+      </select>
+    </label>
+    <div class="actions"><button type="button" class="btn secondary" id="code-practical-submit" disabled>Submit Practical Code</button></div>
+  </div>
+  <p id="code-practical-notice" class="muted" aria-live="polite" style="padding:0 20px 14px">Choose a mapped experiment, run successfully, then submit for faculty assessment. Running code alone does not save marks.</p>
   <div class="code-workspace">
     <div class="code-pane">
       <div class="code-pane-title"><span>Source code</span><small id="code-status">Ready</small></div>

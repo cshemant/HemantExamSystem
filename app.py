@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from urllib.request import Request as URLRequest, urlopen
 from urllib.error import HTTPError, URLError
 
-from flask import Flask, Response, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, session as web_session, flash, jsonify, abort, send_file, after_this_request, send_from_directory
 from dotenv import load_dotenv
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -226,6 +226,7 @@ class CodeRunJob(Base):
     started_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     completed_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     runner_claim_token:Mapped[str]=mapped_column(String(64),nullable=False,default='')
+    source_digest:Mapped[str]=mapped_column(String(64),nullable=False,default='')
 
 class Exam(Base):
     __tablename__='exams'
@@ -932,6 +933,7 @@ class PracticalExperiment(Base):
     # It is never shown to students.
     reference_code:Mapped[str]=mapped_column(Text,nullable=False,default='')
     android_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    code_language:Mapped[str]=mapped_column(String(20),nullable=False,default='')  # separate from Android toggle
     # Optional faculty-defined exact-match penalty rules for Practical Code.
     # One rule per line; rules are never exposed to students.
     penalty_rules:Mapped[str]=mapped_column(Text,nullable=False,default='')
@@ -939,6 +941,21 @@ class PracticalExperiment(Base):
     sort_order:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     created_at:Mapped[str]=mapped_column(String,nullable=False)
 
+
+
+class PracticalCodeRunSubmission(Base):
+    __tablename__='practical_code_run_submissions'
+    __table_args__=(UniqueConstraint('job_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    job_id:Mapped[int]=mapped_column(ForeignKey('code_run_jobs.id'),nullable=False)
+    student_id:Mapped[int]=mapped_column(ForeignKey('students.id'),nullable=False)
+    register_id:Mapped[int]=mapped_column(ForeignKey('practical_registers.id'),nullable=False)
+    practical_student_id:Mapped[int]=mapped_column(ForeignKey('practical_students.id'),nullable=False)
+    practical_experiment_id:Mapped[int]=mapped_column(ForeignKey('practical_experiments.id'),nullable=False)
+    language:Mapped[str]=mapped_column(String(20),nullable=False)
+    source_code:Mapped[str]=mapped_column(Text,nullable=False)
+    output:Mapped[str]=mapped_column(Text,nullable=False,default='')
+    submitted_at:Mapped[str]=mapped_column(String,nullable=False)
 
 class PracticalStudentEditWindow(Base):
     """A faculty-controlled window in which students may enter their own marks.
@@ -1135,6 +1152,8 @@ def run_schema_upgrades():
         ('practical_registers','viva_max_marks','INTEGER NOT NULL DEFAULT 10'),
         ('practical_experiments','reference_code',"TEXT NOT NULL DEFAULT ''"),
         ('practical_experiments','android_enabled','BOOLEAN NOT NULL DEFAULT FALSE'),
+        ('practical_experiments','code_language',"VARCHAR(20) NOT NULL DEFAULT ''"),
+        ('code_run_jobs','source_digest',"VARCHAR(64) NOT NULL DEFAULT ''"),
         ('code_run_jobs','practical_experiment_id','INTEGER'),
         ('practical_experiments','penalty_rules',"TEXT NOT NULL DEFAULT ''"),
         ('practical_file_submissions','experiment_receipts_json',"TEXT NOT NULL DEFAULT '{}'"),
@@ -4747,6 +4766,16 @@ def practical_register_detail(register_id):
     edit_window_map={row.practical_experiment_id:{'row':row,'state':practical_student_edit_window_state(row)} for row in edit_windows}
     return render_template('practical_register_detail.html',register=register,students=students,experiments=experiments,summary=summary,component_maxima=practical_marks_maxima(register),total_max=practical_total_max(register),file_submissions=file_submissions,submission_by_student=submission_by_student,receipt_map=receipt_map,receipt_count_by_student=receipt_count_by_student,receipt_count_by_experiment=receipt_count_by_experiment,received_receipt_count=received_receipt_count,total_receipt_slots=total_receipt_slots,missing_receipt_count=max(0,total_receipt_slots-received_receipt_count),legacy_receipt_count=len({x.id for x in legacy_receipts}),edit_window_map=edit_window_map)
 
+
+@app.get('/admin/practicals/<int:register_id>/code-submissions')
+@practical_required
+def practical_code_run_submissions_review(register_id):
+    s=DB();register=practical_register_access(s,register_id)
+    records=s.scalars(select(PracticalCodeRunSubmission).where(
+        PracticalCodeRunSubmission.register_id==register.id).order_by(PracticalCodeRunSubmission.id.desc()).limit(500)).all()
+    experiments={e.id:e for e in s.scalars(select(PracticalExperiment).where(PracticalExperiment.register_id==register.id)).all()}
+    students={x.id:x for x in s.scalars(select(PracticalStudent).where(PracticalStudent.register_id==register.id)).all()}
+    return render_template('practical_code_run_submissions.html',register=register,records=records,experiments=experiments,students=students)
 
 @app.route('/admin/practicals/<int:register_id>/experiments/<int:experiment_id>/student-edit-window',methods=['POST'])
 @practical_required
@@ -9212,7 +9241,10 @@ def student_dashboard():
 @app.route('/student/code-editor')
 @student_required
 def student_code_editor():
-    return render_template('code_editor.html',languages=CODE_EDITOR_LANGUAGES)
+    s=DB();student=s.get(Student,int(web_session['user_id']))
+    mapped=[r for r in practical_marks_rows_for_student(s,student)
+            if r['experiment'].code_language in CODE_EDITOR_LANGUAGES]
+    return render_template('code_editor.html',languages=CODE_EDITOR_LANGUAGES,code_experiments=mapped)
 
 @app.route('/student/android-studio')
 @student_required
@@ -9220,6 +9252,22 @@ def student_android_lab():
     s=DB(); student=s.get(Student,web_session['user_id'])
     enabled=[row for row in practical_marks_rows_for_student(s,student) if row['experiment'].android_enabled]
     return render_template('android_lab.html',enabled_experiments=enabled)
+
+@app.post('/admin/practicals/<int:register_id>/experiments/<int:experiment_id>/code-language')
+@practical_required
+def practical_code_language_update(register_id,experiment_id):
+    s=DB();register=practical_register_access(s,register_id)
+    experiment=s.get(PracticalExperiment,experiment_id)
+    if not experiment or experiment.register_id!=register.id:abort(404)
+    selected=(request.form.get('code_language') or '').strip().lower()
+    if selected and selected not in CODE_EDITOR_LANGUAGES:abort(400)
+    experiment.code_language=selected
+    register.updated_at=now_iso()
+    audit_event(s,'practical_code_language_updated','practical_experiment',experiment.id,
+                f'language={selected or "none"},register={register.id}')
+    s.commit()
+    flash('Code Editor experiment language updated.')
+    return redirect(url_for('practical_register_detail',register_id=register.id))
 
 @app.post('/admin/practicals/<int:register_id>/android-enabled-bulk')
 @practical_required
@@ -9444,6 +9492,8 @@ def student_code_editor_run():
     stdin_text=payload.get('stdin') if isinstance(payload.get('stdin'),str) else ''
     student_id=int(web_session.get('user_id') or 0);s=DB()
     try:
+        if payload.get('exam_id') is not None and payload.get('practical_experiment_id'):
+            raise ValueError('Mock-drive runs cannot be submitted as practical experiments.')
         if payload.get('exam_id') is not None:
             try:exam_id=int(payload.get('exam_id'))
             except Exception:raise ValueError('Invalid mock-drive exam.')
@@ -9455,6 +9505,14 @@ def student_code_editor_run():
         # process, so a class-wide burst cannot occupy Gunicorn workers.
         cfg=CODE_EDITOR_LANGUAGES.get(language)
         if not cfg:raise ValueError('Choose a supported programming language.')
+        selected_experiment_id=payload.get('practical_experiment_id')
+        selected_experiment_id=int(selected_experiment_id) if str(selected_experiment_id or '').isdigit() else None
+        if payload.get('practical_experiment_id') and not selected_experiment_id:raise ValueError('Invalid practical experiment.')
+        if selected_experiment_id is not None:
+            student=s.get(Student,student_id)
+            mapping=next((r for r in practical_marks_rows_for_student(s,student)
+                          if r['experiment'].id==selected_experiment_id and r['experiment'].code_language==language),None)
+            if not mapping:raise ValueError('This practical experiment is not assigned to you for the selected language.')
         if not source.strip():raise ValueError('Write some code before selecting Run.')
         if len(source.encode('utf-8'))>CODE_EDITOR_MAX_SOURCE_BYTES:raise ValueError('The source code is too large.')
         if len(stdin_text.encode('utf-8'))>CODE_EDITOR_MAX_STDIN_BYTES:raise ValueError('The program input is too large.')
@@ -9462,13 +9520,46 @@ def student_code_editor_run():
         if own_active>=2:return jsonify({'ok':False,'error':'You already have two programs waiting or running. Please wait for one to finish.'}),429
         queue_size=s.scalar(select(func.count()).select_from(CodeRunJob).where(CodeRunJob.status.in_(['queued','running']))) or 0
         if queue_size>=CODE_EDITOR_QUEUE_LIMIT:return jsonify({'ok':False,'error':'The classroom code queue is full. Please try again shortly.'}),503
-        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language=cfg['runner'],source_code=source,stdin_text=stdin_text,status='queued',created_at=now_iso())
+        job=CodeRunJob(token=secrets.token_urlsafe(24),student_id=student_id,language=cfg['runner'],practical_experiment_id=selected_experiment_id,source_digest=hashlib.sha256(source.encode('utf-8')).hexdigest(),source_code=source,stdin_text=stdin_text,status='queued',created_at=now_iso())
         s.add(job);s.commit()
         return jsonify({'ok':True,'job_id':job.token,'status':'queued','position':queue_size+1,'status_url':url_for('student_code_editor_job',job_token=job.token)}),202
     except ValueError as exc:s.rollback();return jsonify({'ok':False,'error':str(exc)}),400
     except Exception:
         s.rollback();app.logger.exception('Student code queue failed')
         return jsonify({'ok':False,'error':'The program could not be queued safely. Please try again.'}),503
+
+@app.post('/student/code-editor/practical-submit')
+@student_required
+def student_code_editor_practical_submit():
+    payload=request.get_json(silent=True) or {}
+    token=str(payload.get('job_token') or '')
+    source=payload.get('source') if isinstance(payload.get('source'),str) else ''
+    student_id=int(web_session.get('user_id') or 0);s=DB()
+    try:
+        job=s.scalar(select(CodeRunJob).where(CodeRunJob.token==token,CodeRunJob.student_id==student_id))
+        if not job or job.status!='completed' or not job.success or job.exit_code!=0 or not job.practical_experiment_id:
+            raise ValueError('Run the assigned experiment successfully before submitting.')
+        if not job.source_digest or not secrets.compare_digest(job.source_digest,hashlib.sha256(source.encode('utf-8')).hexdigest()):
+            raise ValueError('Code changed since the successful run. Run it again before submitting.')
+        student=s.get(Student,student_id)
+        mapping=next((r for r in practical_marks_rows_for_student(s,student)
+                      if r['experiment'].id==job.practical_experiment_id and
+                      CODE_EDITOR_LANGUAGES.get(r['experiment'].code_language,{}).get('runner')==job.language),None)
+        if not mapping:raise ValueError('The selected experiment is no longer assigned to you.')
+        if s.scalar(select(PracticalCodeRunSubmission).where(PracticalCodeRunSubmission.job_id==job.id)):
+            raise ValueError('This run was already submitted.')
+        experiment=mapping['experiment']
+        s.add(PracticalCodeRunSubmission(job_id=job.id,student_id=student_id,register_id=mapping['register'].id,
+            practical_student_id=mapping['practical_student'].id,practical_experiment_id=experiment.id,
+            language=experiment.code_language,source_code=source,output=job.output or '',submitted_at=now_iso()))
+        # Successful execution alone does not guarantee correctness: preserve
+        # faculty performance marks, and never give automatic full marks.
+        audit_event(s,'practical_code_run_submitted','practical_experiment',experiment.id,
+                    f'job={job.id},student={student_id},language={experiment.code_language}')
+        s.commit()
+        return jsonify(ok=True,message='Practical code submitted for faculty assessment. Existing marks remain unchanged.')
+    except ValueError as exc:s.rollback();return jsonify(ok=False,error=str(exc)),400
+    except Exception:s.rollback();app.logger.exception('Practical code submission failed');return jsonify(ok=False,error='Unable to save submission.'),503
 
 @app.post('/student/android-lab/build')
 @student_required

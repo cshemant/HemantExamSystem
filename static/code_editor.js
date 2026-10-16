@@ -3,6 +3,15 @@
   const language=document.getElementById('code-language'),source=document.getElementById('code-source'),stdin=document.getElementById('code-stdin');
   const output=document.getElementById('code-output'),status=document.getElementById('code-status'),run=document.getElementById('code-run');
   const lineNumbers=document.getElementById('code-line-numbers'),bracketLayer=document.getElementById('code-bracket-layer');
+  const experiment=document.getElementById('code-practical-experiment'),submit=document.getElementById('code-practical-submit');
+  let completedRun=null;
+  function clearCompletion(){completedRun=null;submit.disabled=true;}
+  function refreshExperiments(){
+    for(const opt of experiment.options){if(opt.value)opt.hidden=opt.dataset.language!==language.value;}
+    if(experiment.selectedOptions[0]?.hidden)experiment.value='';
+    clearCompletion();
+  }
+  experiment.addEventListener('change',clearCompletion);
   const examples={
     c:'#include <stdio.h>\n\nint main() {\n    printf("Hello, World!\\n");\n    return 0;\n}\n',
     cpp:'#include <iostream>\nusing namespace std;\n\nint main() {\n    cout << "Hello, World!" << endl;\n    return 0;\n}\n',
@@ -47,15 +56,15 @@
     bracketLayer.scrollTop=source.scrollTop;bracketLayer.scrollLeft=source.scrollLeft;
   }
   function load(lang){source.value=drafts[lang]===undefined?examples[lang]:drafts[lang];output.textContent='Run your program to see the output here.';output.className='';status.textContent='Ready';renderEditorGuides();}
-  let active=language.value;load(active);
-  language.addEventListener('change',()=>{if(language.value==='android_studio'){window.location.href=root.dataset.androidUrl;return;}drafts[active]=source.value;active=language.value;load(active);source.focus();});
+  let active=language.value;load(active);refreshExperiments();
+  language.addEventListener('change',()=>{if(language.value==='android_studio'){window.location.href=root.dataset.androidUrl;return;}drafts[active]=source.value;active=language.value;load(active);refreshExperiments();source.focus();});
   source.addEventListener('keydown',event=>{if(event.key==='Tab'){event.preventDefault();const a=source.selectionStart,b=source.selectionEnd;source.setRangeText('    ',a,b,'end');renderEditorGuides();}});
-  source.addEventListener('input',renderEditorGuides);
+  source.addEventListener('input',()=>{clearCompletion();renderEditorGuides();});
   source.addEventListener('click',renderEditorGuides);
   source.addEventListener('keyup',renderEditorGuides);
   source.addEventListener('select',renderEditorGuides);
   source.addEventListener('scroll',renderEditorGuides);
-  document.getElementById('code-reset').addEventListener('click',()=>{if(!confirm('Reset this language to the starter code?'))return;drafts[active]=examples[active];source.value=examples[active];stdin.value='';output.textContent='Run your program to see the output here.';output.className='';status.textContent='Ready';renderEditorGuides();});
+  document.getElementById('code-reset').addEventListener('click',()=>{if(!confirm('Reset this language to the starter code?'))return;clearCompletion();drafts[active]=examples[active];source.value=examples[active];stdin.value='';output.textContent='Run your program to see the output here.';output.className='';status.textContent='Ready';renderEditorGuides();});
   document.getElementById('code-clear').addEventListener('click',()=>{output.textContent='';output.className='';});
   function wait(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
   async function readJob(url){
@@ -77,11 +86,20 @@
     }
     throw new Error('The program is still queued. Please select Run again later.');
   }
+  submit.addEventListener('click',async()=>{
+    if(!completedRun)return;submit.disabled=true;
+    const notice=document.getElementById('code-practical-notice');
+    try{
+      const response=await fetch(root.dataset.practicalSubmitUrl,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':document.querySelector('meta[name="csrf-token"]').content},body:JSON.stringify(completedRun)});
+      const result=await response.json();if(!response.ok||!result.ok)throw new Error(result.error||'Submission failed');
+      notice.textContent=result.message;completedRun=null;
+    }catch(error){notice.textContent=error.message||'Submission failed';submit.disabled=false;}
+  });
   run.addEventListener('click',async()=>{
     if(!source.value.trim()){output.textContent='Write some code before selecting Run.';output.className='code-output-error';return;}
-    run.disabled=true;status.textContent='Running…';output.textContent='Compiling and running…';output.className='';
+    clearCompletion();run.disabled=true;status.textContent='Running…';output.textContent='Compiling and running…';output.className='';
     try{
-      const payload={language:language.value,source:source.value,stdin:stdin.value};if(root.dataset.examId)payload.exam_id=Number(root.dataset.examId);
+      const payload={language:language.value,source:source.value,stdin:stdin.value};if(experiment.value)payload.practical_experiment_id=Number(experiment.value);if(root.dataset.examId)payload.exam_id=Number(root.dataset.examId);
       const response=await fetch(root.dataset.runUrl,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':document.querySelector('meta[name="csrf-token"]').content},body:JSON.stringify(payload)});
       const result=await response.json().catch(()=>({ok:false,error:'The server returned an invalid response.'}));
       if(!response.ok||!result.ok)throw new Error(result.error||'Code execution failed.');
@@ -89,6 +107,7 @@
       const completed=await readJob(result.status_url);
       if(completed.status==='failed')throw new Error(completed.error||'Code execution failed.');
       output.textContent=completed.output;output.className=completed.success?'code-output-success':'code-output-error';status.textContent=completed.exit_code===null||completed.exit_code===undefined?'Finished':'Exit code '+completed.exit_code;
+      if(experiment.value&&completed.success&&completed.exit_code===0){completedRun={job_token:result.job_id,source:source.value,experiment_id:experiment.value};submit.disabled=false;}
     }catch(error){output.textContent=error.message||'Code execution failed.';output.className='code-output-error';status.textContent='Failed';}
     finally{run.disabled=false;}
   });
