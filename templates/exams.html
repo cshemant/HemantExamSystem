@@ -1,7 +1,7 @@
 {% extends 'base.html' %}{% block content %}
 <script>window.EXAM_VOICE_SUBJECT_CATALOG={{ (voice_subject_catalog or [])|tojson }};window.EXAM_VOICE_CURRICULUM_CATALOG={{ (curriculum_exam_options or [])|tojson }};window.EXAM_VOICE_AI_CONFIGURED={{ ai.configured|tojson }};</script>
 <div class="page-head"><div><h1>{{ 'Mock Test Drive' if mock_drive_page else 'Exams' }}</h1>{% if mock_drive_page %}<p>Placement-focused mock examinations kept separate from subject examinations.</p>{% endif %}</div></div>
-{% if not mock_drive_page %}
+{% if not mock_drive_page %} 
 <script>
 (function(){
  const subject=document.getElementById('ai-curriculum-subject'),unit=document.getElementById('ai-curriculum-unit'),context=document.getElementById('ai-curriculum-context');
