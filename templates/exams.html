@@ -97,7 +97,7 @@
       {% for e in group.exams %}
       <tr id="exam-{{ e.id }}" data-voice-exam-title="{{ e.title|e }}" data-voice-subject="{{ e.subject|e }}"><td>
         <div class="practical-register-leading">
-          {% if staff_role=='super_admin' %}
+          {% if e.can_edit %}
           <button type="button" class="exam-edit-icon exam-edit-trigger"
                   data-edit-url="{{ url_for('edit_exam_metadata',exam_id=e.id) }}"
                   data-exam-title="{{ e.title|e }}"
@@ -114,6 +114,8 @@
                   aria-label="Edit {{ e.title }}" title="Edit exam">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4zM13.5 6.5l4 4"/></svg>
           </button>
+          {% endif %}
+          {% if e.can_delete %}
           <button type="button" class="practical-delete-icon exam-delete-trigger"
                   data-delete-url="{{ url_for('delete_exam',exam_id=e.id) }}"
                   data-exam-title="{{ e.title|e }}"
@@ -133,7 +135,7 @@
 {% endif %}
 </div>
 
-{% if staff_role=='super_admin' %}
+{% if staff_role in ['super_admin', 'faculty'] %}
 <dialog id="exam-edit-dialog" style="max-width:720px;width:calc(100% - 32px);max-height:90vh;overflow:auto;border:0;border-radius:16px;padding:0;box-shadow:0 18px 60px rgba(15,23,42,.22)">
   <form id="exam-edit-form" method="post" style="padding:24px;margin:0">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

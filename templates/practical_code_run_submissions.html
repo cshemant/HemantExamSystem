@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-head"><div><h1>Submitted Practical Code</h1><p class="muted">{{ register.title }} — last 500 submitted runs. Assess performance in the existing Practical Marks interface.</p></div></div>
+<p><a href="{{ url_for('practical_register_detail',register_id=register.id) }}">← Back to Practical Register</a></p>
+{% for record in records %}
+<section class="card">
+<h2>{{ students[record.practical_student_id].roll_no if record.practical_student_id in students else 'Student' }} — Experiment {{ experiments[record.practical_experiment_id].experiment_no if record.practical_experiment_id in experiments else record.practical_experiment_id }}</h2>
+<p class="muted">Language: {{ record.language }} · Submitted: {{ record.submitted_at }} · Job #{{ record.job_id }}</p>
+<details><summary>Submitted source code</summary><pre style="white-space:pre-wrap;overflow:auto">{{ record.source_code }}</pre></details>
+<details><summary>Execution output</summary><pre style="white-space:pre-wrap;overflow:auto">{{ record.output }}</pre></details>
+{% if record.practical_experiment_id in experiments %}<p><a class="btn secondary small" href="{{ url_for('practical_mark_entry',register_id=register.id,experiment_id=record.practical_experiment_id) }}">Enter / Review Performance Marks</a></p>{% endif %}
+</section>
+{% else %}<section class="card">No Code Editor submissions yet.</section>{% endfor %}
+{% endblock %}
