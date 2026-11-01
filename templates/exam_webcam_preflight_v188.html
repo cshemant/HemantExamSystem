@@ -1,4 +1,8 @@
 {% extends 'base.html' %}{% block content %}
+<style>
+/* V191: prevent the site's .btn display:inline-flex from overriding hidden. */
+#v188-next[hidden], #v188-preview[hidden], #v188-camera-help[hidden] {display:none!important;}
+</style>
 <div class="page-head"><h1>Webcam required before exam</h1></div>
 <section class="card" id="v188-camera-setup" style="max-width:720px;margin:auto;padding:20px"
   data-exam-id="{{ exam.id }}" data-nonce="{{ nonce }}"
@@ -13,8 +17,9 @@
   </div>
   <video id="v188-preview" autoplay muted playsinline aria-label="Live webcam preview" hidden style="width:240px;max-width:100%;border-radius:8px"></video>
   <p id="v188-state" role="status" aria-live="polite">{% if cv_ready %}Waiting for camera permission.{% else %}Server computer-vision dependencies unavailable. Contact invigilator.{% endif %}</p>
-  <a class="btn" id="v188-next" href="{{ next_url }}" hidden>Continue to exam verification</a>
+  <p id="v188-camera-help" class="mini-meta" role="alert" hidden></p>
+  <a class="btn" id="v188-next" href="{{ next_url }}" aria-disabled="true" tabindex="-1" hidden>Continue to exam verification</a>
 </section>
 <script>if(window.parent!==window){window.parent.postMessage({type:'exam-webcam-preflight-needed',exam_id:{{ exam.id }}},window.location.origin);setTimeout(()=>{if(window.parent!==window)window.top.location.replace(window.location.href);},700);}</script>
-<script defer src="{{ url_for('static',filename='exam_webcam_preflight_v188.js') }}?v={{ app_version }}"></script>
+<script defer src="{{ url_for('static',filename='exam_webcam_preflight_v188.js') }}?v={{ app_version }}-191"></script>
 {% endblock %}
