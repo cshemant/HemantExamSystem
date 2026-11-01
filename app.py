@@ -26,6 +26,8 @@ from enterprise_core import QUESTION_TYPE_LABELS, canonical_question_type, norma
 from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
+from exam_integrity_v185 import validate_seb_config_hash, security_event_weight, visibility_allowed_question
+from exam_ai_proctor_v186 import count_faces_in_jpeg, score_exam_outliers, ai_proctor_dependencies
 from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
 from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, generate_subject_context_questions, generate_placement_questions, AIProviderError
 from public_content import PUBLIC_GUIDES, discover_public_updates, get_public_guide, public_update_by_slug, related_updates, public_sitemap_paths
@@ -35,7 +37,7 @@ DATA_DIR=Path(os.getenv('EXAM_DATA_DIR', str(RESOURCE_DIR))).expanduser().resolv
 DATA_DIR.mkdir(parents=True,exist_ok=True)
 load_dotenv(RESOURCE_DIR/'.env')
 
-APP_VERSION='2.61.0'
+APP_VERSION='2.63.1-staging-v189-webcam-layout'
 OFFLINE_RELEASE_FILENAME='LearnWithHemant_Offline_Exam_V2.02_Windows.zip'
 DEFAULT_OFFLINE_DOWNLOAD_URL=(
     'https://github.com/cshemant/HemantExamSystem/releases/download/v2.02/'
@@ -53,6 +55,11 @@ MAX_ANSWER_LENGTH=max(100,int(os.getenv('MAX_ANSWER_LENGTH','4000')))
 PRACTICAL_SYNC_BATCH_SIZE=max(5,min(50,int(os.getenv('PRACTICAL_SYNC_BATCH_SIZE','20'))))
 INTEGRATION_API_KEY=os.getenv('INTEGRATION_API_KEY','').strip()
 EXAM_PACKAGE_SIGNING_KEY=os.getenv('EXAM_PACKAGE_SIGNING_KEY','').strip()
+# Per-attempt photographic leak deterrent; not an anti-OCR guarantee.
+EXAM_SEB_EXTERNAL_ORIGIN=(os.getenv('EXAM_SEB_EXTERNAL_ORIGIN','').strip()).rstrip('/')
+EXAM_VISUAL_PROTECTION_MODE=os.getenv('EXAM_VISUAL_PROTECTION_MODE','watermark').strip().lower()
+if EXAM_VISUAL_PROTECTION_MODE not in {'off','watermark','watermark_noise'}:
+    EXAM_VISUAL_PROTECTION_MODE='watermark'
 
 # Public SEO is intentionally pinned to the production hostname. This keeps
 # staging/onrender/local copies from competing with the canonical site in
@@ -751,6 +758,55 @@ class ExamSecurityPolicy(Base):
     practical_defaults_applied:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False)
 
+class ExamSecurityProfile(Base):
+    """V185 opt-in profile; old exams always remain in standard mode."""
+    __tablename__='exam_security_profiles'
+    __table_args__=(UniqueConstraint('exam_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    exam_id:Mapped[int]=mapped_column(ForeignKey('exams.id'),nullable=False,index=True)
+    mode:Mapped[str]=mapped_column(String(20),nullable=False,default='standard')
+    require_seb:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    seb_config_key:Mapped[str]=mapped_column(String(64),nullable=False,default='')
+    ml_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    webcam_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class ExamQuestionTelemetry(Base):
+    """Server-observed response times; not proof of AI or misconduct."""
+    __tablename__='exam_question_telemetry'
+    __table_args__=(UniqueConstraint('attempt_id','question_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False,index=True)
+    question_id:Mapped[int]=mapped_column(ForeignKey('questions.id'),nullable=False)
+    first_shown_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    first_answer_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    last_answer_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    answer_change_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+
+class ExamProctorSummary(Base):
+    """Aggregate camera metadata, no student images or videos are stored."""
+    __tablename__='exam_proctor_summaries'
+    __table_args__=(UniqueConstraint('attempt_id'),)
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False,index=True)
+    sample_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    one_face_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    no_face_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    multiple_face_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    camera_error_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    consecutive_no_face:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    consecutive_multiple_face:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    last_sample_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    last_camera_error_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class ExamProctorFlag(Base):
+    """Review-only camera alerts; no biometric identifiers or images."""
+    __tablename__='exam_proctor_flags'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False,index=True)
+    alert_type:Mapped[str]=mapped_column(String(32),nullable=False)
+    created_at:Mapped[str]=mapped_column(String,nullable=False)
+
 class ExamStudentAccess(Base):
     __tablename__='exam_student_access'
     __table_args__=(UniqueConstraint('exam_id','student_id'),)
@@ -1180,6 +1236,8 @@ def run_schema_upgrades():
         ('exam_security_policies','network_mode',"VARCHAR NOT NULL DEFAULT 'any'"),
         ('exam_security_policies','allowed_cidrs',"TEXT NOT NULL DEFAULT ''"),
         ('faculty_roles','institution_id',"INTEGER"),
+        ('exam_security_profiles','ml_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_profiles','webcam_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
     for table_name,column_name,ddl in upgrades:
@@ -1191,6 +1249,70 @@ def run_schema_upgrades():
         conn.execute(text("UPDATE answers SET answer_value=selected_answer WHERE (answer_value IS NULL OR answer_value='') AND selected_answer IS NOT NULL"))
         conn.execute(text("UPDATE practical_registers SET default_max_marks=attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks"))
         conn.execute(text("UPDATE practical_experiments SET max_marks=(SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) WHERE EXISTS (SELECT 1 FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id)"))
+
+
+def get_exam_security_profile(s,exam_id,create=False):
+    row=s.scalar(select(ExamSecurityProfile).where(ExamSecurityProfile.exam_id==exam_id))
+    if not row and create:
+        row=ExamSecurityProfile(exam_id=exam_id,mode='standard',require_seb=False,seb_config_key='',ml_enabled=False,webcam_enabled=False,updated_at=now_iso())
+        s.add(row);s.flush()
+    return row
+
+
+def record_question_presentations(s,attempt,question_ids):
+    existing=set(s.scalars(select(ExamQuestionTelemetry.question_id).where(ExamQuestionTelemetry.attempt_id==attempt.id)).all())
+    for qid in question_ids:
+        if qid not in existing:
+            s.add(ExamQuestionTelemetry(attempt_id=attempt.id,question_id=qid,first_shown_at=now_iso()))
+
+
+def current_visible_question(s,attempt,cfg):
+    """For one-question flows, only the current item can be posted or autosaved."""
+    if cfg and cfg.exam_type=='mock_drive':
+        progress=_mock_drive_progress(s,attempt,create=False)
+        if not progress or not progress.active_section:return None
+        if progress.section_end_at and now_dt()>=parse_dt(progress.section_end_at):return None
+        qids=_mock_section_question_ids(s,attempt,progress.active_section)
+        pos=int(progress.current_question_position or 1)
+        return qids[pos-1] if 1<=pos<=len(qids) else None
+    if cfg and cfg.secure_sequential:
+        progress=_sequential_progress(s,attempt,create=False)
+        row=_attempt_question_at_position(s,attempt,progress.current_position) if progress else None
+        return row.question_id if row else None
+    return None
+
+
+# Applies only to student exam workflows. This is a compatibility-gated
+# verification; SEB modern WKWebView may require a separate JS API integration.
+_SEB_ENDPOINTS={'take_exam','select_mock_drive_section','complete_mock_drive_section',
+                'expire_mock_drive_section','next_exam_question','previous_mock_drive_question',
+                'save_answer','integrity_event','student_exam_page_loaded','student_heartbeat',
+                'student_proctor_frame','student_proctor_status','submit_exam'}
+
+@app.before_request
+def v185_seb_request_guard():
+    if web_session.get('role')!='student' or request.endpoint not in _SEB_ENDPOINTS:return None
+    if request.endpoint in {'save_answer','integrity_event','student_exam_page_loaded','student_heartbeat','student_proctor_frame','student_proctor_status'}:
+        data=request.get_json(silent=True) or {}
+        try:exam_id=int(data.get('exam_id'))
+        except (ValueError,TypeError):return None  # endpoint itself validates payload
+    else:
+        exam_id=(request.view_args or {}).get('exam_id')
+    if not exam_id:return None
+    s=DB()
+    policy=get_exam_security_profile(s,int(exam_id))
+    if not policy or not policy.require_seb:return None
+    # Fail closed if an active exam somehow lost its key or origin setting.
+    key=(policy.seb_config_key or '').lower()
+    if not EXAM_SEB_EXTERNAL_ORIGIN or not re.fullmatch(r'[0-9a-f]{64}',key):
+        abort(403,'This protected exam is not configured for Safe Exam Browser. Contact your invigilator.')
+    # Never rely on request.host/X-Forwarded-Host: only admin-configured public origin.
+    path=request.full_path.rstrip('?')
+    absolute_url=EXAM_SEB_EXTERNAL_ORIGIN+path
+    supplied=request.headers.get('X-SafeExamBrowser-ConfigKeyHash','').strip()
+    if not validate_seb_config_hash(absolute_url,key,supplied):
+        abort(403,'Safe Exam Browser verification failed. Open the approved .seb exam configuration or contact your invigilator.')
+    return None
 
 
 def get_exam_security_policy(s,exam_id,create=False):
@@ -3280,7 +3402,15 @@ def security_headers(response):
     # staff pages. Keep microphone access disabled everywhere else (especially
     # student/exam pages), while allowing same-origin microphone access for staff.
     voice_staff_page=web_session.get('role') in {'admin','faculty'} and request.endpoint not in {'take_exam','submitted'}
-    camera_policy='camera=(self)' if scanner_page else 'camera=()'
+    # Only camera-enabled exam documents (including the same-origin PIN shell)
+    # receive camera permission; the browser still requires student consent.
+    camera_proctor_page=False
+    if endpoint in {'take_exam','verify_student_exam_pin'}:
+        target_id=(request.view_args or {}).get('exam_id')
+        if target_id:
+            _profile=get_exam_security_profile(DB(),int(target_id),False)
+            camera_proctor_page=bool(_profile and _profile.webcam_enabled)
+    camera_policy='camera=(self)' if scanner_page or camera_proctor_page else 'camera=()' 
     microphone_policy='microphone=(self)' if voice_staff_page else 'microphone=()'
     response.headers.setdefault('Permissions-Policy',f'{camera_policy}, {microphone_policy}, geolocation=(), payment=(), usb=()')
     if scanner_page:
@@ -3806,6 +3936,12 @@ def save_answer_record(s,attempt_id,question_id,answer,question=None):
     normalized=normalize_answer(question,raw)
     if not normalized:raise ValueError('Answer format is invalid for this question.')
     legacy=normalized if canonical_question_type(question.question_type)=='single_choice' and normalized in {'A','B','C','D'} else None
+    if (row.answer_value if row else '')!=normalized:
+        measurement=s.scalar(select(ExamQuestionTelemetry).where(ExamQuestionTelemetry.attempt_id==attempt_id,ExamQuestionTelemetry.question_id==question_id))
+        if measurement:
+            if not measurement.first_answer_at:measurement.first_answer_at=now_iso()
+            else:measurement.answer_change_count+=1
+            measurement.last_answer_at=now_iso()
     if row:
         row.selected_answer=legacy;row.answer_value=normalized;row.saved_at=now_iso()
     else:
@@ -7969,7 +8105,10 @@ def exam_builder(exam_id):
             except ValueError:
                 flash('Approved network contains an invalid IP/CIDR value. Example: 203.0.113.0/24','error');return redirect(url_for('exam_builder',exam_id=exam_id))
         else:allowed_cidrs=''
-        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';cfg.secure_sequential=request.form.get('secure_sequential')=='on';cfg.sequential_min_seconds=sequential_min_seconds;cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.strict_start_window=request.form.get('strict_start_window')=='on';security.start_grace_minutes=start_grace_minutes;security.auto_submit_on_integrity_limit=request.form.get('auto_submit_on_integrity_limit')=='on';security.defer_results_until_end=request.form.get('defer_results_until_end')=='on';security.result_release_at=result_release_at or '';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.practical_defaults_applied=True if (cfg.exam_type or '').strip().lower()=='practical_exam' else security.practical_defaults_applied;security.updated_at=now_iso();
+        cfg.subject=request.form.get('subject','').strip();cfg.course_semester=request.form.get('course_semester','').strip();cfg.question_count=qcount;cfg.pool_size=pool_size;cfg.easy_pct=easy;cfg.medium_pct=medium;cfg.hard_pct=hard;cfg.unit_weights=json.dumps(unit_weights,ensure_ascii=False);cfg.randomize_questions=request.form.get('randomize_questions')=='on';cfg.shuffle_options=request.form.get('shuffle_options')=='on';
+        profile=get_exam_security_profile(s,exam_id)
+        if profile and profile.require_seb:cfg.randomize_questions=True;cfg.shuffle_options=True
+        cfg.secure_sequential=request.form.get('secure_sequential')=='on';cfg.sequential_min_seconds=sequential_min_seconds;cfg.require_fullscreen=request.form.get('require_fullscreen')=='on';cfg.tab_switch_limit=tab_limit;cfg.updated_at=now_iso();security.require_candidate_checkin=request.form.get('require_candidate_checkin')=='on';security.require_exam_pin=request.form.get('require_exam_pin')=='on';security.heartbeat_seconds=heartbeat_seconds;security.strict_start_window=request.form.get('strict_start_window')=='on';security.start_grace_minutes=start_grace_minutes;security.auto_submit_on_integrity_limit=request.form.get('auto_submit_on_integrity_limit')=='on';security.defer_results_until_end=request.form.get('defer_results_until_end')=='on';security.result_release_at=result_release_at or '';security.block_ip_roll_switch=request.form.get('block_ip_roll_switch')=='on';security.practical_defaults_applied=True if (cfg.exam_type or '').strip().lower()=='practical_exam' else security.practical_defaults_applied;security.updated_at=now_iso();
         security.network_mode=network_mode;security.allowed_cidrs=allowed_cidrs
         if cfg.exam_type=='mock_drive':
             try:
@@ -8011,7 +8150,111 @@ def exam_builder(exam_id):
     subjects=s.scalars(select(BankQuestion.subject).where(BankQuestion.status=='approved',BankQuestion.practice_visibility.in_(['official_only','both'])).distinct().order_by(BankQuestion.subject)).all();pool_count=s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0;attempt_count=s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0
     try:unit_weights_display=', '.join(f'{k}:{v}' for k,v in json.loads(cfg.unit_weights or '{}').items())
     except Exception:unit_weights_display=''
-    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);approval_policy=exam_approval_policy(s,exam);practice_release=get_exam_practice_release(s,exam_id,create=True);s.commit();return render_template('exam_builder.html',exam=exam,cfg=cfg,security=security,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,approval_policy=approval_policy,practice_release=practice_release,group_label=group_label,can_approve=can_approve_exams(s),mock_durations=mock_section_minutes(cfg),mock_sections=MOCK_DRIVE_SECTIONS)
+    groups=s.scalars(select(AcademicGroup).where(AcademicGroup.is_active==True).order_by(AcademicGroup.program,AcademicGroup.semester,AcademicGroup.section)).all();sessions=s.execute(select(ExamSession,AcademicGroup).join(AcademicGroup,AcademicGroup.id==ExamSession.group_id).where(ExamSession.exam_id==exam_id).order_by(ExamSession.scheduled_start)).all();approval=get_exam_approval(s,exam_id,create=True);approval_policy=exam_approval_policy(s,exam);practice_release=get_exam_practice_release(s,exam_id,create=True);s.commit();return render_template('exam_builder.html',exam=exam,cfg=cfg,security=security,subjects=subjects,pool_count=pool_count,attempt_count=attempt_count,unit_weights_display=unit_weights_display,groups=groups,sessions=sessions,approval=approval,approval_policy=approval_policy,practice_release=practice_release,group_label=group_label,can_approve=can_approve_exams(s),can_manage_v185=may_manage_own_exam(s,exam_id,'edit'),mock_durations=mock_section_minutes(cfg),mock_sections=MOCK_DRIVE_SECTIONS)
+
+@app.route('/admin/exam/<int:exam_id>/security-profile',methods=['GET','POST'])
+@staff_required
+def exam_security_profile_admin(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    profile=get_exam_security_profile(s,exam_id,create=True)
+    cfg=get_exam_config(s,exam_id,create=True)
+    attempt_count=int(s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)
+    if request.method=='POST':
+        if attempt_count:
+            flash('Security profile is locked after the first student attempt to avoid changes during examinations.','error')
+            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+        mode=(request.form.get('security_mode') or 'standard').strip()
+        if mode not in {'standard','supervised','high'}:abort(400)
+        require_seb=mode in {'supervised','high'}
+        key_input=(request.form.get('seb_config_key') or '').strip().lower()
+        if key_input:
+            if not re.fullmatch('[0-9a-f]{64}',key_input):
+                flash('The SEB Config Key must be exactly 64 hexadecimal characters.','error')
+                return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+            profile.seb_config_key=key_input
+        if request.form.get('clear_seb_key')=='on':profile.seb_config_key=''
+        if require_seb and (not EXAM_SEB_EXTERNAL_ORIGIN or not re.fullmatch('[0-9a-f]{64}',profile.seb_config_key or '')):
+            s.rollback()
+            flash('Cannot enable protected mode until EXAM_SEB_EXTERNAL_ORIGIN is set and a valid SEB Config Key is saved.','error')
+            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+        enable_ml=request.form.get('enable_ml')=='on'
+        enable_webcam=request.form.get('enable_webcam')=='on'
+        deps=ai_proctor_dependencies()
+        if enable_ml and not deps['ml']:
+            s.rollback();flash('Install requirements-ai-proctor.txt on the staging server before enabling ML.','error')
+            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+        if enable_webcam and not deps['cv']:
+            s.rollback();flash('Install requirements-ai-proctor.txt on the staging server before enabling webcam CV.','error')
+            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+        profile.ml_enabled=enable_ml
+        profile.webcam_enabled=enable_webcam
+        profile.mode=mode;profile.require_seb=require_seb;profile.updated_at=now_iso()
+        if require_seb:
+            cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.updated_at=now_iso()
+            legacy_policy=get_exam_security_policy(s,exam_id,create=True)
+            legacy_policy.auto_submit_on_integrity_limit=False
+            legacy_policy.updated_at=now_iso()
+        audit_event(s,'exam_security_profile_saved','exam',exam_id,f'mode={mode}; seb_required={require_seb}; ml={enable_ml}; webcam={enable_webcam}')
+        s.commit();flash('V185 security profile saved. Test the SEB configuration on staging before activating this exam.')
+        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+    return render_template('exam_security_profile.html',exam=exam,profile=profile,attempt_count=attempt_count,
+                           dependencies=ai_proctor_dependencies(),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
+
+
+@app.route('/admin/exam/<int:exam_id>/integrity-dashboard')
+@staff_required
+def exam_integrity_dashboard(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    attempts=s.scalars(select(Attempt).where(Attempt.exam_id==exam_id).order_by(Attempt.id.desc()).limit(200)).all()
+    rows=[]
+    for attempt in attempts:
+        student=s.get(Student,attempt.student_id)
+        evs=s.scalars(select(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)).all()
+        measurements=s.scalars(select(ExamQuestionTelemetry).where(ExamQuestionTelemetry.attempt_id==attempt.id)).all()
+        fast=0;answered=0
+        for t in measurements:
+            if t.first_shown_at and t.first_answer_at:
+                answered+=1
+                try:
+                    elapsed=(parse_dt(t.first_answer_at)-parse_dt(t.first_shown_at)).total_seconds()
+                    if 0<=elapsed<3:fast+=1
+                except Exception:pass
+        focus=sum(1 for e in evs if security_event_weight(e.event_type)>0)
+        rows.append({'attempt':attempt,'student':student,'focus':focus,
+                     'other_events':sum(1 for e in evs if security_event_weight(e.event_type)==0),
+                     'fast':fast,'answered':answered,'changes':sum(t.answer_change_count for t in measurements)})
+    profile=get_exam_security_profile(s,exam_id,create=False)
+    webcam_enabled=bool(profile and profile.webcam_enabled)
+    ml_enabled=bool(profile and profile.ml_enabled)
+    # One query for summaries / flags, not one query per attempt.
+    ids=[r['attempt'].id for r in rows]
+    summaries={x.attempt_id:x for x in s.scalars(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id.in_(ids))).all()} if ids else {}
+    flags=s.scalars(select(ExamProctorFlag).where(ExamProctorFlag.attempt_id.in_(ids)).order_by(ExamProctorFlag.id.desc()).limit(1000)).all() if ids else []
+    flag_map={}
+    for flag in flags:flag_map.setdefault(flag.attempt_id,[]).append(flag)
+    vectors=[];completed_indices=[]
+    for index,row in enumerate(rows):
+        summary=summaries.get(row['attempt'].id)
+        row['camera']=summary
+        row['camera_flags']=flag_map.get(row['attempt'].id,[])[:5]
+        row['ml_signal']='Off' if not ml_enabled else 'Collecting baseline'
+        if row['attempt'].status=='submitted':
+            vector=[row['fast']/max(1,row['answered']),
+                    min(row['focus'],20),min(row['other_events'],20),
+                    row['changes']/max(1,row['answered']),
+                    (summary.no_face_count/max(1,summary.sample_count)) if summary and webcam_enabled else 0,
+                    (summary.multiple_face_count/max(1,summary.sample_count)) if summary and webcam_enabled else 0]
+            vectors.append(vector);completed_indices.append(index)
+    if ml_enabled:
+        results=score_exam_outliers(vectors)
+        for index,signal in zip(completed_indices,results):rows[index]['ml_signal']=signal
+    return render_template('exam_integrity_dashboard.html',exam=exam,rows=rows,
+                           webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,ml_baseline_count=len(vectors))
+
 
 @app.route('/admin/exam/<int:exam_id>/student-access')
 @staff_required
@@ -9937,6 +10180,133 @@ def current_student_exam_pin(exam_id):
     return response
 
 
+# V188: webcam permission + verified server-side camera frame BEFORE attempt creation.
+# This is a permission/live-frame gate, not an anti-spoofing or identity check.
+_V188_PREFLIGHT_SECONDS=600
+
+def v188_webcam_ready(exam_id, student_id):
+    grants=web_session.get('_v188_camera_grants') or {}
+    grant=grants.get(str(exam_id)) or {}
+    try:
+        verified=int(grant.get('student_id',-1))==int(student_id) and 0<=int(time.time())-int(grant.get('verified_at',0))<=180
+    except (TypeError,ValueError):verified=False
+    return bool(verified)
+
+
+def v188_camera_gate_required(s, exam_id, student_id):
+    profile=get_exam_security_profile(s,exam_id,False)
+    if not profile or not profile.webcam_enabled:return False
+    # Unlike V188, resumed attempts must ALSO pass a camera check.
+    attempt=get_attempt(s,student_id,exam_id)
+    if attempt and attempt.status=='submitted':return False
+    if attempt and v189_camera_sample_fresh(s,attempt):return False
+    return not v188_webcam_ready(exam_id,student_id)
+
+
+def v188_webcam_preflight(exam_id):
+    s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True));student=s.get(Student,web_session['user_id'])
+    if not exam or not student:abort(404)
+    allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
+    if not allowed:
+        if request.method=='POST':return jsonify(ok=False,error='Exam access unavailable.'),403
+        flash(access_label,'error');return redirect(url_for('student_dashboard'))
+    profile=get_exam_security_profile(s,exam_id,False)
+    if not profile or not profile.webcam_enabled:
+        return redirect(url_for('take_exam',exam_id=exam_id))
+    security=get_exam_security_policy(s,exam_id,False)
+    next_url=url_for('verify_student_exam_pin',exam_id=exam_id) if security and security.require_exam_pin else url_for('take_exam',exam_id=exam_id)
+    if request.method=='GET':
+        nonce=secrets.token_urlsafe(24)
+        challenges=web_session.get('_v188_camera_challenges') or {}
+        challenges[str(exam_id)]={'nonce':nonce,'issued_at':int(time.time()),'student_id':student.id}
+        web_session['_v188_camera_challenges']=challenges
+        response=app.make_response(render_template('exam_webcam_preflight_v188.html',exam=exam,next_url=next_url,nonce=nonce,student=student,cv_ready=ai_proctor_dependencies()['cv']))
+        response.headers['Cache-Control']='no-store, no-cache, must-revalidate'
+        return response
+    if request.content_length is not None and request.content_length>115000:return jsonify(ok=False,error='Frame too large.'),413
+    data=request.get_json(silent=True) or {}
+    challenge=(web_session.get('_v188_camera_challenges') or {}).get(str(exam_id)) or {}
+    nonce=data.get('nonce')
+    if not isinstance(nonce,str) or not secrets.compare_digest(nonce,str(challenge.get('nonce',''))) or not nonce:
+        return jsonify(ok=False,error='Camera setup expired. Refresh this page.'),403
+    try:
+        fresh=(int(time.time())-int(challenge.get('issued_at',0)))<=300
+        bound=int(challenge.get('student_id',-1))==int(student.id)
+    except (ValueError,TypeError):fresh=False;bound=False
+    if not fresh or not bound:return jsonify(ok=False,error='Camera setup expired. Refresh this page.'),403
+    encoded=data.get('frame')
+    if not isinstance(encoded,str) or len(encoded)>108000 or not encoded.startswith('data:image/jpeg;base64,'):
+        return jsonify(ok=False,error='Camera has not provided a valid sample.'),400
+    try:
+        jpeg=base64.b64decode(encoded.split(',',1)[1],validate=True)
+        if len(jpeg)>80000:raise ValueError('Oversized JPEG')
+        faces=count_faces_in_jpeg(jpeg)
+    except (ValueError,base64.binascii.Error):return jsonify(ok=False,error='Camera frame was unreadable. Retry.'),400
+    except RuntimeError:return jsonify(ok=False,error='Camera analysis is unavailable on the server. Contact the invigilator.'),503
+    challenges=web_session.get('_v188_camera_challenges') or {}
+    challenges.pop(str(exam_id),None);web_session['_v188_camera_challenges']=challenges
+    grants=web_session.get('_v188_camera_grants') or {}
+    grants[str(exam_id)]={'student_id':student.id,'verified_at':int(time.time())}
+    web_session['_v188_camera_grants']=grants
+    # No image stored: in-memory frame decoded only to establish server availability.
+    response=jsonify(ok=True,next_url=next_url,face_visible=faces>=1)
+    response.headers['Cache-Control']='no-store'
+    return response
+
+# V189: camera MUST be live before exam interactions may proceed.
+# Server-verified samples, not client flags or mere browser permission.
+_V189_CAMERA_FRESH_SECONDS=55
+
+def v189_camera_sample_fresh(s,attempt):
+    if not attempt:return False
+    row=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id))
+    if not row or not row.last_sample_at:return False
+    try:
+        elapsed=(now_dt()-parse_dt(row.last_sample_at)).total_seconds()
+        return 0<=elapsed<=_V189_CAMERA_FRESH_SECONDS
+    except (ValueError,TypeError,OverflowError):return False
+
+def v189_camera_enforced(s,exam_id):
+    profile=get_exam_security_profile(s,exam_id,False)
+    return bool(profile and profile.webcam_enabled)
+
+@app.route('/student/proctor/lease/<int:exam_id>',methods=['GET'])
+@student_required
+def v189_proctor_lease(exam_id):
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
+    if not attempt or attempt.status=='submitted':return jsonify(ready=False),404
+    if not secure_exam_device_allowed(s,attempt):return jsonify(ready=False),409
+    ready=v189_camera_sample_fresh(s,attempt) if v189_camera_enforced(s,exam_id) else True
+    response=jsonify(ready=ready,expires_in=_V189_CAMERA_FRESH_SECONDS)
+    response.headers['Cache-Control']='no-store'
+    return response
+
+@app.before_request
+def v189_block_exam_actions_without_webcam():
+    # Authoritative server-side enforcement on student answers/progression.
+    # Expiry and final submission remain available; no auto-fail on equipment errors.
+    endpoints={'save_answer','next_exam_question','previous_mock_drive_question',
+               'select_mock_drive_section','complete_mock_drive_section','submit_exam'}
+    if request.method!='POST' or request.endpoint not in endpoints:return None
+    if request.endpoint=='submit_exam' and request.form.get('submission_reason')=='TIME_EXPIRED':return None
+    if web_session.get('role')!='student' or not web_session.get('user_id'):return None
+    if request.endpoint=='save_answer':
+        payload=request.get_json(silent=True) or {}
+        try:exam_id=int(payload.get('exam_id'))
+        except (ValueError,TypeError):return None
+    else:
+        try:exam_id=int((request.view_args or {}).get('exam_id'))
+        except (ValueError,TypeError):return None
+    s=DB()
+    if not v189_camera_enforced(s,exam_id):return None
+    attempt=get_attempt(s,web_session['user_id'],exam_id)
+    if not attempt or attempt.status!='in_progress':return None
+    if v189_camera_sample_fresh(s,attempt):return None
+    message='Camera monitoring is not active. Restore the camera before answering or moving to another question.'
+    if request.endpoint=='save_answer' or request.headers.get('X-Requested-With')=='XMLHttpRequest' or request.accept_mimetypes.best=='application/json':
+        return jsonify(ok=False,camera_required=True,error=message),423
+    return (render_template('exam_webcam_locked_v189.html',exam_id=exam_id,message=message),423,{'Cache-Control':'no-store'})
+
 @app.route('/student/exam/<int:exam_id>/verify-pin',methods=['GET','POST'])
 @student_required
 def verify_student_exam_pin(exam_id):
@@ -9946,6 +10316,10 @@ def verify_student_exam_pin(exam_id):
     if not security or not security.require_exam_pin:return redirect(url_for('take_exam',exam_id=exam_id))
     allowed,access_label,_session=exam_access_for_student(s,student.id,exam)
     if not allowed:flash(access_label,'error');return redirect(url_for('student_dashboard'))
+    if v188_camera_gate_required(s,exam_id,student.id):
+        if request.method=='POST' and (request.headers.get('X-Requested-With')=='XMLHttpRequest' or request.accept_mimetypes.best=='application/json'):
+            return jsonify(ok=False,error='webcam_required',setup_url=url_for('v188_webcam_preflight',exam_id=exam_id)),428
+        return redirect(url_for('v188_webcam_preflight',exam_id=exam_id))
     ip_ok,_ip_lock=ensure_exam_ip_session_lock(s,exam,student,resolved_exam_window_for_student(s,student.id,exam,_session))
     if not ip_ok:
         s.commit();clear_student_session_for_ip_conflict();return redirect(url_for('home'))
@@ -9966,7 +10340,7 @@ def verify_student_exam_pin(exam_id):
         audit_event(s,'student_rotating_exam_pin_failed','exam',exam_id,f'student_id={student.id}, ip={request.remote_addr or ""}');s.commit()
         if ajax:return jsonify(ok=False,error='invalid_pin',pin=rotating_exam_pin(exam_id,student.id),seconds_remaining=rotating_exam_pin_seconds_remaining()),400
         flash('The PIN changed or was entered incorrectly. Use the PIN currently shown on screen.','error')
-    return render_template('exam_pin_verify.html',exam=exam,student=student,display_title=student_exam_display_title(s,exam),rotating_pin=rotating_exam_pin(exam_id,student.id),pin_seconds_remaining=rotating_exam_pin_seconds_remaining())
+    return render_template('exam_pin_verify.html',webcam_proctor_enabled=bool(getattr(get_exam_security_profile(s,exam_id,False),'webcam_enabled',False)),exam=exam,student=student,display_title=student_exam_display_title(s,exam),rotating_pin=rotating_exam_pin(exam_id,student.id),pin_seconds_remaining=rotating_exam_pin_seconds_remaining())
 
 
 def _sequential_progress(s,attempt,create=False):
@@ -10009,6 +10383,8 @@ def take_exam(exam_id):
         if not device_ok:
             s.commit();flash('This exam is already locked to another browser/device. Ask the invigilator to reset your device lock.','error');return redirect(url_for('student_dashboard'))
         s.commit()
+    if v188_camera_gate_required(s,exam_id,student.id):
+        return redirect(url_for('v188_webcam_preflight',exam_id=exam_id))
     cfg=normalize_legacy_manual_subject_exam(s,exam_id,get_exam_config(s,exam_id));attempt=get_attempt(s,web_session['user_id'],exam_id)
     if attempt and attempt.status=='submitted':return redirect(url_for('submitted',exam_id=exam_id))
     if not attempt:
@@ -10037,6 +10413,8 @@ def take_exam(exam_id):
         if cfg and cfg.secure_sequential:
             _sequential_progress(s,attempt,create=True)
         s.commit()
+    if v189_camera_enforced(s,exam_id) and not v189_camera_sample_fresh(s,attempt):
+        return render_template('exam_webcam_warmup_v189.html',exam=exam,next_url=request.url,secure_shell=request.args.get('secure_shell')=='1')
     end_dt=parse_dt(attempt.end_at)
     if now_dt()>=end_dt:finalize_attempt(s,attempt,'TIME_EXPIRED');return redirect(url_for('submitted',exam_id=exam_id))
     aq_rows=s.scalars(select(AttemptQuestion).where(AttemptQuestion.attempt_id==attempt.id).order_by(AttemptQuestion.position)).all()
@@ -10074,13 +10452,21 @@ def take_exam(exam_id):
         if not q:continue
         qtype=canonical_question_type(q.question_type);text={'A':q.option_a,'B':q.option_b,'C':q.option_c,'D':q.option_d};order=aq.option_order or 'ABCD';display=[(chr(65+i),key,text[key]) for i,key in enumerate(order)] if qtype in {'single_choice','multiple_select'} else []
         views.append(type('QuestionView',(),{'id':q.id,'question':q.question,'question_type':qtype,'question_type_label':QUESTION_TYPE_LABELS.get(qtype,qtype),'display_options':display,'marks':q.marks,'mock_section':q.mock_section or ''})())
+    record_question_presentations(s,attempt,[v.id for v in views]);s.commit()
     saved=s.scalars(select(Answer).where(Answer.attempt_id==attempt.id)).all();answers={a.question_id:answer_record_value(a) for a in saved}
     security=get_exam_security_policy(s,exam_id,create=False)
     secure_shell=bool(request.args.get('secure_shell')=='1' and security and security.require_exam_pin)
     if mock_drive and mock_progress:
         elapsed=max(0,int((now_dt()-parse_dt(mock_progress.question_started_at or now_iso())).total_seconds()));sequential_wait=max(0,int(cfg.sequential_min_seconds or 0)-elapsed);timer_end=min(end_dt,parse_dt(mock_progress.section_end_at)) if mock_progress.section_end_at else end_dt
     else:timer_end=end_dt
-    return render_template('exam.html',exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
+    visual_mode=EXAM_VISUAL_PROTECTION_MODE
+    attempt_student=s.get(Student,attempt.student_id) if visual_mode!='off' else None
+    if visual_mode!='off':
+        student_ref=(attempt_student.roll_no if attempt_student and attempt_student.roll_no else str(attempt.student_id))
+        visual_watermark=f'Roll {student_ref} | Exam {exam.id} | Attempt {attempt.id}'
+    else:
+        visual_watermark=''
+    return render_template('exam.html',webcam_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).webcam_enabled),visual_protection_mode=visual_mode,visual_watermark=visual_watermark,exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
 
 @app.route('/student/exam/<int:exam_id>/section/select',methods=['POST'])
 @student_required
@@ -10107,14 +10493,23 @@ def complete_mock_drive_section(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
     if not attempt or attempt.status=='submitted' or not cfg or cfg.exam_type!='mock_drive':abort(404)
     if not secure_exam_device_allowed(s,attempt):abort(409)
+    if now_dt()>=parse_dt(attempt.end_at):
+        finalize_attempt(s,attempt,'TIME_EXPIRED')
+        return redirect(url_for('submitted',exam_id=exam_id))
     progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+    if progress.section_end_at and now_dt()>=parse_dt(progress.section_end_at):
+        return redirect(_mock_drive_resume_url(s,exam_id),code=303)
     expected=request.form.get('expected_position',type=int)
     if expected is not None and expected!=int(progress.current_question_position or 1):
         s.rollback();return redirect(_mock_drive_resume_url(s,exam_id),code=303)
     section=(progress.active_section or '').strip();qids=_mock_section_question_ids(s,attempt,section)
     if not section or not qids:return redirect(_mock_drive_resume_url(s,exam_id))
     questions={q.id:q for q in s.scalars(select(Question).where(Question.id.in_(qids))).all()}
+    # Only accept the question actually displayed on this screen; prior
+    # questions were individually autosaved and cannot be forged in this POST.
+    current_qid=current_visible_question(s,attempt,cfg)
     for qid,question in questions.items():
+        if qid!=current_qid:continue
         values=request.form.getlist(f'q_{qid}')
         if values:
             value=','.join(values) if canonical_question_type(question.question_type)=='multiple_select' else values[0]
@@ -10178,7 +10573,10 @@ def next_exam_question(exam_id):
     if not attempt or attempt.status=='submitted':return redirect(url_for('submitted',exam_id=exam_id))
     if cfg and cfg.exam_type=='mock_drive':
         if not secure_exam_device_allowed(s,attempt):flash('This exam is locked to another device.','error');return redirect(url_for('student_dashboard'))
+        if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return redirect(url_for('submitted',exam_id=exam_id))
         progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+        if progress.section_end_at and now_dt()>=parse_dt(progress.section_end_at):
+            return redirect(_mock_drive_resume_url(s,exam_id),code=303)
         expected=request.form.get('expected_position',type=int)
         if expected is not None and expected!=int(progress.current_question_position or 1):
             s.rollback();return resume_current_question()
@@ -10226,7 +10624,10 @@ def next_exam_question(exam_id):
 def previous_mock_drive_question(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);cfg=get_exam_config(s,exam_id,create=False)
     if not attempt or attempt.status=='submitted' or not cfg or cfg.exam_type!='mock_drive':return redirect(url_for('student_dashboard'))
+    if not secure_exam_device_allowed(s,attempt):abort(409)
+    if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return redirect(url_for('submitted',exam_id=exam_id))
     progress=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id).with_for_update().execution_options(populate_existing=True)) or _mock_drive_progress(s,attempt,create=True)
+    if progress.section_end_at and now_dt()>=parse_dt(progress.section_end_at):return redirect(_mock_drive_resume_url(s,exam_id),code=303)
     expected=request.form.get('expected_position',type=int)
     if expected is not None and expected!=int(progress.current_question_position or 1):
         s.rollback();return redirect(_mock_drive_resume_url(s,exam_id),code=303)
@@ -10248,17 +10649,84 @@ def save_answer():
     if now_dt()>=parse_dt(attempt.end_at):finalize_attempt(s,attempt,'TIME_EXPIRED');return jsonify(saved=False,submitted=True)
     if qid not in attempt_question_ids(s,attempt):return jsonify(error='Question not part of this attempt'),400
     cfg=get_exam_config(s,exam_id,create=False)
-    if cfg and cfg.exam_type=='mock_drive':
-        progress=_mock_drive_progress(s,attempt,create=True)
-        question=s.get(Question,qid)
-        if not question or not progress.active_section or question.mock_section!=progress.active_section:
-            return jsonify(error='This question belongs to a locked or inactive section.'),409
-    if cfg and cfg.secure_sequential:
-        progress=_sequential_progress(s,attempt,create=True);current=_attempt_question_at_position(s,attempt,progress.current_position)
-        if not current or current.question_id!=qid:return jsonify(error='Only the current question can be answered in Secure Sequential mode.'),409
+    visible=current_visible_question(s,attempt,cfg)
+    if (cfg and (cfg.exam_type=='mock_drive' or cfg.secure_sequential)) and visible!=qid:
+        return jsonify(error='Only the currently displayed, unlocked question can be answered.'),409
     question=s.get(Question,qid)
     try:save_answer_record(s,attempt.id,qid,ans,question)
     except ValueError as exc:return jsonify(error=str(exc)),400
+    s.commit();return jsonify(saved=True)
+
+@app.route('/student/proctor/frame',methods=['POST'])
+@student_required
+def student_proctor_frame():
+    # Limit JSON and JPEG size before decoding; images are processed in memory only.
+    if request.content_length is not None and request.content_length>115000:
+        return jsonify(error='Frame exceeds maximum size.'),413
+    data=request.get_json(silent=True) or {}
+    try:exam_id=int(data.get('exam_id'))
+    except (TypeError,ValueError):return jsonify(error='Invalid exam ID.'),400
+    encoded=data.get('frame')
+    if not isinstance(encoded,str) or len(encoded)>108000 or not encoded.startswith('data:image/jpeg;base64,'):
+        return jsonify(error='Invalid JPEG frame.'),400
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
+    profile=get_exam_security_profile(s,exam_id,False)
+    if not attempt or attempt.status=='submitted' or not profile or not profile.webcam_enabled:return jsonify(error='Webcam monitoring unavailable.'),404
+    if not secure_exam_device_allowed(s,attempt):return jsonify(error='Device lock.'),409
+    if now_dt()>=parse_dt(attempt.end_at):return jsonify(error='Exam expired.'),409
+    summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id).with_for_update())
+    if not summary:
+        summary=ExamProctorSummary(attempt_id=attempt.id)
+        s.add(summary);s.flush()
+    if summary.last_sample_at:
+        try:
+            if (now_dt()-parse_dt(summary.last_sample_at)).total_seconds()<12:
+                return jsonify(error='Wait before sampling again.'),429
+        except ValueError:pass
+    try:
+        jpeg=base64.b64decode(encoded.split(',',1)[1],validate=True)
+    except (ValueError,base64.binascii.Error):return jsonify(error='Invalid encoded JPEG.'),400
+    if len(jpeg)>80000:return jsonify(error='JPEG frame too large.'),413
+    try:faces=count_faces_in_jpeg(jpeg)
+    except ValueError:return jsonify(error='Unreadable camera frame.'),400
+    except RuntimeError:return jsonify(error='Computer vision dependency unavailable.'),503
+    summary.sample_count+=1;summary.last_sample_at=now_iso()
+    if faces==0:
+        summary.no_face_count+=1;summary.consecutive_no_face+=1;summary.consecutive_multiple_face=0
+        if summary.consecutive_no_face==3:
+            s.add(ExamProctorFlag(attempt_id=attempt.id,alert_type='no_face_3_samples',created_at=now_iso()))
+    elif faces>1:
+        summary.multiple_face_count+=1;summary.consecutive_multiple_face+=1;summary.consecutive_no_face=0
+        if summary.consecutive_multiple_face==2:
+            s.add(ExamProctorFlag(attempt_id=attempt.id,alert_type='multiple_faces_2_samples',created_at=now_iso()))
+    else:
+        summary.one_face_count+=1;summary.consecutive_multiple_face=0;summary.consecutive_no_face=0
+    s.commit()
+    # Never expose face imagery or biometric identity in response.
+    return jsonify(accepted=True,status='review_only',samples=summary.sample_count)
+
+@app.route('/student/proctor/status',methods=['POST'])
+@student_required
+def student_proctor_status():
+    data=request.get_json(silent=True) or {}
+    try:exam_id=int(data.get('exam_id'))
+    except (TypeError,ValueError):return jsonify(error='Invalid exam ID.'),400
+    status=str(data.get('status') or '')[:30]
+    if status not in {'permission_denied','camera_unavailable','camera_interrupted'}:return jsonify(error='Invalid status.'),400
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id);profile=get_exam_security_profile(s,exam_id,False)
+    if not attempt or attempt.status=='submitted' or not profile or not profile.webcam_enabled:return jsonify(error='Not enabled.'),404
+    if not secure_exam_device_allowed(s,attempt):return jsonify(error='Device lock.'),409
+    summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id).with_for_update())
+    if not summary:
+        summary=ExamProctorSummary(attempt_id=attempt.id);s.add(summary);s.flush()
+    # Suppress repeated errors from a broken device, but show one review-only flag per status window.
+    if summary.last_camera_error_at:
+        try:
+            if (now_dt()-parse_dt(summary.last_camera_error_at)).total_seconds()<60:
+                return jsonify(saved=False,rate_limited=True)
+        except ValueError:pass
+    summary.camera_error_count+=1;summary.last_camera_error_at=now_iso()
+    s.add(ExamProctorFlag(attempt_id=attempt.id,alert_type=status,created_at=now_iso()))
     s.commit();return jsonify(saved=True)
 
 @app.route('/student/integrity-event',methods=['POST'])
@@ -10283,7 +10751,7 @@ def integrity_event():
     if not duplicate:
         s.add(IntegrityEvent(attempt_id=attempt.id,event_type=event_type,details=str(data.get('details',''))[:250],created_at=now_iso()));s.flush()
 
-    count=int(s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id)) or 0)
+    count=int(s.scalar(select(func.count()).select_from(IntegrityEvent).where(IntegrityEvent.attempt_id==attempt.id,IntegrityEvent.event_type.in_(['tab_hidden','fullscreen_exit']))) or 0)
     cfg=get_exam_config(s,exam_id,create=False);security=get_exam_security_policy(s,exam_id,create=False);limit=max(0,int(cfg.tab_switch_limit or 0)) if cfg else 0
     auto_enforce=bool(security and security.auto_submit_on_integrity_limit and limit>0)
     message='Integrity event recorded.'
@@ -10362,6 +10830,9 @@ def submit_exam(exam_id):
         if ajax:return jsonify(ok=False,submitted=False,exam_url=url_for('student_dashboard'),message=message),409
         flash(message,'error');return redirect(url_for('student_dashboard'))
     allowed=set(attempt_question_ids(s,attempt));cfg=get_exam_config(s,exam_id,create=False)
+    visible=current_visible_question(s,attempt,cfg)
+    if cfg and (cfg.secure_sequential or cfg.exam_type=='mock_drive'):
+        allowed={visible} if visible in allowed else set()
     if attempt.status!='submitted':
         questions={q.id:q for q in (s.scalars(select(Question).where(Question.id.in_(allowed))).all() if allowed else [])}
         for qid,question in questions.items():

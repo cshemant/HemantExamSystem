@@ -1,0 +1,8 @@
+{% extends 'base.html' %}{% block content %}
+<section class="card" style="max-width:680px;margin:50px auto;padding:25px;">
+  <h1>Camera monitoring required</h1>
+  <p>{{ message }}</p>
+  <p>Your answers were not changed and this camera interruption was not counted as a fullscreen violation.</p>
+  <a class="btn" href="{{ url_for('v188_webcam_preflight',exam_id=exam_id) }}" target="_top">Verify Webcam</a>
+</section>
+{% endblock %}

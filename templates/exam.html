@@ -3,9 +3,33 @@
 {% set manual_fullscreen = cfg and cfg.require_fullscreen and not pin_secure %}
 <div class="exam-head"><span class="exam-title">{{ display_title }}</span>{% if mock_drive %}<span class="sequential-progress-badge">{{ mock_section_label }} · {{ mock_section_minutes }} min · Question {{ current_position }} of {{ total_questions }}</span>{% elif sequential_mode %}<span class="sequential-progress-badge">Question {{ current_position }} of {{ total_questions }}</span>{% endif %}<span id="save-status" class="save-status" aria-live="polite"></span>{% if manual_fullscreen %}<button type="button" id="fullscreen-btn" class="btn small secondary">Enter Full Screen</button>{% endif %}<span class="timer">{% if mock_drive %}Section time left{% else %}Time left{% endif %}: <span id="timer"></span></span></div>
 {% if manual_fullscreen %}<div id="integrity-warning" class="integrity-banner">Integrity monitoring is enabled. Leaving the exam tab or full-screen mode is recorded for faculty review.</div>{% endif %}
+{% if webcam_proctor_enabled %}
+<div class="webcam-exam-grid{% if mock_drive and mock_active_section=='technical' %} webcam-exam-grid-technical{% endif %}">
+  <aside class="webcam-exam-sidebar" aria-label="Webcam monitoring">
+{% endif %}
+{% if webcam_proctor_enabled %}
+<section id="webcam-proctor-panel" class="card soft" style="margin:0;padding:15px;" data-exam-id="{{ exam.id }}" data-frame-url="{{ url_for('student_proctor_frame') }}" data-status-url="{{ url_for('student_proctor_status') }}" data-lease-url="{{ url_for('v189_proctor_lease',exam_id=exam.id) }}">
+  <h3>Mandatory Webcam Monitoring</h3>
+  <p class="mini-meta">Webcam permission and a test frame are required before starting or resuming. During the exam, regular samples are analysed on the server for approximate face counts. Raw video is not retained. Camera interruptions pause answering and navigation; contact your invigilator if equipment fails.</p>
+  <div class="actions"><button type="button" class="btn secondary" id="proctor-start" hidden>Reconnect Camera</button><span id="proctor-status" class="mini-meta" role="status" aria-live="polite">Starting webcam monitoring…</span></div>
+  <video id="proctor-preview" autoplay muted playsinline aria-label="Live webcam preview" style="display:none;width:100%;max-width:240px;border-radius:8px;transform:scaleX(-1)"></video>
+</section>
+<div id="v189-camera-lock" role="alertdialog" aria-modal="true" aria-label="Camera monitoring required" style="position:fixed;inset:0;z-index:2147483000;background:#f5f7fc;display:flex;align-items:center;justify-content:center;padding:24px">
+  <div style="max-width:550px;background:white;border:1px solid #cad9f2;border-radius:18px;padding:32px;box-shadow:0 15px 35px #142f591f;text-align:center;">
+    <h2>Camera verification required</h2><p id="v189-camera-lock-msg">Starting camera and verifying a live server sample…</p>
+    <p class="mini-meta">Question content stays unavailable until the webcam is working. A camera failure is not automatically treated as cheating.</p>
+    <button id="v189-camera-retry" type="button" class="btn">Retry Camera</button>
+  </div>
+</div>
+<script defer src="{{ url_for('static',filename='exam_proctor_v189.js') }}?v=189"></script>
+{% endif %}
+{% if webcam_proctor_enabled %}
+  </aside>
+  <div class="webcam-exam-questions">
+{% endif %}
 <form id="exam-form" method="post" action="{{ url_for('submit_exam',exam_id=exam.id) }}" data-exam-integrity="{{ exam.id }}" data-secure-shell="{{ '1' if secure_shell else '0' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if sequential_mode or mock_drive %}<input type="hidden" name="expected_position" value="{{ current_position }}">{% endif %}
 {% if mock_drive and mock_active_section=='technical' %}<div class="mock-technical-layout"><div class="mock-question-column">{% endif %}
-{% for q in questions %}<div class="question exam-question" data-question-type="{{ q.question_type }}"><div class="question-title">Q{{ current_position if (sequential_mode or mock_drive) else loop.index }}. {{ q.question }}</div><div class="mini-meta">{{ q.question_type_label }} · {{ q.marks }} mark(s)</div>
+{% for q in questions %}<div class="question exam-question{% if visual_protection_mode != 'off' %} exam-visual-watermark{% endif %}{% if visual_protection_mode == 'watermark_noise' %} exam-visual-noise{% endif %}" data-question-type="{{ q.question_type }}"{% if visual_protection_mode != 'off' %} data-visual-watermark="{{ visual_watermark }}"{% endif %}><div class="question-title">Q{{ current_position if (sequential_mode or mock_drive) else loop.index }}. {{ q.question }}</div><div class="mini-meta">{{ q.question_type_label }} · {{ q.marks }} mark(s)</div>
   {% if q.question_type=='single_choice' %}
     {% for label,key,value in q.display_options %}<label class="option"><input type="radio" name="q_{{ q.id }}" value="{{ key }}" {% if answers.get(q.id)==key %}checked{% endif %} onchange="saveAnswer({{ exam.id }},{{ q.id }},'{{ key }}')"><span><strong>{{ label }}.</strong> {{ value }}</span></label>{% endfor %}
   {% elif q.question_type=='multiple_select' %}
@@ -36,6 +60,10 @@
     </div>
   </div>
 </div>{% endif %}</form>
+{% if webcam_proctor_enabled %}
+  </div>
+</div>
+{% endif %}
 <script>{% if mock_drive %}startSectionTimer({{ end_epoch }},{{ server_now_epoch }},'{{ url_for('expire_mock_drive_section',exam_id=exam.id) }}');{% else %}startTimer({{ end_epoch }},{{ server_now_epoch }});{% endif %}startIntegrity({{ exam.id }},{{ 'true' if manual_fullscreen else 'false' }},{{ cfg.tab_switch_limit if cfg else 0 }});startExamHeartbeat({{ exam.id }},{{ security.heartbeat_seconds if security else 25 }});{% if (sequential_mode or mock_drive) and current_position < total_questions %}startSequentialNextCountdown();{% endif %}</script>
 {% if mock_drive and mock_active_section=='technical' %}<script src="{{ url_for('static',filename='code_editor.js') }}?v={{ app_version }}"></script>{% endif %}
 {% endblock %}  

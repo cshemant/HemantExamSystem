@@ -1,0 +1,6 @@
+# Install only on a staging server that will enable either AI/ML or webcam proctoring.
+# Webcam CV uses OpenCV's bundled Haar face detector, not face recognition.
+# Use a supported Python version compatible with these pinned version ranges.
+opencv-python-headless>=4.10,<5
+numpy>=1.26,<3
+scikit-learn>=1.5,<2

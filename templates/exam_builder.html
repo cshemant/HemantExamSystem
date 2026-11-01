@@ -1,6 +1,7 @@
 {% extends 'base.html' %}{% block content %}
 <div data-voice-exam-context data-voice-exam-id="{{ exam.id }}" data-voice-exam-title="{{ exam.title|e }}" data-voice-subject="{{ cfg.subject|e }}" hidden></div>
 <div class="page-head"><h1>{{ exam.title }}</h1></div>
+{% if can_manage_v185 %}<div class="actions" style="margin-bottom:12px"><a class="btn secondary" href="{{ url_for('exam_security_profile_admin',exam_id=exam.id) }}">Security Mode &amp; SEB</a><a class="btn secondary" href="{{ url_for('exam_integrity_dashboard',exam_id=exam.id) }}">Security Review Dashboard</a></div>{% endif %}
 <div class="grid builder-summary"><div class="stat-card"><strong>{{ pool_count }}</strong><span>Pool Questions</span></div><div class="stat-card"><strong>{{ cfg.question_count or 0 }}</strong><span>Questions / Student</span></div><div class="stat-card"><strong>{{ attempt_count }}</strong><span>Attempts</span></div><div class="stat-card"><strong>{{ approval.status|title }}</strong><span>Approval</span></div></div>
 <div class="card soft"><div class="import-header"><div><h2>Encrypted Campus Exam Package</h2></div>{% if edge_package_enabled %}<div class="actions"><a class="btn" href="{{ url_for('export_edge_exam_package',exam_id=exam.id) }}">Download Edge Exam Package</a><a class="btn secondary" href="{{ url_for('export_edge_results_package',exam_id=exam.id) }}">Download Encrypted Results Archive</a></div>{% else %}<span class="badge warning">Signing key not configured</span>{% endif %}</div></div>
 <div class="card"><h2>Exam Blueprint</h2>

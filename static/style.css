@@ -699,3 +699,25 @@ body.secure-exam-running .secure-exam-shell{visibility:visible!important}
 .practical-experiment-picker select{width:100%;max-width:900px}
 .practical-student-marks-grid{grid-template-columns:repeat(4,minmax(145px,1fr));margin:14px 0}
 @media(max-width:800px){.student-window-form{grid-template-columns:1fr;min-width:260px}.practical-student-marks-grid{grid-template-columns:1fr 1fr}}
+
+/* Optional photo-leak deterrence. THIS DOES NOT DEFEAT OCR. */
+.exam-question.exam-visual-watermark{position:relative;isolation:isolate;overflow:hidden}
+.exam-question.exam-visual-watermark::after{content:attr(data-visual-watermark);position:absolute;top:48%;left:50%;z-index:1;pointer-events:none;user-select:none;white-space:nowrap;color:#273854;opacity:.11;font-size:clamp(12px,1.65vw,20px);font-weight:700;transform:translate(-50%,-50%) rotate(-19deg);animation:exam-wm-drift 23s ease-in-out infinite alternate}
+@keyframes exam-wm-drift{from{top:38%;left:45%}to{top:62%;left:55%}}
+@media(prefers-reduced-motion:reduce){.exam-question.exam-visual-watermark::after{animation:none}}
+.exam-question.exam-visual-noise::before{content:'';position:absolute;inset:0;z-index:1;pointer-events:none;background-image:radial-gradient(circle,rgba(27,50,91,.075) .45px,transparent .75px);background-size:11px 11px;opacity:.20}
+@media print{.exam-question.exam-visual-watermark::after{animation:none}}
+
+/* Staging: V189 mandatory-webcam exam layout – compact left proctor,
+   flexible right question. Technical mock-drive editor remains full-width. */
+.webcam-exam-grid{display:grid;grid-template-columns:minmax(215px,255px) minmax(0,1fr);gap:18px;align-items:start;margin:14px 0}
+.webcam-exam-sidebar,.webcam-exam-questions{min-width:0}
+.webcam-exam-sidebar #webcam-proctor-panel{margin:0}
+.webcam-exam-sidebar #webcam-proctor-panel h3{font-size:1.05rem;margin:0 0 10px}
+.webcam-exam-sidebar #webcam-proctor-panel p.mini-meta{font-size:.78rem;line-height:1.5}
+.webcam-exam-sidebar #proctor-status{overflow-wrap:anywhere}
+.webcam-exam-sidebar #proctor-preview{display:block;max-width:100%;height:auto;aspect-ratio:4/3;object-fit:cover}
+.webcam-exam-sidebar #proctor-preview[style*="display:none"]{display:none!important}
+.webcam-exam-questions #exam-form{min-width:0;margin:0}
+.webcam-exam-grid-technical{grid-template-columns:minmax(0,1fr)}
+@media(max-width:820px){.webcam-exam-grid{grid-template-columns:minmax(0,1fr)}.webcam-exam-sidebar #proctor-preview{max-width:220px}}

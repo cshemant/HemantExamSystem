@@ -1,0 +1,18 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><h1>Verify Webcam Connection</h1></div>
+<section id="webcam-proctor-panel" class="card soft" style="max-width:720px;margin:30px auto;padding:25px" data-exam-id="{{ exam.id }}" data-frame-url="{{ url_for('student_proctor_frame') }}" data-status-url="{{ url_for('student_proctor_status') }}" data-lease-url="{{ url_for('v189_proctor_lease',exam_id=exam.id) }}" data-next-url="{{ next_url }}">
+  <h2>Waiting for live webcam verification</h2>
+  <p>Your questions are not available until the examination server has accepted a fresh camera sample. Browser permission alone is not sufficient.</p>
+  <p id="proctor-status" role="status">Opening webcam…</p>
+  <button type="button" id="proctor-start" hidden>Reconnect Camera</button>
+  <video id="proctor-preview" autoplay muted playsinline aria-label="Camera preview" style="width:220px;max-width:100%;display:none"></video>
+</section>
+<div id="v189-camera-lock" style="position:fixed;inset:0;z-index:2147483000;background:#f5f7fc;display:flex;align-items:center;justify-content:center;padding:20px" role="alertdialog" aria-modal="true">
+  <div style="max-width:530px;padding:30px;border-radius:16px;background:white;text-align:center;border:1px solid #cad9f2">
+    <h2>Checking webcam before showing questions</h2>
+    <p id="v189-camera-lock-msg">Please allow the camera and keep it active.</p>
+    <button type="button" id="v189-camera-retry" class="btn">Retry Camera</button>
+  </div>
+</div>
+<script defer src="{{ url_for('static',filename='exam_proctor_v189.js') }}?v=189"></script>
+{% endblock %}

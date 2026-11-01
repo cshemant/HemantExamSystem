@@ -1,0 +1,38 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><div><a href="{{ url_for('exam_builder',exam_id=exam.id) }}">← Exam Blueprint</a><h1>Exam Security Profile</h1><p>{{ exam.title }}</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('exam_integrity_dashboard',exam_id=exam.id) }}">Security Dashboard</a></div></div>
+<div class="card soft"><p><strong>Safeguards:</strong> These controls reduce risk, but they cannot stop a second phone photographing the exam screen. A supervised, phone-restricted room is required for high-stakes on-campus exams.</p>
+<p class="mini-meta">New and existing exams default to <strong>Standard</strong>. Protected modes are opt-in and cannot be changed after a student has started an attempt.</p></div>
+<div class="card">
+<h2>Staging Security Mode</h2>
+{% if attempt_count %}<p class="integrity-banner">This exam already has {{ attempt_count }} attempt(s). Settings are locked to protect fairness and exam continuity.</p>{% endif %}
+<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<fieldset {% if attempt_count %}disabled{% endif %}>
+  <div class="integrity-options">
+  <label class="checkline"><input type="radio" name="security_mode" value="standard" {% if profile.mode=='standard' %}checked{% endif %}> <strong>Standard</strong> — Existing browser workflows, question shuffling and audit logging. No SEB requirement.</label>
+  <label class="checkline"><input type="radio" name="security_mode" value="supervised" {% if profile.mode=='supervised' %}checked{% endif %}> <strong>Supervised</strong> — Requires validated SEB Config Key and managed lab supervision.</label>
+  <label class="checkline"><input type="radio" name="security_mode" value="high" {% if profile.mode=='high' %}checked{% endif %}> <strong>High Integrity</strong> — Same verified-browser enforcement, plus strict institution operating procedures. Enable optional monitoring separately below.</label>
+  </div>
+  <h3>Safe Exam Browser validation (Windows/legacy header-compatible SEB)</h3>
+  <p>Set <code>EXAM_SEB_EXTERNAL_ORIGIN</code> on the <strong>staging server</strong>, e.g. <code>https://staging.exam.learnwithhemant.com</code>. Current value: <strong>{{ seb_origin or 'Not configured' }}</strong>.</p>
+  <p>In the SEB Config Tool, save the final <code>.seb</code> file; enable <em>Use Browser &amp; Config Keys</em>; copy the 64-character <strong>Config Key</strong> (not the per-request hash) below. Changing the .seb configuration requires a new key.</p>
+  <label for="seb-key">Replace SEB Config Key (64 hexadecimal characters; leave blank to keep existing)</label>
+  <input id="seb-key" type="password" name="seb_config_key" autocomplete="off" minlength="64" maxlength="64" pattern="[0-9A-Fa-f]{64}" placeholder="Paste the saved SEB Config Key here">
+  <div class="mini-meta">Key status: {% if profile.seb_config_key %}Configured (ends in …{{ profile.seb_config_key[-6:] }}){% else %}Not configured{% endif %}. Never paste the key in public screenshots or share a configuration file that exposes it.</div>
+  <label class="checkline"><input type="checkbox" name="clear_seb_key"> Clear saved key (only if reverting to Standard)</label>
+  <h3>Optional AI / Webcam Monitoring (independent switches)</h3>
+  <div class="integrity-options">
+    <label class="checkline"><input type="checkbox" name="enable_ml" {% if profile.ml_enabled %}checked{% endif %}>
+      <strong>Enable ML anomaly review</strong> — Isolation Forest on completed-attempt patterns; needs at least 25 completed attempts for a baseline.</label>
+    <label class="checkline"><input type="checkbox" name="enable_webcam" {% if profile.webcam_enabled %}checked{% endif %}>
+      <strong>Enable webcam computer-vision proctoring</strong> — explicit camera consent; check approximate number of visible faces using periodic low-resolution stills. No webcam images/video are saved.</label>
+  </div>
+  <p class="mini-meta">Model availability on server: ML {{ 'ready' if dependencies.ml else 'missing dependency' }}; Computer Vision {{ 'ready' if dependencies.cv else 'missing dependency' }}. To install on staging: <code>pip install -r requirements-ai-proctor.txt</code>. Both switches default OFF. Switching after the first attempt is blocked.</p>
+  <p class="mini-meta"><strong>Privacy and fairness:</strong> show students the camera notice, provide an invigilator-supported alternative if camera monitoring is inaccessible or declined, and treat flags as review-only. Neither ML nor face detection can confirm cheating or detect an off-camera mobile phone.</p>
+  <div class="actions"><button>Save security profile</button><a class="btn secondary" href="{{ url_for('exam_integrity_dashboard',exam_id=exam.id) }}">Review integrity events</a></div>
+</fieldset></form>
+</div>
+<div class="card"><h2>Question-bank variation</h2>
+<p>Available pool: <strong>{{ pool_count }}</strong> · Questions per student: <strong>{{ cfg.question_count or pool_count }}</strong>.</p>
+{% if pool_count <= (cfg.question_count or pool_count) %}<p class="mini-meta">All candidates can receive the same question set in a different order. Add more validated questions than the per-student count to obtain different papers.</p>{% else %}<p class="mini-meta">A larger question pool is available; the existing randomized sampling can give students different question subsets. Ensure equivalent difficulty and coverage.</p>{% endif %}
+<p class="mini-meta">Modern macOS/iOS WKWebView SEB variants that send keys via a JavaScript API are not supported by this header-only release. Do not enable protected mode for those clients without further integration testing.</p></div>
+{% endblock %}

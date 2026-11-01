@@ -31,6 +31,30 @@
   let fullscreenEstablished=false;
   let submissionInProgress=false;
   let guard=null;
+  let secureExamFrame=null;
+  let cameraRequestUsed=false;
+  let cameraPermissionGrace=false;
+  let cameraPermissionDeadline=0;
+  let cameraPermissionFullscreenExited=false;
+  const CAMERA_PERMISSION_WINDOW_MS=60000;
+  const cameraPermissionWindow=()=>cameraPermissionGrace && Date.now()<cameraPermissionDeadline;
+  function showCameraReturnGuard(){
+    const overlay=ensureGuard();
+    cameraPermissionFullscreenExited=true;
+    const heading=overlay.querySelector('h2');
+    const message=overlay.querySelector('p');
+    if(heading)heading.textContent='Return to full-screen after camera setup';
+    if(message)message.textContent='Chrome temporarily exited full-screen while requesting webcam permission. This was not counted as an integrity violation. Return to full-screen to continue.';
+    overlay.hidden=false;
+  }
+  function resetGuardExplanation(){
+    if(!guard)return;
+    const heading=guard.querySelector('h2');
+    const message=guard.querySelector('p');
+    if(heading)heading.textContent='Exam paused';
+    if(message)message.textContent='Full-screen mode was exited and the integrity event has been recorded.';
+  }
+
 
   async function refreshPin(){
     try{
@@ -84,6 +108,8 @@
   document.addEventListener('visibilitychange',async()=>{
     if(examFinished || !shellActive || submissionInProgress)return;
     if(!document.hidden)return;
+    // A Chrome-owned camera permission prompt can temporarily change focus.
+    if(cameraPermissionWindow())return;
     const data=await logIntegrity({{ exam.id }},'tab_hidden','Secure exam tab/window became hidden',{navigateOnSubmit:false});
     if(data && data.submitted){showLockedScreen(data.message);}
   });
@@ -92,10 +118,19 @@
     if(examFinished || !shellActive || submissionInProgress)return;
     if(document.fullscreenElement){
       fullscreenEstablished=true;
+      cameraPermissionFullscreenExited=false;
+      resetGuardExplanation();
       if(guard)guard.hidden=true;
       return;
     }
     if(!fullscreenEstablished)return;
+    if(cameraPermissionWindow()){
+      // One bounded, documented camera prompt; the exam stays blocked until
+      // full-screen is restored by an actual user gesture.
+      showCameraReturnGuard();
+      return;
+    }
+    resetGuardExplanation();
     ensureGuard().hidden=false;
     const data=await logIntegrity({{ exam.id }},'fullscreen_exit','Secure exam shell left full-screen',{navigateOnSubmit:false});
     if(data && data.submitted){showLockedScreen(data.message);}
@@ -143,8 +178,10 @@
     shell.setAttribute('aria-hidden','false');
     const frame=document.createElement('iframe');
     frame.className='secure-exam-frame';
+    secureExamFrame=frame;
+    
     frame.setAttribute('title','Exam');
-    frame.setAttribute('allow','fullscreen');
+    frame.setAttribute('allow','fullscreen; camera');
     frame.src=url;
     shell.replaceChildren(frame);
     frame.addEventListener('load',()=>{
@@ -162,6 +199,30 @@
   window.addEventListener('message',event=>{
     if(event.origin!==window.location.origin)return;
     const data=event.data || {};
+    // Only this exam's live iframe can request the camera-permission grace.
+    if(event.source===secureExamFrame?.contentWindow && Number(data.exam_id)==={{ exam.id }} && shellActive && !examFinished){
+      if(data.type==='exam-camera-permission-start'){
+        // Every prompt must be handled; a browser can ask again after a
+        // question navigation or a time-limited permission grant.
+        cameraRequestUsed=true;
+        cameraPermissionGrace=true;
+        cameraPermissionDeadline=Date.now()+CAMERA_PERMISSION_WINDOW_MS;
+        event.source.postMessage({type:'exam-camera-permission-ack',exam_id:{{ exam.id }}},window.location.origin);
+        return;
+      }
+      if(data.type==='exam-camera-permission-end'){
+        // Keep a short race-condition margin for browsers which dispatch
+        // fullscreenchange just after getUserMedia resolves.
+        setTimeout(()=>{cameraPermissionGrace=false;},1500);
+        if(cameraPermissionFullscreenExited && !document.fullscreenElement)showCameraReturnGuard();
+        return;
+      }
+    }
+    if(event.source===secureExamFrame?.contentWindow && data.type==='exam-webcam-preflight-needed' && Number(data.exam_id)==={{ exam.id }}){
+      submissionInProgress=true;shellActive=false;
+      window.location.replace('{{ url_for("v188_webcam_preflight",exam_id=exam.id) }}');
+      return;
+    }
     if(data.type==='secure-exam-submitting' && Number(data.exam_id)==={{ exam.id }}){
       submissionInProgress=true;
       if(guard)guard.hidden=true;
@@ -184,6 +245,9 @@
 
   setInterval(()=>{if(shellActive||examFinished)return;remaining=Math.max(0,remaining-1);countdownEl.textContent=remaining;if(remaining<=0)refreshPin();},1000);
 
+  // Optional preflight deliberately runs BEFORE any fullscreen request.
+  // Chrome can therefore display its real permission UI without triggering
+  // an exam-security fullscreen event. The camera stream is immediately stopped.
   form.addEventListener('submit',async event=>{
     event.preventDefault();
     if(form.dataset.submitting==='1')return;

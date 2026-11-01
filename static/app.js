@@ -220,6 +220,31 @@ async function logIntegrity(examId,eventType,details='',options={}){
 function startIntegrity(examId,requireFullscreen,tabLimit){
   let enteredFullscreen=false;
   let tabEvents=0;
+  // One local permission prompt allowance in manual-fullscreen exams.
+  let cameraPermissionUsed=false;
+  let cameraPermissionUntil=0;
+  let cameraReturnOverlay=null;
+  window.addEventListener('exam-camera-permission-start',()=>{
+    cameraPermissionUsed=true;
+    cameraPermissionUntil=Date.now()+60000;
+  });
+  window.addEventListener('exam-camera-permission-end',()=>{
+    if(cameraPermissionUntil)setTimeout(()=>{cameraPermissionUntil=0;},1500);
+  });
+  const withinCameraPermission=()=>cameraPermissionUntil && Date.now()<cameraPermissionUntil;
+  const showCameraReturn=()=>{
+    if(!cameraReturnOverlay){
+      cameraReturnOverlay=document.createElement('div');
+      cameraReturnOverlay.className='silent-fullscreen-guard';
+      cameraReturnOverlay.innerHTML='<div class="fullscreen-reentry-card"><h2>Return to full-screen</h2><p>Chrome temporarily exited full-screen while requesting webcam permission. This was not counted as a violation.</p><button type="button" class="btn" id="camera-fullscreen-return">Return to Exam</button></div>';
+      document.body.appendChild(cameraReturnOverlay);
+      cameraReturnOverlay.querySelector('button').addEventListener('click',async()=>{
+        try{await document.documentElement.requestFullscreen();}catch(_error){}
+        if(document.fullscreenElement)cameraReturnOverlay.hidden=true;
+      });
+    }
+    cameraReturnOverlay.hidden=false;
+  };
   const banner=document.getElementById('integrity-warning');
   const fullscreenBtn=document.getElementById('fullscreen-btn');
   const examForm=document.getElementById('exam-form');
@@ -238,6 +263,7 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
   if(!insideSecureShell){
     document.addEventListener('visibilitychange',async()=>{
       if(examSubmissionInProgress||examNavigationInProgress)return;
+      if(document.hidden && withinCameraPermission())return;
       if(document.hidden){const data=await logIntegrity(examId,'tab_hidden','Exam tab became hidden');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();}
     });
   }
@@ -248,7 +274,12 @@ function startIntegrity(examId,requireFullscreen,tabLimit){
     });}
     document.addEventListener('fullscreenchange',async()=>{
       if(examSubmissionInProgress||examNavigationInProgress)return;
-      if(document.fullscreenElement){enteredFullscreen=true;if(fullscreenBtn)fullscreenBtn.textContent='Full Screen Active';return;}
+      if(document.fullscreenElement){enteredFullscreen=true;if(cameraReturnOverlay)cameraReturnOverlay.hidden=true;if(fullscreenBtn)fullscreenBtn.textContent='Full Screen Active';return;}
+      if(enteredFullscreen && withinCameraPermission()){
+        showCameraReturn(); // Never leave the exam interactive outside fullscreen.
+        if(fullscreenBtn)fullscreenBtn.textContent='Re-enter Full Screen';
+        return;
+      }
       if(enteredFullscreen){const data=await logIntegrity(examId,'fullscreen_exit','Full-screen mode exited');tabEvents=data&&Number.isFinite(Number(data.count))?Number(data.count):tabEvents+1;updateBanner();if(fullscreenBtn)fullscreenBtn.textContent='Re-enter Full Screen';}
     });
   }
@@ -699,4 +730,3 @@ function startSecureExamFullscreenLock(){
   document.addEventListener('fullscreenchange',sync);
   sync();
 }
-
