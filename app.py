@@ -10203,6 +10203,8 @@ def v188_camera_gate_required(s, exam_id, student_id):
     return not v188_webcam_ready(exam_id,student_id)
 
 
+@app.route('/student/exam/<int:exam_id>/camera-preflight', methods=['GET', 'POST'])
+@student_required
 def v188_webcam_preflight(exam_id):
     s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True));student=s.get(Student,web_session['user_id'])
     if not exam or not student:abort(404)
