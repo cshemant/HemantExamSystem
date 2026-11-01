@@ -3405,7 +3405,7 @@ def security_headers(response):
     # Only camera-enabled exam documents (including the same-origin PIN shell)
     # receive camera permission; the browser still requires student consent.
     camera_proctor_page=False
-    if endpoint in {'take_exam','verify_student_exam_pin'}:
+    if endpoint in {'take_exam','verify_student_exam_pin','v188_webcam_preflight'}:
         target_id=(request.view_args or {}).get('exam_id')
         if target_id:
             _profile=get_exam_security_profile(DB(),int(target_id),False)
