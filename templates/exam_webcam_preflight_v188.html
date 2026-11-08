@@ -9,7 +9,7 @@
   data-submit-url="{{ url_for('v188_webcam_preflight',exam_id=exam.id) }}" data-next-url="{{ next_url }}">
   <h2>{{ exam.title }}</h2>
   <p>This exam requires webcam monitoring. The exam timer will <strong>not start</strong> until camera permission is granted and a test frame is accepted by the examination server.</p>
-  <p class="mini-meta">Camera frames are processed for approximate face detection; raw frames are not stored by this preflight. The system may make mistakes and faculty review alerts. If you cannot use a camera, contact your invigilator for an alternative arrangement.</p>
+  <p class="mini-meta">Frames are checked, not stored. Detection may be imperfect; contact the invigilator if camera access is unavailable.</p>
   <label class="checkline"><input type="checkbox" id="v188-consent"> I understand the webcam notice and agree to use my camera during this exam.</label>
   <div class="actions" style="margin:15px 0">
     <button class="btn" id="v188-test" type="button" disabled>Allow Camera &amp; Test Connection</button>

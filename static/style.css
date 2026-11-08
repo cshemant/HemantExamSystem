@@ -721,3 +721,39 @@ body.secure-exam-running .secure-exam-shell{visibility:visible!important}
 .webcam-exam-questions #exam-form{min-width:0;margin:0}
 .webcam-exam-grid-technical{grid-template-columns:minmax(0,1fr)}
 @media(max-width:820px){.webcam-exam-grid{grid-template-columns:minmax(0,1fr)}.webcam-exam-sidebar #proctor-preview{max-width:220px}}
+
+/* HOME OFFLINE DOWNLOAD RESPONSIVE LAYOUT: BEGIN */
+/* Scoped to the public login/landing page; no exam or admin layout changes. */
+.login-shell .intro-card,
+.login-shell .intro-main,
+.login-shell .offline-download-box,
+.login-shell .offline-download-copy { min-width: 0; }
+.login-shell .offline-download-box {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+.login-shell .offline-download-copy {
+  overflow-wrap: anywhere;
+}
+.login-shell .offline-download-copy strong,
+.login-shell .offline-download-copy span { line-height: 1.45; }
+.login-shell .offline-download-btn {
+  box-sizing: border-box;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
+  line-height: 1.4;
+}
+@media (max-width: 620px) {
+  .login-shell .offline-download-box {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+  .login-shell .offline-download-btn { width: 100%; }
+}
+/* HOME OFFLINE DOWNLOAD RESPONSIVE LAYOUT: END */

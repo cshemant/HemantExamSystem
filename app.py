@@ -8203,6 +8203,133 @@ def exam_security_profile_admin(exam_id):
                            dependencies=ai_proctor_dependencies(),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
 
 
+# V194: Centralized, read-only integrity monitoring. Review signals are not proof of misconduct.
+@app.route('/admin/integrity-monitor')
+@staff_required
+def integrity_monitor_v194():
+    s=DB()
+    permitted_exams=[exam for exam in s.scalars(select(Exam).order_by(Exam.id.desc())).all()
+                     if may_manage_own_exam(s,exam.id,'edit')]
+    permitted_ids={exam.id for exam in permitted_exams}
+    exam_map={exam.id:exam for exam in permitted_exams}
+    raw_exam=(request.args.get('exam_id') or '').strip()
+    if raw_exam:
+        try: selected_exam_id=int(raw_exam)
+        except (TypeError,ValueError):abort(400)
+        if selected_exam_id not in permitted_ids:abort(403)
+        requested_exam_ids=[selected_exam_id]
+    else:
+        selected_exam_id=None
+        requested_exam_ids=list(permitted_ids)
+    state=(request.args.get('state') or 'all').lower()
+    if state not in {'all','active','submitted'}:state='all'
+    signal=(request.args.get('signal') or 'all').lower()
+    if signal not in {'all','review','camera','focus','timing','ml'}:signal='all'
+    query=(request.args.get('q') or '').strip().lower()[:70]
+    attempts=(s.scalars(select(Attempt).where(Attempt.exam_id.in_(requested_exam_ids))
+                        .order_by(Attempt.id.desc()).limit(250)).all() if requested_exam_ids else [])
+    ids=[a.id for a in attempts]
+    sid_map={x.id:x for x in s.scalars(select(Student).where(Student.id.in_({a.student_id for a in attempts}))).all()} if ids else {}
+    heartbeat_map={x.attempt_id:x for x in s.scalars(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id.in_(ids))).all()} if ids else {}
+    summary_map={x.attempt_id:x for x in s.scalars(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id.in_(ids))).all()} if ids else {}
+    flags=s.execute(select(ExamProctorFlag.attempt_id,ExamProctorFlag.alert_type,func.count(ExamProctorFlag.id))
+                    .where(ExamProctorFlag.attempt_id.in_(ids))
+                    .group_by(ExamProctorFlag.attempt_id,ExamProctorFlag.alert_type)).all() if ids else []
+    camera_flags={}
+    for attempt_id,kind,count in flags:
+        camera_flags.setdefault(attempt_id,[]).append((kind,int(count)))
+    events=s.execute(select(IntegrityEvent.attempt_id,IntegrityEvent.event_type,func.count(IntegrityEvent.id))
+                     .where(IntegrityEvent.attempt_id.in_(ids))
+                     .group_by(IntegrityEvent.attempt_id,IntegrityEvent.event_type)).all() if ids else []
+    focus_by_attempt={}
+    other_by_attempt={}
+    for attempt_id,kind,count in events:
+        target=focus_by_attempt if security_event_weight(kind)>0 else other_by_attempt
+        target[attempt_id]=target.get(attempt_id,0)+int(count)
+    telemetry=s.scalars(select(ExamQuestionTelemetry)
+                        .where(ExamQuestionTelemetry.attempt_id.in_(ids))).all() if ids else []
+    time_by_attempt={}
+    for t in telemetry:
+        fast,answered,changes=time_by_attempt.get(t.attempt_id,(0,0,0))
+        changes+=int(t.answer_change_count or 0)
+        if t.first_answer_at and t.first_shown_at:
+            try:
+                delta=(parse_dt(t.first_answer_at)-parse_dt(t.first_shown_at)).total_seconds()
+                if delta>=0:
+                    answered+=1
+                    if delta<3:fast+=1
+            except (ValueError,TypeError,OverflowError):pass
+        time_by_attempt[t.attempt_id]=(fast,answered,changes)
+    profiles={p.exam_id:p for p in s.scalars(select(ExamSecurityProfile)
+              .where(ExamSecurityProfile.exam_id.in_(requested_exam_ids))).all()} if requested_exam_ids else {}
+    rows=[]; ml_exam_vectors={}
+    for attempt in attempts:
+        student=sid_map.get(attempt.student_id)
+        hb=heartbeat_map.get(attempt.id)
+        heartbeat=heartbeat_status(hb.last_seen_at if hb else '')
+        running=(attempt.status=='in_progress' and heartbeat=='online')
+        camera=summary_map.get(attempt.id)
+        camera_events=camera_flags.get(attempt.id,[])
+        camera_count=sum(c for _,c in camera_events)
+        camera_error=int(camera.camera_error_count or 0) if camera else 0
+        focus=focus_by_attempt.get(attempt.id,0)
+        fast,answered,changes=time_by_attempt.get(attempt.id,(0,0,0))
+        webcam_on=bool(profiles.get(attempt.exam_id) and profiles[attempt.exam_id].webcam_enabled)
+        camera_problem=bool(webcam_on and (camera_count>0 or camera_error>0 or
+            (camera and camera.multiple_face_count>0) or
+            (camera and camera.sample_count>=3 and camera.no_face_count==camera.sample_count)))
+        row={'attempt':attempt,'exam':exam_map[attempt.exam_id],'student':student,
+             'running':running,'heartbeat':heartbeat,'camera':camera,'camera_problem':camera_problem,
+             'camera_events':camera_events,'camera_count':camera_count,'camera_error':camera_error,
+             'focus':focus,'fast':fast,'answered':answered,'changes':changes,
+             'ml':'Off' if not (profiles.get(attempt.exam_id) and profiles[attempt.exam_id].ml_enabled) else 'Insufficient data'}
+        rows.append(row)
+        if (attempt.status=='submitted' and profiles.get(attempt.exam_id)
+                and profiles[attempt.exam_id].ml_enabled):
+            vector=[fast/max(1,answered),min(focus,20),min(other_by_attempt.get(attempt.id,0),20),
+                    changes/max(1,answered),
+                    camera.no_face_count/max(1,camera.sample_count) if camera and webcam_on else 0,
+                    camera.multiple_face_count/max(1,camera.sample_count) if camera and webcam_on else 0]
+            ml_exam_vectors.setdefault(attempt.exam_id,[]).append((row,vector))
+    for exam_id,group in ml_exam_vectors.items():
+        outcomes=score_exam_outliers([vector for _,vector in group])
+        for (row,_),outcome in zip(group,outcomes):row['ml']=outcome
+    for row in rows:
+        row['timing_review']=bool(row['answered']>=3 and row['fast']>=3)
+        row['review']=bool(row['camera_problem'] or row['focus']>0 or row['ml']=='Review'
+                           or row['timing_review'])
+        row['signals']=[]
+        if row['camera_problem']:row['signals'].append('Camera')
+        if row['focus']:row['signals'].append('Focus')
+        if row['timing_review']:row['signals'].append('Timing')
+        if row['ml']=='Review':row['signals'].append('ML')
+    all_recent=len(rows)
+    active_count=sum(1 for row in rows if row['running'])
+    review_count=sum(1 for row in rows if row['review'])
+    camera_count=sum(1 for row in rows if row['camera_problem'])
+    if state=='active':rows=[row for row in rows if row['running']]
+    elif state=='submitted':rows=[row for row in rows if row['attempt'].status=='submitted']
+    if signal=='review':rows=[row for row in rows if row['review']]
+    elif signal=='camera':rows=[row for row in rows if row['camera_problem']]
+    elif signal=='focus':rows=[row for row in rows if row['focus']>0]
+    elif signal=='timing':rows=[row for row in rows if row['timing_review']]
+    elif signal=='ml':rows=[row for row in rows if row['ml']=='Review']
+    if query:
+        rows=[row for row in rows if query in str(row['student'].roll_no if row['student'] else '').lower()
+              or query in str(row['student'].name if row['student'] else '').lower()
+              or query in row['exam'].title.lower()]
+    context={'rows':rows,'active_count':active_count,'review_count':review_count,
+             'camera_count':camera_count,'recent_count':all_recent,
+             'refreshed_at':now_dt().strftime('%H:%M:%S')}
+    if request.args.get('fragment')=='1':
+        response=app.make_response(render_template('_integrity_monitor_live_v194.html',**context))
+    else:
+        response=app.make_response(render_template('integrity_monitor_v194.html',exams=permitted_exams,
+                                               selected_exam_id=selected_exam_id,state=state,
+                                               signal=signal,query=query,**context))
+    response.headers['Cache-Control']='private, no-store'
+    return response
+
 @app.route('/admin/exam/<int:exam_id>/integrity-dashboard')
 @staff_required
 def exam_integrity_dashboard(exam_id):
