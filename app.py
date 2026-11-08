@@ -8537,7 +8537,7 @@ def admin_stop_attempt_video(attempt_id):
 def admin_download_attempt_video(attempt_id,clip_id):
     s=DB();attempt=_exam_recording_access(s,attempt_id)
     row=s.get(ExamVideoRecording,clip_id)
-    if not row or row.attempt_id!=attempt.id or row.status!='saved':abort(404)
+    if not row or row.attempt_id!=attempt.id or row.status not in {'saved','interrupted'}:abort(404)
     root=_exam_video_storage_root()
     if root is None:abort(503)
     path=_exam_video_path(row,root)
@@ -8665,12 +8665,40 @@ def student_proctor_video_finish():
     s.commit();return jsonify(saved=row.status=='saved',status=row.status)
 
 
+def _reconcile_exam_video_records(s, exam_id):
+    """Resolve abandoned stop requests; never mislabel unfinalized video as saved."""
+    clips=s.scalars(select(ExamVideoRecording).join(Attempt,Attempt.id==ExamVideoRecording.attempt_id)
+                    .where(Attempt.exam_id==exam_id,
+                           ExamVideoRecording.status.in_(['requested','recording','stopping']))).all()
+    changed=False
+    for clip in clips:
+        attempt=s.get(Attempt,clip.attempt_id)
+        if not attempt:continue
+        # Give the client enough time to upload its final chunk after Stop/Submit.
+        stalled=clip.status=='stopping' or attempt.status=='submitted'
+        if not stalled:continue
+        timestamp=(clip.stopped_at if clip.status=='stopping' else attempt.submitted_at) or clip.requested_at
+        try:
+            if (now_dt()-parse_dt(timestamp)).total_seconds()<90:continue
+        except (ValueError,TypeError):continue
+        root=_exam_video_storage_root()
+        path=_exam_video_path(clip,root) if root else None
+        has_data=bool(path and path.is_file() and path.stat().st_size>0 and clip.byte_count>0)
+        clip.status='interrupted' if has_data else 'failed'
+        clip.stopped_at=now_iso()
+        audit_event(s,'exam_video_recording_unfinished','attempt',attempt.id,
+                    f'clip={clip.id}; status={clip.status}; bytes={clip.byte_count}')
+        changed=True
+    if changed:s.commit()
+
+
 @app.route('/admin/exam/<int:exam_id>/integrity-dashboard')
 @staff_required
 def exam_integrity_dashboard(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
     if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    _reconcile_exam_video_records(s,exam_id)
     attempts=s.scalars(select(Attempt).where(Attempt.exam_id==exam_id).order_by(Attempt.id.desc()).limit(200)).all()
     rows=[]
     for attempt in attempts:
@@ -8714,11 +8742,17 @@ def exam_integrity_dashboard(exam_id):
     if ml_enabled:
         results=score_exam_outliers(vectors)
         for index,signal in zip(completed_indices,results):rows[index]['ml_signal']=signal
-    recording_map={}
+    recording_map={}; clips_by_attempt={}
+    root=_exam_video_storage_root()
     if ids:
         for clip in s.scalars(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id.in_(ids)).order_by(ExamVideoRecording.id.desc())).all():
             recording_map.setdefault(clip.attempt_id,clip)
-    for row in rows:row['video_recording']=recording_map.get(row['attempt'].id)
+            if clip.status in {'saved','interrupted'}:
+                exists=bool(root and _exam_video_path(clip,root).is_file())
+                clips_by_attempt.setdefault(clip.attempt_id,[]).append((clip,exists))
+    for row in rows:
+        row['video_recording']=recording_map.get(row['attempt'].id)
+        row['video_clips']=clips_by_attempt.get(row['attempt'].id,[])
     return render_template('exam_integrity_dashboard.html',exam=exam,rows=rows,
                            recording_enabled=bool(profile and profile.recording_enabled),
                            bulk_recording_enabled=bool(profile and profile.bulk_recording_enabled),

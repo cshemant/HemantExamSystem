@@ -15,6 +15,11 @@ function beginExamSubmission(examId,reason='MANUAL'){
 function isExamSubmissionInProgress(){return examSubmissionInProgress===true;}
 
 async function submitExamToServer(form,examId,reason){
+  // Finalize video before the form navigates away; never block exam submission forever.
+  examSubmissionInProgress=true;
+  if(typeof window.__finishExamRecording==='function'){
+    try{await window.__finishExamRecording(reason==='TIME_EXPIRED'?6000:10000);}catch(_err){}
+  }
   let reasonInput=form.querySelector('input[name="submission_reason"]');
   if(!reasonInput){
     reasonInput=document.createElement('input');
@@ -165,10 +170,13 @@ function startSectionTimer(endEpoch,serverNowEpoch,expiryUrl){
         const examId=Number(form.getAttribute('data-exam-integrity')||0);
         fetch(expiryUrl,{method:'POST',body:new FormData(form),credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest','Accept':'application/json'},cache:'no-store'})
           .then(async response=>({response,payload:await response.json().catch(()=>null)}))
-          .then(({response,payload})=>{
+          .then(async ({response,payload})=>{
             if(!response.ok||!payload)throw new Error('Section expiry response failed');
             if(payload.submitted&&payload.submitted_url){
               examSubmissionInProgress=true;
+              if(typeof window.__finishExamRecording==='function'){
+                try{await window.__finishExamRecording(6000);}catch(_err){}
+              }
               if(window.parent!==window){
                 window.parent.postMessage({type:'secure-exam-submitting',exam_id:examId,reason:'TIME_EXPIRED'},window.location.origin);
                 window.parent.postMessage({type:'secure-exam-submitted',exam_id:examId,url:payload.submitted_url},window.location.origin);
@@ -178,7 +186,7 @@ function startSectionTimer(endEpoch,serverNowEpoch,expiryUrl){
             }
             if(payload.exam_url)window.location.replace(payload.exam_url);
           })
-          .catch(()=>{form.action=expiryUrl;form.method='post';form.submit();});
+          .catch(async()=>{if(typeof window.__finishExamRecording==='function'){try{await window.__finishExamRecording(4000);}catch(_){}}form.action=expiryUrl;form.method='post';form.submit();});
       }
     }
   };

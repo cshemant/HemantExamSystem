@@ -11,6 +11,7 @@ const retry=document.getElementById('v189-camera-retry'), legacyRetry=document.g
 const lock=document.getElementById('v189-camera-lock'), lockMsg=document.getElementById('v189-camera-lock-msg');
 let stream=null,interval=null,lastOk=0,starting=false,uploading=false,ended=false;
 let recordingPoll=null, recorder=null, recordingId=null, recordingIndex=0, chunkQueue=Promise.resolve(), recordingError=false;
+let recordingFinishPending=null, endingExamRecording=false;
 const csrf=()=>document.querySelector('meta[name="csrf-token"]')?.content||'';
 const message=s=>{status.textContent=s;if(lockMsg)lockMsg.textContent=s;};
 const block=s=>{if(lock)lock.style.display='flex';if(s)message(s);};
@@ -42,12 +43,15 @@ async function uploadRecordedChunk(blob,clipId,index){
  if(!response.ok)throw Error(`Recording upload failed: ${response.status}`);
 }
 function stopRecording(){
- if(!recorder)return;
+ if(!recorder)return recordingFinishPending || Promise.resolve(true);
  const active=recorder;recorder=null;
- if(active.state!=='inactive')active.stop();
+ if(active.state!=='inactive'){
+  try{active.stop();}catch(_){recordingError=true;}
+ }
+ return recordingFinishPending || Promise.resolve(false);
 }
 function startRecording(clipId){
- if(ended||!cameraLive()||recorder||typeof MediaRecorder==='undefined')return;
+ if(ended||endingExamRecording||!cameraLive()||recorder||recordingFinishPending||typeof MediaRecorder==='undefined')return;
  const mime=['video/webm;codecs=vp8','video/webm'].find(type=>MediaRecorder.isTypeSupported(type));
  if(!mime){videoNotice('Video capture unavailable on this browser · notify invigilator');return;}
  recordingId=clipId;recordingIndex=0;recordingError=false;chunkQueue=Promise.resolve();
@@ -55,6 +59,9 @@ function startRecording(clipId){
  try{active=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:280000});}
  catch(e){videoNotice('Video recording could not start · notify invigilator');return;}
  recorder=active;
+ let done;
+ const finalizing=new Promise(resolve=>{done=resolve;});
+ recordingFinishPending=finalizing;
  active.addEventListener('dataavailable',event=>{
    if(!event.data||!event.data.size)return;
    const index=recordingIndex++;
@@ -65,14 +72,24 @@ function startRecording(clipId){
  });
  active.addEventListener('stop',()=>{
    chunkQueue.then(()=>post(recordingFinishUrl,{recording_id:clipId,client_ok:!recordingError}))
-    .catch(()=>{videoNotice('Video recording upload incomplete · notify invigilator');});
+    .then(result=>{
+      if(result.saved)videoNotice('Video recording stopped · clip saved for faculty review');
+      else videoNotice('Video recording incomplete · notify invigilator');
+      done(result.saved===true);
+    })
+    .catch(()=>{
+      videoNotice('Video recording upload incomplete · notify invigilator');
+      done(false);
+    }).finally(()=>{
+      if(recordingFinishPending===finalizing)recordingFinishPending=null;
+    });
  });
  active.start(8000);  // uploads bounded WebM chunks; the existing camera track stays live
  videoNotice('● Video recording in progress · faculty enabled');
 }
 let recordingStatusPending=false;
 async function checkRecordingRequest(){
- if(ended||recordingStatusPending||!recordingControlUrl||!cameraLive())return;
+ if(ended||endingExamRecording||recordingStatusPending||!recordingControlUrl||!cameraLive())return;
  recordingStatusPending=true;
  try{
   const url=new URL(recordingControlUrl,location.origin);url.searchParams.set('exam_id',String(id));
@@ -80,12 +97,13 @@ async function checkRecordingRequest(){
   if(!response.ok)throw Error('Recording control unavailable');
   const state=await response.json();
   if(state.record&&state.recording_id&&(!recorder||recordingId!==state.recording_id)){
-   if(recorder)stopRecording();
-   startRecording(state.recording_id);
+   if(recorder)await stopRecording();
+   else if(recordingFinishPending)await recordingFinishPending;
+   if(!endingExamRecording)startRecording(state.recording_id);
   }else if(!state.record&&recorder){
    stopRecording();
    videoNotice('Video recording stopped · saving clip');
-  }else if(!state.record&&!recorder){
+  }else if(!state.record&&!recorder&&!recordingFinishPending){
    videoNotice(state.recording_status==='saved'?'Video recording stopped · clip retained for faculty review':'Camera required · Face-count checks · No video stored');
   }
  }catch(e){
@@ -93,6 +111,19 @@ async function checkRecordingRequest(){
   if(!recorder)videoNotice('Camera required · Face-count checks · Recording status unavailable');
  }finally{recordingStatusPending=false;}
 }
+// Called by the existing exam submission code BEFORE leaving the exam page.
+// Preserve the current MediaStream; finish uploading the final MediaRecorder data.
+window.__finishExamRecording=async (timeoutMs=10000)=>{
+ endingExamRecording=true;
+ if(recordingPoll){clearInterval(recordingPoll);recordingPoll=null;}
+ if(!recorder && !recordingFinishPending)return true;
+ const pending=stopRecording();
+ return Promise.race([
+  pending,
+  new Promise(resolve=>setTimeout(()=>resolve(false),Math.max(1000,timeoutMs)))
+ ]);
+};
+
 function scheduleRecordingControl(){
  if(recordingPoll)clearInterval(recordingPoll);
  recordingPoll=setInterval(()=>{void checkRecordingRequest();},6000);
