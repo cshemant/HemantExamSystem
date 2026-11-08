@@ -1,13 +1,16 @@
 /* V189 – strict webcam and verified samples. Frame analysis is server-side.
- * No frame persistence. Do not trust a browser-only flag for enforcement. */
+ * Periodic frame checks are not saved. Faculty may request clearly notified video clips. */
 (()=>{
 'use strict';
 const panel=document.getElementById('webcam-proctor-panel');if(!panel)return;
 const id=Number(panel.dataset.examId), frameUrl=panel.dataset.frameUrl, statusUrl=panel.dataset.statusUrl, leaseUrl=panel.dataset.leaseUrl, nextUrl=panel.dataset.nextUrl;
+const recordingControlUrl=panel.dataset.recordControlUrl, recordingChunkUrl=panel.dataset.recordChunkUrl, recordingFinishUrl=panel.dataset.recordFinishUrl;
+const recordingNotice=document.getElementById('webcam-video-notice');
 const video=document.getElementById('proctor-preview'), status=document.getElementById('proctor-status');
 const retry=document.getElementById('v189-camera-retry'), legacyRetry=document.getElementById('proctor-start');
 const lock=document.getElementById('v189-camera-lock'), lockMsg=document.getElementById('v189-camera-lock-msg');
 let stream=null,interval=null,lastOk=0,starting=false,uploading=false,ended=false;
+let recordingPoll=null, recorder=null, recordingId=null, recordingIndex=0, chunkQueue=Promise.resolve(), recordingError=false;
 const csrf=()=>document.querySelector('meta[name="csrf-token"]')?.content||'';
 const message=s=>{status.textContent=s;if(lockMsg)lockMsg.textContent=s;};
 const block=s=>{if(lock)lock.style.display='flex';if(s)message(s);};
@@ -18,7 +21,84 @@ async function post(url,payload){
 }
 async function verifiedLease(){try{const r=await fetch(leaseUrl,{credentials:'same-origin',cache:'no-store'});const data=await r.json();return r.ok&&data.ready===true;}catch(_){return false;}}
 function cameraLive(){return !!(stream&&stream.getVideoTracks()[0]&&stream.getVideoTracks()[0].readyState==='live'&&video.videoWidth>=64);}
-function stop(){ended=true;if(interval){clearInterval(interval);interval=null;}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}video.srcObject=null;}
+function videoNotice(text){
+ if(!recordingNotice)return;
+ recordingNotice.textContent=text;
+ const active=text.startsWith('● Video recording');
+ recordingNotice.style.color=active?'#b91c1c':'';
+ recordingNotice.style.fontWeight=active?'700':'';
+}
+function stop(){
+ ended=true;
+ if(interval){clearInterval(interval);interval=null;}
+ if(recordingPoll){clearInterval(recordingPoll);recordingPoll=null;}
+ stopRecording();
+ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+ video.srcObject=null;
+}
+async function uploadRecordedChunk(blob,clipId,index){
+ const form=new FormData();form.append('exam_id',String(id));form.append('recording_id',String(clipId));form.append('index',String(index));form.append('chunk',blob,'segment.webm');
+ const response=await fetch(recordingChunkUrl,{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'X-CSRF-Token':csrf()},body:form});
+ if(!response.ok)throw Error(`Recording upload failed: ${response.status}`);
+}
+function stopRecording(){
+ if(!recorder)return;
+ const active=recorder;recorder=null;
+ if(active.state!=='inactive')active.stop();
+}
+function startRecording(clipId){
+ if(ended||!cameraLive()||recorder||typeof MediaRecorder==='undefined')return;
+ const mime=['video/webm;codecs=vp8','video/webm'].find(type=>MediaRecorder.isTypeSupported(type));
+ if(!mime){videoNotice('Video capture unavailable on this browser · notify invigilator');return;}
+ recordingId=clipId;recordingIndex=0;recordingError=false;chunkQueue=Promise.resolve();
+ let active;
+ try{active=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:280000});}
+ catch(e){videoNotice('Video recording could not start · notify invigilator');return;}
+ recorder=active;
+ active.addEventListener('dataavailable',event=>{
+   if(!event.data||!event.data.size)return;
+   const index=recordingIndex++;
+   chunkQueue=chunkQueue.then(()=>uploadRecordedChunk(event.data,clipId,index)).catch(()=>{
+     recordingError=true;
+     videoNotice('Video upload interrupted · notify invigilator');
+   });
+ });
+ active.addEventListener('stop',()=>{
+   chunkQueue.then(()=>post(recordingFinishUrl,{recording_id:clipId,client_ok:!recordingError}))
+    .catch(()=>{videoNotice('Video recording upload incomplete · notify invigilator');});
+ });
+ active.start(8000);  // uploads bounded WebM chunks; the existing camera track stays live
+ videoNotice('● Video recording in progress · faculty enabled');
+}
+let recordingStatusPending=false;
+async function checkRecordingRequest(){
+ if(ended||recordingStatusPending||!recordingControlUrl||!cameraLive())return;
+ recordingStatusPending=true;
+ try{
+  const url=new URL(recordingControlUrl,location.origin);url.searchParams.set('exam_id',String(id));
+  const response=await fetch(url,{cache:'no-store',credentials:'same-origin'});
+  if(!response.ok)throw Error('Recording control unavailable');
+  const state=await response.json();
+  if(state.record&&state.recording_id&&(!recorder||recordingId!==state.recording_id)){
+   if(recorder)stopRecording();
+   startRecording(state.recording_id);
+  }else if(!state.record&&recorder){
+   stopRecording();
+   videoNotice('Video recording stopped · saving clip');
+  }else if(!state.record&&!recorder){
+   videoNotice(state.recording_status==='saved'?'Video recording stopped · clip retained for faculty review':'Camera required · Face-count checks · No video stored');
+  }
+ }catch(e){
+  // Network interruptions do not turn video recording on; preserve local capture state.
+  if(!recorder)videoNotice('Camera required · Face-count checks · Recording status unavailable');
+ }finally{recordingStatusPending=false;}
+}
+function scheduleRecordingControl(){
+ if(recordingPoll)clearInterval(recordingPoll);
+ recordingPoll=setInterval(()=>{void checkRecordingRequest();},6000);
+ void checkRecordingRequest();
+}
+
 async function report(name){try{await post(statusUrl,{status:name});}catch(_){}}
 async function frame(){
  if(ended)return false;
@@ -76,12 +156,12 @@ async function start(){
   try{stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{width:{ideal:320},height:{ideal:240},facingMode:'user'}});}
   finally{permissionEnd();}
   const track=stream.getVideoTracks()[0];if(!track||track.readyState!=='live')throw Error('Camera unavailable');
-  track.addEventListener('ended',()=>{if(ended)return;block('Webcam disconnected. Click Retry Camera.');void report('camera_interrupted');});
+  track.addEventListener('ended',()=>{if(ended)return;stopRecording();block('Webcam disconnected. Click Retry Camera.');void report('camera_interrupted');});
   video.srcObject=stream;video.style.display='block';await video.play();
   for(let n=0;n<40&&!cameraLive();n++)await new Promise(r=>setTimeout(r,100));
   if(!cameraLive())throw Error('Camera preview unavailable');
   if(!await frame())throw Error('Server rejected the camera sample');
-  scheduleSamples();
+  scheduleSamples();scheduleRecordingControl();
  }catch(e){block(e.message||'Camera unavailable. Ask invigilator for assistance.');void report(e.name==='NotAllowedError'?'permission_denied':'camera_unavailable');}
  finally{starting=false;}
 }

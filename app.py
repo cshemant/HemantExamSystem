@@ -57,6 +57,12 @@ INTEGRATION_API_KEY=os.getenv('INTEGRATION_API_KEY','').strip()
 EXAM_PACKAGE_SIGNING_KEY=os.getenv('EXAM_PACKAGE_SIGNING_KEY','').strip()
 # Per-attempt photographic leak deterrent; not an anti-OCR guarantee.
 EXAM_SEB_EXTERNAL_ORIGIN=(os.getenv('EXAM_SEB_EXTERNAL_ORIGIN','').strip()).rstrip('/')
+# Optional faculty-controlled video clips: writable, private storage is required.
+# For Render, EXAM_RECORDING_DIR must point to durable storage; the free filesystem is ephemeral.
+EXAM_RECORDING_DIR=(os.getenv('EXAM_RECORDING_DIR') or (str(Path.home()/'LearnWithHemantExamRecordings') if APP_MODE=='offline' else '')).strip()
+EXAM_RECORDING_MAX_BYTES=30*1024*1024
+EXAM_RECORDING_MAX_SECONDS=600
+
 EXAM_VISUAL_PROTECTION_MODE=os.getenv('EXAM_VISUAL_PROTECTION_MODE','watermark').strip().lower()
 if EXAM_VISUAL_PROTECTION_MODE not in {'off','watermark','watermark_noise'}:
     EXAM_VISUAL_PROTECTION_MODE='watermark'
@@ -798,6 +804,20 @@ class ExamProctorSummary(Base):
     consecutive_multiple_face:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     last_sample_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     last_camera_error_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+
+class ExamVideoRecording(Base):
+    """Opt-in faculty-requested video clip. Content lives outside public static files."""
+    __tablename__='exam_video_recordings'
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    attempt_id:Mapped[int]=mapped_column(ForeignKey('attempts.id'),nullable=False,index=True)
+    status:Mapped[str]=mapped_column(String(20),nullable=False,default='requested')
+    requested_by:Mapped[str]=mapped_column(String(120),nullable=False,default='')
+    requested_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    started_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    stopped_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    mime_type:Mapped[str]=mapped_column(String(48),nullable=False,default='video/webm')
+    byte_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    last_chunk:Mapped[int]=mapped_column(Integer,nullable=False,default=-1)
 
 class ExamProctorFlag(Base):
     """Review-only camera alerts; no biometric identifiers or images."""
@@ -3405,7 +3425,7 @@ def security_headers(response):
     # Only camera-enabled exam documents (including the same-origin PIN shell)
     # receive camera permission; the browser still requires student consent.
     camera_proctor_page=False
-    if endpoint in {'take_exam','verify_student_exam_pin','v188_webcam_preflight'}:
+    if endpoint in {'take_exam','verify_student_exam_pin'}:
         target_id=(request.view_args or {}).get('exam_id')
         if target_id:
             _profile=get_exam_security_profile(DB(),int(target_id),False)
@@ -8203,132 +8223,182 @@ def exam_security_profile_admin(exam_id):
                            dependencies=ai_proctor_dependencies(),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
 
 
-# V194: Centralized, read-only integrity monitoring. Review signals are not proof of misconduct.
-@app.route('/admin/integrity-monitor')
+def _exam_video_storage_root():
+    if not EXAM_RECORDING_DIR:
+        return None
+    root=Path(EXAM_RECORDING_DIR).expanduser().resolve()
+    # Avoid accidentally exposing video by storing it within publicly served static files.
+    if Path(RESOURCE_DIR).resolve()==root or Path(RESOURCE_DIR).resolve() in root.parents:
+        return None
+    try:
+        root.mkdir(mode=0o700,parents=True,exist_ok=True)
+    except OSError:
+        return None
+    return root
+
+
+def _exam_video_path(recording, root):
+    return root / f'attempt-{recording.attempt_id}-clip-{recording.id}.webm'
+
+
+def _exam_recording_access(s, attempt_id):
+    attempt=s.get(Attempt,attempt_id)
+    if not attempt or not may_manage_own_exam(s,attempt.exam_id,'edit'):
+        abort(403)
+    profile=get_exam_security_profile(s,attempt.exam_id,False)
+    if not profile or not profile.webcam_enabled:abort(404)
+    return attempt
+
+
+@app.route('/admin/attempt/<int:attempt_id>/video/start',methods=['POST'])
 @staff_required
-def integrity_monitor_v194():
-    s=DB()
-    permitted_exams=[exam for exam in s.scalars(select(Exam).order_by(Exam.id.desc())).all()
-                     if may_manage_own_exam(s,exam.id,'edit')]
-    permitted_ids={exam.id for exam in permitted_exams}
-    exam_map={exam.id:exam for exam in permitted_exams}
-    raw_exam=(request.args.get('exam_id') or '').strip()
-    if raw_exam:
-        try: selected_exam_id=int(raw_exam)
-        except (TypeError,ValueError):abort(400)
-        if selected_exam_id not in permitted_ids:abort(403)
-        requested_exam_ids=[selected_exam_id]
-    else:
-        selected_exam_id=None
-        requested_exam_ids=list(permitted_ids)
-    state=(request.args.get('state') or 'all').lower()
-    if state not in {'all','active','submitted'}:state='all'
-    signal=(request.args.get('signal') or 'all').lower()
-    if signal not in {'all','review','camera','focus','timing','ml'}:signal='all'
-    query=(request.args.get('q') or '').strip().lower()[:70]
-    attempts=(s.scalars(select(Attempt).where(Attempt.exam_id.in_(requested_exam_ids))
-                        .order_by(Attempt.id.desc()).limit(250)).all() if requested_exam_ids else [])
-    ids=[a.id for a in attempts]
-    sid_map={x.id:x for x in s.scalars(select(Student).where(Student.id.in_({a.student_id for a in attempts}))).all()} if ids else {}
-    heartbeat_map={x.attempt_id:x for x in s.scalars(select(AttemptHeartbeat).where(AttemptHeartbeat.attempt_id.in_(ids))).all()} if ids else {}
-    summary_map={x.attempt_id:x for x in s.scalars(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id.in_(ids))).all()} if ids else {}
-    flags=s.execute(select(ExamProctorFlag.attempt_id,ExamProctorFlag.alert_type,func.count(ExamProctorFlag.id))
-                    .where(ExamProctorFlag.attempt_id.in_(ids))
-                    .group_by(ExamProctorFlag.attempt_id,ExamProctorFlag.alert_type)).all() if ids else []
-    camera_flags={}
-    for attempt_id,kind,count in flags:
-        camera_flags.setdefault(attempt_id,[]).append((kind,int(count)))
-    events=s.execute(select(IntegrityEvent.attempt_id,IntegrityEvent.event_type,func.count(IntegrityEvent.id))
-                     .where(IntegrityEvent.attempt_id.in_(ids))
-                     .group_by(IntegrityEvent.attempt_id,IntegrityEvent.event_type)).all() if ids else []
-    focus_by_attempt={}
-    other_by_attempt={}
-    for attempt_id,kind,count in events:
-        target=focus_by_attempt if security_event_weight(kind)>0 else other_by_attempt
-        target[attempt_id]=target.get(attempt_id,0)+int(count)
-    telemetry=s.scalars(select(ExamQuestionTelemetry)
-                        .where(ExamQuestionTelemetry.attempt_id.in_(ids))).all() if ids else []
-    time_by_attempt={}
-    for t in telemetry:
-        fast,answered,changes=time_by_attempt.get(t.attempt_id,(0,0,0))
-        changes+=int(t.answer_change_count or 0)
-        if t.first_answer_at and t.first_shown_at:
-            try:
-                delta=(parse_dt(t.first_answer_at)-parse_dt(t.first_shown_at)).total_seconds()
-                if delta>=0:
-                    answered+=1
-                    if delta<3:fast+=1
-            except (ValueError,TypeError,OverflowError):pass
-        time_by_attempt[t.attempt_id]=(fast,answered,changes)
-    profiles={p.exam_id:p for p in s.scalars(select(ExamSecurityProfile)
-              .where(ExamSecurityProfile.exam_id.in_(requested_exam_ids))).all()} if requested_exam_ids else {}
-    rows=[]; ml_exam_vectors={}
-    for attempt in attempts:
-        student=sid_map.get(attempt.student_id)
-        hb=heartbeat_map.get(attempt.id)
-        heartbeat=heartbeat_status(hb.last_seen_at if hb else '')
-        running=(attempt.status=='in_progress' and heartbeat=='online')
-        camera=summary_map.get(attempt.id)
-        camera_events=camera_flags.get(attempt.id,[])
-        camera_count=sum(c for _,c in camera_events)
-        camera_error=int(camera.camera_error_count or 0) if camera else 0
-        focus=focus_by_attempt.get(attempt.id,0)
-        fast,answered,changes=time_by_attempt.get(attempt.id,(0,0,0))
-        webcam_on=bool(profiles.get(attempt.exam_id) and profiles[attempt.exam_id].webcam_enabled)
-        camera_problem=bool(webcam_on and (camera_count>0 or camera_error>0 or
-            (camera and camera.multiple_face_count>0) or
-            (camera and camera.sample_count>=3 and camera.no_face_count==camera.sample_count)))
-        row={'attempt':attempt,'exam':exam_map[attempt.exam_id],'student':student,
-             'running':running,'heartbeat':heartbeat,'camera':camera,'camera_problem':camera_problem,
-             'camera_events':camera_events,'camera_count':camera_count,'camera_error':camera_error,
-             'focus':focus,'fast':fast,'answered':answered,'changes':changes,
-             'ml':'Off' if not (profiles.get(attempt.exam_id) and profiles[attempt.exam_id].ml_enabled) else 'Insufficient data'}
-        rows.append(row)
-        if (attempt.status=='submitted' and profiles.get(attempt.exam_id)
-                and profiles[attempt.exam_id].ml_enabled):
-            vector=[fast/max(1,answered),min(focus,20),min(other_by_attempt.get(attempt.id,0),20),
-                    changes/max(1,answered),
-                    camera.no_face_count/max(1,camera.sample_count) if camera and webcam_on else 0,
-                    camera.multiple_face_count/max(1,camera.sample_count) if camera and webcam_on else 0]
-            ml_exam_vectors.setdefault(attempt.exam_id,[]).append((row,vector))
-    for exam_id,group in ml_exam_vectors.items():
-        outcomes=score_exam_outliers([vector for _,vector in group])
-        for (row,_),outcome in zip(group,outcomes):row['ml']=outcome
-    for row in rows:
-        row['timing_review']=bool(row['answered']>=3 and row['fast']>=3)
-        row['review']=bool(row['camera_problem'] or row['focus']>0 or row['ml']=='Review'
-                           or row['timing_review'])
-        row['signals']=[]
-        if row['camera_problem']:row['signals'].append('Camera')
-        if row['focus']:row['signals'].append('Focus')
-        if row['timing_review']:row['signals'].append('Timing')
-        if row['ml']=='Review':row['signals'].append('ML')
-    all_recent=len(rows)
-    active_count=sum(1 for row in rows if row['running'])
-    review_count=sum(1 for row in rows if row['review'])
-    camera_count=sum(1 for row in rows if row['camera_problem'])
-    if state=='active':rows=[row for row in rows if row['running']]
-    elif state=='submitted':rows=[row for row in rows if row['attempt'].status=='submitted']
-    if signal=='review':rows=[row for row in rows if row['review']]
-    elif signal=='camera':rows=[row for row in rows if row['camera_problem']]
-    elif signal=='focus':rows=[row for row in rows if row['focus']>0]
-    elif signal=='timing':rows=[row for row in rows if row['timing_review']]
-    elif signal=='ml':rows=[row for row in rows if row['ml']=='Review']
-    if query:
-        rows=[row for row in rows if query in str(row['student'].roll_no if row['student'] else '').lower()
-              or query in str(row['student'].name if row['student'] else '').lower()
-              or query in row['exam'].title.lower()]
-    context={'rows':rows,'active_count':active_count,'review_count':review_count,
-             'camera_count':camera_count,'recent_count':all_recent,
-             'refreshed_at':now_dt().strftime('%H:%M:%S')}
-    if request.args.get('fragment')=='1':
-        response=app.make_response(render_template('_integrity_monitor_live_v194.html',**context))
-    else:
-        response=app.make_response(render_template('integrity_monitor_v194.html',exams=permitted_exams,
-                                               selected_exam_id=selected_exam_id,state=state,
-                                               signal=signal,query=query,**context))
+def admin_start_attempt_video(attempt_id):
+    s=DB();attempt=_exam_recording_access(s,attempt_id)
+    root=_exam_video_storage_root()
+    if root is None:
+        flash('Video storage is not configured. Set EXAM_RECORDING_DIR to a private persistent directory.','error')
+        return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+    if attempt.status!='in_progress' or now_dt()>=parse_dt(attempt.end_at):
+        flash('Recording is available only while the student is taking the exam.','error')
+        return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+    latest=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id).order_by(ExamVideoRecording.id.desc()).limit(1))
+    if latest and latest.status in {'requested','recording','stopping'}:
+        flash('A recording request already exists for this attempt.')
+        return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+    row=ExamVideoRecording(attempt_id=attempt.id,status='requested',requested_by=actor_label(s),requested_at=now_iso())
+    s.add(row);s.flush()
+    audit_event(s,'exam_video_recording_requested','attempt',attempt.id,f'clip={row.id}')
+    s.commit();flash('Video recording requested. Student will see a visible recording notice when capture begins.')
+    return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+
+
+@app.route('/admin/attempt/<int:attempt_id>/video/stop',methods=['POST'])
+@staff_required
+def admin_stop_attempt_video(attempt_id):
+    s=DB();attempt=_exam_recording_access(s,attempt_id)
+    row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id).order_by(ExamVideoRecording.id.desc()).limit(1))
+    if row and row.status in {'requested','recording'}:
+        row.status='stopping';row.stopped_at=now_iso()
+        audit_event(s,'exam_video_recording_stop_requested','attempt',attempt.id,f'clip={row.id}')
+        s.commit();flash('Video stop requested. Waiting for the final recording chunk.')
+    return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+
+
+@app.route('/admin/attempt/<int:attempt_id>/video/<int:clip_id>/download')
+@staff_required
+def admin_download_attempt_video(attempt_id,clip_id):
+    s=DB();attempt=_exam_recording_access(s,attempt_id)
+    row=s.get(ExamVideoRecording,clip_id)
+    if not row or row.attempt_id!=attempt.id or row.status!='saved':abort(404)
+    root=_exam_video_storage_root()
+    if root is None:abort(503)
+    path=_exam_video_path(row,root)
+    if not path.is_file():abort(404)
+    response=send_file(path,as_attachment=True,download_name=f'exam-{attempt.exam_id}-attempt-{attempt.id}-clip-{row.id}.webm',mimetype='video/webm')
     response.headers['Cache-Control']='private, no-store'
     return response
+
+
+@app.route('/admin/attempt/<int:attempt_id>/video/<int:clip_id>/delete',methods=['POST'])
+@staff_required
+def admin_delete_attempt_video(attempt_id,clip_id):
+    s=DB();attempt=_exam_recording_access(s,attempt_id)
+    row=s.get(ExamVideoRecording,clip_id)
+    if not row or row.attempt_id!=attempt.id or row.status in {'requested','recording','stopping'}:abort(404)
+    root=_exam_video_storage_root()
+    if root:
+        try:_exam_video_path(row,root).unlink(missing_ok=True)
+        except OSError:
+            flash('Video could not be deleted from storage.','error')
+            return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+    row.status='deleted'
+    audit_event(s,'exam_video_recording_deleted','attempt',attempt.id,f'clip={row.id}')
+    s.commit();flash('Recording deleted.')
+    return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+
+
+@app.route('/student/proctor/video/control')
+@student_required
+def student_proctor_video_control():
+    exam_id=request.args.get('exam_id',type=int)
+    if exam_id is None:return jsonify(error='Invalid exam.'),400
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
+    profile=get_exam_security_profile(s,exam_id,False)
+    if not attempt or not profile or not profile.webcam_enabled:return jsonify(error='Monitoring not available.'),404
+    if not secure_exam_device_allowed(s,attempt):return jsonify(error='Device lock.'),409
+    if attempt.status!='in_progress' or now_dt()>=parse_dt(attempt.end_at):
+        return jsonify(record=False,recording_id=None)
+    row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id).order_by(ExamVideoRecording.id.desc()).limit(1))
+    if not row:return jsonify(record=False,recording_id=None)
+    # An active recording may not run beyond 10 minutes per faculty command.
+    if row.status in {'recording','requested'} and row.started_at:
+        try:
+            if (now_dt()-parse_dt(row.started_at)).total_seconds()>EXAM_RECORDING_MAX_SECONDS:
+                row.status='stopping';row.stopped_at=now_iso();s.commit()
+        except (ValueError,TypeError):pass
+    return jsonify(record=row.status in {'requested','recording'},recording_id=row.id if row.status in {'requested','recording','stopping'} else None,recording_status=row.status)
+
+
+@app.route('/student/proctor/video/chunk',methods=['POST'])
+@student_required
+def student_proctor_video_chunk():
+    exam_id=request.form.get('exam_id',type=int)
+    clip_id=request.form.get('recording_id',type=int)
+    chunk_index=request.form.get('index',type=int)
+    blob=request.files.get('chunk')
+    if not exam_id or not clip_id or chunk_index is None or chunk_index<0 or not blob:
+        return jsonify(error='Invalid chunk.'),400
+    if request.content_length and request.content_length>1600000:return jsonify(error='Chunk exceeds limit.'),413
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
+    if not attempt or not secure_exam_device_allowed(s,attempt):return jsonify(error='Unauthorized attempt.'),403
+    row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.id==clip_id,ExamVideoRecording.attempt_id==attempt.id).with_for_update())
+    if not row or row.status not in {'requested','recording','stopping'}:return jsonify(error='Recording is not active.'),409
+    root=_exam_video_storage_root()
+    if root is None:return jsonify(error='Video storage unavailable.'),503
+    if chunk_index<=row.last_chunk:return jsonify(saved=True,duplicate=True)
+    if chunk_index!=row.last_chunk+1:return jsonify(error='Chunk arrived out of order.'),409
+    if row.started_at and (now_dt()-parse_dt(row.started_at)).total_seconds()>EXAM_RECORDING_MAX_SECONDS+20:
+        row.status='stopping';row.stopped_at=now_iso();s.commit()
+        return jsonify(error='Video recording time limit reached.'),409
+    data=blob.read(1200001)
+    if len(data)>1200000 or not data:return jsonify(error='Invalid chunk size.'),413
+    if chunk_index==0 and not data.startswith(b'\x1a\x45\xdf\xa3'):
+        return jsonify(error='Expected a WebM recording.'),400
+    if row.byte_count+len(data)>EXAM_RECORDING_MAX_BYTES:
+        row.status='failed';row.stopped_at=now_iso();s.commit()
+        return jsonify(error='Recording size limit reached.'),413
+    path=_exam_video_path(row,root)
+    try:
+        with path.open('ab') as output:output.write(data)
+        try:path.chmod(0o600)
+        except OSError:pass
+    except OSError:
+        row.status='failed';row.stopped_at=now_iso();s.commit()
+        return jsonify(error='Failed to save recording.'),503
+    row.byte_count+=len(data);row.last_chunk=chunk_index
+    if not row.started_at:row.started_at=now_iso()
+    if row.status=='requested':row.status='recording'
+    s.commit()
+    return jsonify(saved=True,bytes=row.byte_count)
+
+
+@app.route('/student/proctor/video/finish',methods=['POST'])
+@student_required
+def student_proctor_video_finish():
+    data=request.get_json(silent=True) or {}
+    try:exam_id=int(data.get('exam_id'));clip_id=int(data.get('recording_id'))
+    except (ValueError,TypeError):return jsonify(error='Invalid request.'),400
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
+    if not attempt:return jsonify(error='Attempt unavailable.'),404
+    row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.id==clip_id,ExamVideoRecording.attempt_id==attempt.id).with_for_update())
+    if not row or row.status not in {'requested','recording','stopping','failed'}:return jsonify(error='Recording unavailable.'),409
+    root=_exam_video_storage_root()
+    path=_exam_video_path(row,root) if root else None
+    row.status='saved' if data.get('client_ok') is True and row.byte_count>0 and path and path.is_file() and row.status!='failed' else 'failed'
+    row.stopped_at=now_iso()
+    audit_event(s,'exam_video_recording_finished','attempt',attempt.id,f'clip={row.id}; status={row.status}; bytes={row.byte_count}')
+    s.commit();return jsonify(saved=row.status=='saved',status=row.status)
+
 
 @app.route('/admin/exam/<int:exam_id>/integrity-dashboard')
 @staff_required
@@ -8379,7 +8449,13 @@ def exam_integrity_dashboard(exam_id):
     if ml_enabled:
         results=score_exam_outliers(vectors)
         for index,signal in zip(completed_indices,results):rows[index]['ml_signal']=signal
+    recording_map={}
+    if ids:
+        for clip in s.scalars(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id.in_(ids)).order_by(ExamVideoRecording.id.desc())).all():
+            recording_map.setdefault(clip.attempt_id,clip)
+    for row in rows:row['video_recording']=recording_map.get(row['attempt'].id)
     return render_template('exam_integrity_dashboard.html',exam=exam,rows=rows,
+                           recording_available=bool(_exam_video_storage_root()),
                            webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,ml_baseline_count=len(vectors))
 
 
@@ -10330,8 +10406,6 @@ def v188_camera_gate_required(s, exam_id, student_id):
     return not v188_webcam_ready(exam_id,student_id)
 
 
-@app.route('/student/exam/<int:exam_id>/camera-preflight', methods=['GET', 'POST'])
-@student_required
 def v188_webcam_preflight(exam_id):
     s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True));student=s.get(Student,web_session['user_id'])
     if not exam or not student:abort(404)
