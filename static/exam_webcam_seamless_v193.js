@@ -96,12 +96,41 @@
       if(resolved.origin!==window.location.origin)throw Error('Unexpected exam redirect.');
       const html=await response.text();
       const parsed=new DOMParser().parseFromString(html,'text/html');
+      if(!parsed.querySelector('.webcam-exam-questions') &&
+         parsed.querySelector('#webcam-proctor-panel') &&
+         !parsed.querySelector('#exam-form')){
+        // A slow POST can outlive the camera lease. Keep the real camera
+        // stream alive, renew its server sample, then GET the current position.
+        // Do NOT repeat the POST: it may already have advanced the question.
+        statusMessage('Checking live webcam sample…');
+        const verify=window.__examProctorVerifyNow;
+        if(typeof verify!=='function'||!await verify()){
+          cameraBlocked('Camera connection needs verification before continuing.');
+          return;
+        }
+        const fresh=await fetch(resolved.href,{
+          credentials:'same-origin',cache:'no-store',redirect:'follow',
+          headers:{'Accept':'text/html','X-Requested-With':'XMLHttpRequest'}
+        });
+        if(!fresh.ok)throw Error(`Could not refresh the question (HTTP ${fresh.status}).`);
+        const latest=new DOMParser().parseFromString(await fresh.text(),'text/html');
+        if(swapQuestion(latest)){
+          const confirmed=new URL(fresh.url,window.location.href);
+          if(confirmed.origin===location.origin)history.replaceState(history.state,'',confirmed.pathname+confirmed.search+confirmed.hash);
+          return;
+        }
+        cameraBlocked('Question could not be restored. Ask your invigilator.');
+        return;
+      }
       if(!swapQuestion(parsed)){
-        // Only when the server changes workflow (expiry, section selection,
-        // submission, etc.) do we allow an ordinary page navigation.
+        // Real workflow changes, such as a completed exam, can navigate.
+        // Ordinary Next/Previous must not replace the webcam document.
         window.location.assign(resolved.href);
         return;
       }
+      // Keep the current server-issued secure-shell token after a 303 redirect,
+      // so an accidental refresh does not needlessly re-enter PIN verification.
+      history.replaceState(history.state,'',resolved.pathname+resolved.search+resolved.hash);
     }catch(error){
       statusMessage('Question change was not confirmed. Please retry or ask the invigilator.');
       // Do not automatically repeat POST: a previous request might have committed.

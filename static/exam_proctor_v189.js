@@ -21,7 +21,9 @@ function cameraLive(){return !!(stream&&stream.getVideoTracks()[0]&&stream.getVi
 function stop(){ended=true;if(interval){clearInterval(interval);interval=null;}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}video.srcObject=null;}
 async function report(name){try{await post(statusUrl,{status:name});}catch(_){}}
 async function frame(){
- if(ended||uploading||!cameraLive()){block('Webcam is disconnected. Reconnect to continue.');return false;}
+ if(ended)return false;
+ if(uploading)return false;
+ if(!cameraLive()){block('Webcam is disconnected. Reconnect to continue.');return false;}
  uploading=true;
  try{
   const canvas=document.createElement('canvas');canvas.width=320;canvas.height=240;
@@ -31,8 +33,14 @@ async function frame(){
   try{await post(frameUrl,{frame:image});}
   catch(e){if(e.httpStatus!==429||!await verifiedLease())throw e;}
   lastOk=Date.now();unblock();message('Camera active · monitoring samples are being verified');if(nextUrl){location.replace(nextUrl);}return true;
- }catch(e){block('Monitoring connection failed. Reconnect camera or contact your invigilator.');return false;}
- finally{uploading=false;}
+ }catch(e){
+  // One late monitoring response is not a camera disconnection. The server still
+  // enforces its fresh-sample lease independently of this display.
+  if(lastOk&&Date.now()-lastOk<45000&&cameraLive()){
+   status.textContent='Checking webcam connection…';
+  }else{block('Monitoring connection failed. Reconnect camera or contact your invigilator.');}
+  return false;
+ }finally{uploading=false;}
 }
 async function permissionBegin(){
  if(window.parent===window){window.dispatchEvent(new Event('exam-camera-permission-start'));return;}
@@ -45,8 +53,22 @@ async function permissionBegin(){
  });
 }
 function permissionEnd(){if(window.parent===window)window.dispatchEvent(new Event('exam-camera-permission-end'));else window.parent.postMessage({type:'exam-camera-permission-end',exam_id:id},location.origin);}
+function scheduleSamples(){
+ if(interval)clearInterval(interval);
+ interval=setInterval(()=>{
+  if(ended)return;
+  if(!cameraLive()||(lastOk&&Date.now()-lastOk>52000))block('Camera validation expired. Please reconnect.');
+  void frame();
+ },20000);
+}
 async function start(){
- if(starting||ended)return;starting=true;block('Connecting to webcam…');
+ if(starting||ended)return;starting=true;
+ // Retry should verify the existing stream, never close a healthy camera.
+ if(cameraLive()){
+  try{if(await frame())scheduleSamples();}finally{starting=false;}
+  return;
+ }
+ block('Connecting to webcam…');
  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
  try{
   if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia)throw Error('Webcam requires localhost or HTTPS.');
@@ -59,11 +81,29 @@ async function start(){
   for(let n=0;n<40&&!cameraLive();n++)await new Promise(r=>setTimeout(r,100));
   if(!cameraLive())throw Error('Camera preview unavailable');
   if(!await frame())throw Error('Server rejected the camera sample');
-  if(interval)clearInterval(interval);
-  interval=setInterval(()=>{if(ended)return;if(!cameraLive()||Date.now()-lastOk>52000){block('Camera validation expired. Please reconnect.');}void frame();},20000);
+  scheduleSamples();
  }catch(e){block(e.message||'Camera unavailable. Ask invigilator for assistance.');void report(e.name==='NotAllowedError'?'permission_denied':'camera_unavailable');}
  finally{starting=false;}
 }
+
+// The existing question-navigation asset was not referenced by the provided
+// exam template. Load that existing asset once; no extra source file is needed.
+// It swaps only the question column, keeping the MediaStream and timers alive.
+if(document.querySelector('.webcam-exam-questions') &&
+   !document.querySelector('script[src*="exam_webcam_seamless_v193.js"]')){
+ const source=document.currentScript?.src||'/static/exam_proctor_v189.js';
+ const script=document.createElement('script');
+ script.src=new URL('exam_webcam_seamless_v193.js',source).href;
+ script.async=false;
+ document.head.appendChild(script);
+}
+// Used only when a server redirect says the camera lease needs refreshing.
+// This reuses the active stream and never invokes getUserMedia unnecessarily.
+window.__examProctorVerifyNow=async()=>{
+ if(!cameraLive()||ended){block('Webcam disconnected. Please reconnect.');return false;}
+ if(uploading){return await verifiedLease();}
+ return await frame();
+};
 retry?.addEventListener('click',()=>void start());legacyRetry?.addEventListener('click',()=>void start());
 window.addEventListener('pagehide',stop,{once:true});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&Date.now()-lastOk>52000)block('Camera connection needs verification.');});

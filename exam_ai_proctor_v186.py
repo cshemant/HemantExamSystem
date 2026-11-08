@@ -7,19 +7,16 @@ from functools import lru_cache
 from io import BytesIO
 
 
+@lru_cache(maxsize=1)
 def ai_proctor_dependencies():
-    try:
-        import cv2
-        import numpy  # noqa: F401
-        cv = bool(cv2.data.haarcascades)
-    except (ImportError, AttributeError):
-        cv = False
-    try:
-        from sklearn.ensemble import IsolationForest  # noqa: F401
-        ml = True
-    except ImportError:
-        ml = False
-    return {'cv': cv, 'ml': ml}
+    """Check installed packages without importing the heavy ML model on exam start.
+
+    Full model and OpenCV imports occur only when their actual operations run.
+    A package check is advisory; frame processing still fails closed if CV is broken.
+    """
+    from importlib.util import find_spec
+    return {'cv': find_spec('cv2') is not None and find_spec('numpy') is not None,
+            'ml': find_spec('sklearn') is not None}
 
 
 @lru_cache(maxsize=1)
