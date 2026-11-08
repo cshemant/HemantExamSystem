@@ -776,6 +776,7 @@ class ExamSecurityProfile(Base):
     seb_config_key:Mapped[str]=mapped_column(String(64),nullable=False,default='')
     ml_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     webcam_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 class ExamQuestionTelemetry(Base):
@@ -1259,6 +1260,7 @@ def run_schema_upgrades():
         ('faculty_roles','institution_id',"INTEGER"),
         ('exam_security_profiles','ml_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_profiles','webcam_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_profiles','recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
     for table_name,column_name,ddl in upgrades:
@@ -3426,7 +3428,7 @@ def security_headers(response):
     # Only camera-enabled exam documents (including the same-origin PIN shell)
     # receive camera permission; the browser still requires student consent.
     camera_proctor_page=False
-    if endpoint in {'take_exam','verify_student_exam_pin'}:
+    if endpoint in {'take_exam','verify_student_exam_pin','v188_webcam_preflight'}:
         target_id=(request.view_args or {}).get('exam_id')
         if target_id:
             _profile=get_exam_security_profile(DB(),int(target_id),False)
@@ -8339,6 +8341,7 @@ def exam_security_profile_admin(exam_id):
             return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
         profile.ml_enabled=enable_ml
         profile.webcam_enabled=enable_webcam
+        if not enable_webcam:profile.recording_enabled=False
         profile.mode=mode;profile.require_seb=require_seb;profile.updated_at=now_iso()
         if require_seb:
             cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.updated_at=now_iso()
@@ -8349,7 +8352,39 @@ def exam_security_profile_admin(exam_id):
         s.commit();flash('V185 security profile saved. Test the SEB configuration on staging before activating this exam.')
         return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
     return render_template('exam_security_profile.html',exam=exam,profile=profile,attempt_count=attempt_count,
-                           dependencies=ai_proctor_dependencies(),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
+                           dependencies=ai_proctor_dependencies(),recording_available=bool(_exam_video_storage_root()),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
+
+
+@app.route('/admin/exam/<int:exam_id>/recording-policy',methods=['POST'])
+@staff_required
+def exam_recording_policy_admin(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    profile=get_exam_security_profile(s,exam_id,create=True)
+    enabled=request.form.get('enable_video_recording')=='on'
+    if enabled:
+        if not profile.webcam_enabled:
+            flash('Enable webcam proctoring before enabling video recording.','error')
+            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+        if _exam_video_storage_root() is None:
+            flash('Recording is unavailable. Configure private persistent storage (EXAM_RECORDING_DIR) first.','error')
+            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+    profile.recording_enabled=enabled
+    profile.updated_at=now_iso()
+    if not enabled:
+        # Gracefully stop requested or ongoing recordings for this exam.
+        attempt_ids=select(Attempt.id).where(Attempt.exam_id==exam_id)
+        active=s.scalars(select(ExamVideoRecording).where(
+            ExamVideoRecording.attempt_id.in_(attempt_ids),
+            ExamVideoRecording.status.in_(['requested','recording'])
+        )).all()
+        for clip in active:
+            clip.status='stopping';clip.stopped_at=now_iso()
+    audit_event(s,'exam_video_recording_policy_changed','exam',exam_id,f'enabled={enabled}')
+    s.commit()
+    flash('Faculty-controlled video recording '+('enabled.' if enabled else 'disabled.'))
+    return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
 
 
 def _exam_video_storage_root():
@@ -8383,6 +8418,10 @@ def _exam_recording_access(s, attempt_id):
 @staff_required
 def admin_start_attempt_video(attempt_id):
     s=DB();attempt=_exam_recording_access(s,attempt_id)
+    profile=get_exam_security_profile(s,attempt.exam_id,False)
+    if not profile or not profile.recording_enabled:
+        flash('Enable faculty-controlled recording in Exam Security Profile first.','error')
+        return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
     root=_exam_video_storage_root()
     if root is None:
         flash('Video storage is not configured. Set EXAM_RECORDING_DIR to a private persistent directory.','error')
@@ -8459,6 +8498,8 @@ def student_proctor_video_control():
         return jsonify(record=False,recording_id=None)
     row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id).order_by(ExamVideoRecording.id.desc()).limit(1))
     if not row:return jsonify(record=False,recording_id=None)
+    if not getattr(profile,'recording_enabled',False) and row.status in {'requested','recording'}:
+        row.status='stopping';row.stopped_at=now_iso();s.commit()
     # An active recording may not run beyond 10 minutes per faculty command.
     if row.status in {'recording','requested'} and row.started_at:
         try:
@@ -8584,6 +8625,7 @@ def exam_integrity_dashboard(exam_id):
             recording_map.setdefault(clip.attempt_id,clip)
     for row in rows:row['video_recording']=recording_map.get(row['attempt'].id)
     return render_template('exam_integrity_dashboard.html',exam=exam,rows=rows,
+                           recording_enabled=bool(profile and profile.recording_enabled),
                            recording_available=bool(_exam_video_storage_root()),
                            webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,ml_baseline_count=len(vectors))
 
@@ -10535,6 +10577,8 @@ def v188_camera_gate_required(s, exam_id, student_id):
     return not v188_webcam_ready(exam_id,student_id)
 
 
+@app.route('/student/exam/<int:exam_id>/camera-preflight',methods=['GET','POST'])
+@student_required
 def v188_webcam_preflight(exam_id):
     s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True));student=s.get(Student,web_session['user_id'])
     if not exam or not student:abort(404)
