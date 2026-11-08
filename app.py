@@ -285,6 +285,7 @@ class Attempt(Base):
     total_marks:Mapped[int|None]=mapped_column(Integer,nullable=True)
     grading_status:Mapped[str]=mapped_column(String,nullable=False,default='complete')
     question_order:Mapped[str]=mapped_column(String,nullable=False)
+    bulk_recording_opt_out:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
 
 class Answer(Base):
     __tablename__='answers'
@@ -777,6 +778,7 @@ class ExamSecurityProfile(Base):
     ml_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     webcam_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    bulk_recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 class ExamQuestionTelemetry(Base):
@@ -1187,6 +1189,7 @@ def run_schema_upgrades():
         ('answers','graded_by',"VARCHAR NOT NULL DEFAULT ''"),
         ('answers','graded_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('attempts','grading_status',"VARCHAR NOT NULL DEFAULT 'complete'"),
+        ('attempts','bulk_recording_opt_out',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('bank_questions','answer_key',"TEXT NOT NULL DEFAULT ''"),
         ('bank_questions','answer_tolerance',"VARCHAR NOT NULL DEFAULT ''"),
         ('bank_questions','answer_case_sensitive',"BOOLEAN NOT NULL DEFAULT FALSE"),
@@ -1261,6 +1264,7 @@ def run_schema_upgrades():
         ('exam_security_profiles','ml_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_profiles','webcam_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_profiles','recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_profiles','bulk_recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
     for table_name,column_name,ddl in upgrades:
@@ -8341,7 +8345,9 @@ def exam_security_profile_admin(exam_id):
             return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
         profile.ml_enabled=enable_ml
         profile.webcam_enabled=enable_webcam
-        if not enable_webcam:profile.recording_enabled=False
+        if not enable_webcam:
+            profile.recording_enabled=False
+            profile.bulk_recording_enabled=False
         profile.mode=mode;profile.require_seb=require_seb;profile.updated_at=now_iso()
         if require_seb:
             cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.updated_at=now_iso()
@@ -8371,6 +8377,7 @@ def exam_recording_policy_admin(exam_id):
             flash('Recording is unavailable. Configure private persistent storage (EXAM_RECORDING_DIR) first.','error')
             return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
     profile.recording_enabled=enabled
+    if not enabled:profile.bulk_recording_enabled=False
     profile.updated_at=now_iso()
     if not enabled:
         # Gracefully stop requested or ongoing recordings for this exam.
@@ -8380,11 +8387,79 @@ def exam_recording_policy_admin(exam_id):
             ExamVideoRecording.status.in_(['requested','recording'])
         )).all()
         for clip in active:
-            clip.status='stopping';clip.stopped_at=now_iso()
+            clip.status='cancelled' if clip.status=='requested' else 'stopping'
+            clip.stopped_at=now_iso()
     audit_event(s,'exam_video_recording_policy_changed','exam',exam_id,f'enabled={enabled}')
     s.commit()
     flash('Faculty-controlled video recording '+('enabled.' if enabled else 'disabled.'))
     return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+
+
+def _exam_bulk_video_access(s,exam_id):
+    exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    profile=get_exam_security_profile(s,exam_id,create=False)
+    if not profile or not profile.webcam_enabled or not profile.recording_enabled:
+        flash('Enable webcam monitoring and video recording in Security Settings first.','error')
+        return exam,None
+    if _exam_video_storage_root() is None:
+        flash('Private video storage is not available.','error')
+        return exam,None
+    return exam,profile
+
+
+def _queue_exam_video(s,attempt,requested_by):
+    """Queue exactly one clip for an active attempt. Caller holds its DB row lock."""
+    if attempt.status!='in_progress' or now_dt()>=parse_dt(attempt.end_at):return False
+    latest=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id)
+                    .order_by(ExamVideoRecording.id.desc()).limit(1))
+    if latest and latest.status in {'requested','recording','stopping'}:return False
+    if latest and latest.status=='failed':return False  # require explicit faculty retry
+    s.add(ExamVideoRecording(attempt_id=attempt.id,status='requested',
+                             requested_by=requested_by,requested_at=now_iso()))
+    return True
+
+
+@app.route('/admin/exam/<int:exam_id>/video/start-all',methods=['POST'])
+@staff_required
+def admin_start_all_exam_video(exam_id):
+    s=DB();exam,profile=_exam_bulk_video_access(s,exam_id)
+    if profile is None:return redirect(url_for('exam_integrity_dashboard',exam_id=exam_id))
+    # Preserve the bulk policy for students who start after this button is clicked.
+    profile=s.scalar(select(ExamSecurityProfile).where(ExamSecurityProfile.id==profile.id).with_for_update())
+    profile.bulk_recording_enabled=True;profile.updated_at=now_iso()
+    attempts=s.scalars(select(Attempt).where(Attempt.exam_id==exam_id,Attempt.status=='in_progress')
+                       .with_for_update()).all()
+    queued=0
+    for attempt in attempts:
+        attempt.bulk_recording_opt_out=False
+        if _queue_exam_video(s,attempt,'Bulk exam recording'):queued+=1
+    audit_event(s,'exam_bulk_video_started','exam',exam_id,f'active={len(attempts)}; requested={queued}; future_joiners=yes')
+    s.commit()
+    flash(f'Record All enabled. {queued} recording request(s) queued. New students will also be included.')
+    return redirect(url_for('exam_integrity_dashboard',exam_id=exam_id))
+
+
+@app.route('/admin/exam/<int:exam_id>/video/stop-all',methods=['POST'])
+@staff_required
+def admin_stop_all_exam_video(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    profile=get_exam_security_profile(s,exam_id,False)
+    if profile:
+        profile.bulk_recording_enabled=False;profile.updated_at=now_iso()
+    clips=s.scalars(select(ExamVideoRecording).join(Attempt,Attempt.id==ExamVideoRecording.attempt_id)
+                    .where(Attempt.exam_id==exam_id,ExamVideoRecording.status.in_(['requested','recording']))
+                    .with_for_update()).all()
+    for clip in clips:
+        clip.status='cancelled' if clip.status=='requested' else 'stopping'
+        clip.stopped_at=now_iso()
+    audit_event(s,'exam_bulk_video_stopped','exam',exam_id,f'clips_stop_requested={len(clips)}')
+    s.commit()
+    flash(f'Stop All requested for {len(clips)} clip(s). Wait for uploads to finish before downloading.')
+    return redirect(url_for('exam_integrity_dashboard',exam_id=exam_id))
 
 
 def _exam_video_storage_root():
@@ -8433,6 +8508,7 @@ def admin_start_attempt_video(attempt_id):
     if latest and latest.status in {'requested','recording','stopping'}:
         flash('A recording request already exists for this attempt.')
         return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+    attempt.bulk_recording_opt_out=False
     row=ExamVideoRecording(attempt_id=attempt.id,status='requested',requested_by=actor_label(s),requested_at=now_iso())
     s.add(row);s.flush()
     audit_event(s,'exam_video_recording_requested','attempt',attempt.id,f'clip={row.id}')
@@ -8445,10 +8521,14 @@ def admin_start_attempt_video(attempt_id):
 def admin_stop_attempt_video(attempt_id):
     s=DB();attempt=_exam_recording_access(s,attempt_id)
     row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id).order_by(ExamVideoRecording.id.desc()).limit(1))
+    # Individual Stop remains authoritative even during Record All.
+    attempt.bulk_recording_opt_out=True
     if row and row.status in {'requested','recording'}:
-        row.status='stopping';row.stopped_at=now_iso()
+        row.status='cancelled' if row.status=='requested' else 'stopping'
+        row.stopped_at=now_iso()
         audit_event(s,'exam_video_recording_stop_requested','attempt',attempt.id,f'clip={row.id}')
         s.commit();flash('Video stop requested. Waiting for the final recording chunk.')
+    else:s.commit()
     return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
 
 
@@ -8490,23 +8570,38 @@ def admin_delete_attempt_video(attempt_id,clip_id):
 def student_proctor_video_control():
     exam_id=request.args.get('exam_id',type=int)
     if exam_id is None:return jsonify(error='Invalid exam.'),400
-    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
+    s=DB()
+    # Lock this attempt to avoid duplicate bulk requests from overlapping polls.
+    attempt=s.scalar(select(Attempt).where(Attempt.student_id==web_session['user_id'],
+                        Attempt.exam_id==exam_id).with_for_update())
     profile=get_exam_security_profile(s,exam_id,False)
     if not attempt or not profile or not profile.webcam_enabled:return jsonify(error='Monitoring not available.'),404
     if not secure_exam_device_allowed(s,attempt):return jsonify(error='Device lock.'),409
     if attempt.status!='in_progress' or now_dt()>=parse_dt(attempt.end_at):
         return jsonify(record=False,recording_id=None)
-    row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id).order_by(ExamVideoRecording.id.desc()).limit(1))
-    if not row:return jsonify(record=False,recording_id=None)
-    if not getattr(profile,'recording_enabled',False) and row.status in {'requested','recording'}:
-        row.status='stopping';row.stopped_at=now_iso();s.commit()
-    # An active recording may not run beyond 10 minutes per faculty command.
-    if row.status in {'recording','requested'} and row.started_at:
+    row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id)
+                 .order_by(ExamVideoRecording.id.desc()).limit(1))
+    if not profile.recording_enabled and row and row.status in {'requested','recording'}:
+        row.status='cancelled' if row.status=='requested' else 'stopping'
+        row.stopped_at=now_iso();s.commit()
+    # The current upload format is limited to ten minutes per clip. A bulk session
+    # continues with a new clip only after the previous one has been saved.
+    if row and row.status in {'recording','requested'} and row.started_at:
         try:
             if (now_dt()-parse_dt(row.started_at)).total_seconds()>EXAM_RECORDING_MAX_SECONDS:
                 row.status='stopping';row.stopped_at=now_iso();s.commit()
         except (ValueError,TypeError):pass
-    return jsonify(record=row.status in {'requested','recording'},recording_id=row.id if row.status in {'requested','recording','stopping'} else None,recording_status=row.status)
+    if (profile.recording_enabled and profile.bulk_recording_enabled and
+            not attempt.bulk_recording_opt_out and _exam_video_storage_root() is not None and
+            (row is None or row.status=='saved')):
+        if _queue_exam_video(s,attempt,'Bulk exam recording'):
+            s.commit()
+            row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id)
+                         .order_by(ExamVideoRecording.id.desc()).limit(1))
+    if not row:return jsonify(record=False,recording_id=None)
+    active=row.status in {'requested','recording'}
+    return jsonify(record=active,recording_id=row.id if row.status in {'requested','recording','stopping'} else None,
+                   recording_status=row.status)
 
 
 @app.route('/student/proctor/video/chunk',methods=['POST'])
@@ -8626,6 +8721,8 @@ def exam_integrity_dashboard(exam_id):
     for row in rows:row['video_recording']=recording_map.get(row['attempt'].id)
     return render_template('exam_integrity_dashboard.html',exam=exam,rows=rows,
                            recording_enabled=bool(profile and profile.recording_enabled),
+                           bulk_recording_enabled=bool(profile and profile.bulk_recording_enabled),
+                           active_attempt_count=sum(1 for r in rows if r['attempt'].status=='in_progress'),
                            recording_available=bool(_exam_video_storage_root()),
                            webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,ml_baseline_count=len(vectors))
 

@@ -3,6 +3,19 @@
 <p class="mini-meta">ML: {{ 'On' if ml_enabled else 'Off' }} · Webcam: {{ 'On' if webcam_enabled else 'Off' }}{% if ml_enabled %} · ML baseline: {{ ml_baseline_count }}/25{% endif %} · Signals are for faculty review.</p>
 {% if webcam_enabled %}<p class="mini-meta">On-demand video: {{ 'Enabled' if recording_enabled else 'Disabled' }} · {{ 'Storage ready' if recording_available else 'Private storage required' }} · <a href="{{ url_for('exam_security_profile_admin',exam_id=exam.id) }}">Recording settings</a></p>{% endif %}
 <div class="card"><h2>Student Attempts</h2>
+{% if webcam_enabled and recording_enabled and recording_available %}
+<div class="actions" style="margin:12px 0;gap:12px;flex-wrap:wrap;align-items:center">
+  {% if bulk_recording_enabled %}
+  <form method="post" action="{{ url_for('admin_stop_all_exam_video',exam_id=exam.id) }}" onsubmit="return confirm('Stop recording for every student in this exam, including individually started recordings?')">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn secondary" type="submit">Stop All Recordings</button>
+  </form><span class="mini-meta" role="status">Record All active · new students included</span>
+  {% else %}
+  <form method="post" action="{{ url_for('admin_start_all_exam_video',exam_id=exam.id) }}" onsubmit="return confirm('Start recording all active students and students who join later? Students will see a recording notice. Video storage is required.')">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn" type="submit">Record All Students</button>
+  </form><span class="mini-meta">{{ active_attempt_count }} active attempt(s) · individual controls remain available</span>
+  {% endif %}
+</div>
+{% endif %}
 {% if rows %}<div class="table-wrap"><table><thead><tr><th>Roll / Student</th><th>Attempt</th><th>Status</th><th>Focus events</th><th>Copy/paste or menu logs</th><th>Responses &lt;3 seconds</th><th>Answer changes</th>{% if ml_enabled %}<th>ML signal</th>{% endif %}{% if webcam_enabled %}<th>Camera samples</th><th>Camera alerts</th><th>Video</th>{% endif %}<th>Review</th></tr></thead><tbody>
 {% for row in rows %}<tr><td>{{ row.student.roll_no if row.student else 'Unknown' }}<div class="mini-meta">{{ row.student.name if row.student else '' }}</div></td><td>#{{ row.attempt.id }}</td><td>{{ row.attempt.status }}</td><td>{{ row.focus }}</td><td>{{ row.other_events }}</td><td>{{ row.fast }} / {{ row.answered }}</td><td>{{ row.changes }}</td>{% if ml_enabled %}<td>{{ row.ml_signal }}</td>{% endif %}{% if webcam_enabled %}<td>{% if row.camera %}{{ row.camera.sample_count }} frames · {{ row.camera.no_face_count }} no-face · {{ row.camera.multiple_face_count }} multiple-face{% else %}<strong>No camera samples</strong>{% endif %}</td><td>{% if row.camera_flags %}{% for flag in row.camera_flags %}<div>{{ flag.alert_type|replace('_',' ') }} ({{ flag.created_at }})</div>{% endfor %}{% else %}None recorded{% endif %}</td><td>
 {% if not recording_available %}<span class="mini-meta">Storage not configured</span>
