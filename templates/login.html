@@ -8,8 +8,8 @@
       <a class="intro-learn-link" href="#exam-system-features">Explore exam system features <span aria-hidden="true">↓</span></a>
     </div>
     <div class="offline-download-box">
-      <div class="offline-download-copy"><strong>Need an Internet-independent exam?</strong><span>Offline V{{ app_version }} · Windows · LAN ready</span></div>
-      <a class="offline-download-btn" href="{{ url_for('offline_download') }}">Download Offline V{{ app_version }}</a>
+      <div class="offline-download-copy"><strong>Need an Internet-independent exam?</strong><span>Offline V{{ app_version.split("-")[0] }} · Windows · LAN ready</span></div>
+      <a class="offline-download-btn" href="{{ url_for('offline_download') }}">Download Offline V{{ app_version.split("-")[0] }}</a>
     </div>
   </div>
   <div class="login-cards" id="exam-login">
