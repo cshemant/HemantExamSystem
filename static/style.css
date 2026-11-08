@@ -730,7 +730,7 @@ body.secure-exam-running .secure-exam-shell{visibility:visible!important}
 .login-shell .offline-download-copy { min-width: 0; }
 .login-shell .offline-download-box {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 196px);
   align-items: center;
   gap: 12px;
 }
