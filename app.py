@@ -57,9 +57,6 @@ INTEGRATION_API_KEY=os.getenv('INTEGRATION_API_KEY','').strip()
 EXAM_PACKAGE_SIGNING_KEY=os.getenv('EXAM_PACKAGE_SIGNING_KEY','').strip()
 # Per-attempt photographic leak deterrent; not an anti-OCR guarantee.
 EXAM_SEB_EXTERNAL_ORIGIN=(os.getenv('EXAM_SEB_EXTERNAL_ORIGIN','').strip()).rstrip('/')
-# Optional faculty-controlled video clips: writable, private storage is required.
-# For Render, EXAM_RECORDING_DIR must point to durable storage; the free filesystem is ephemeral.
-EXAM_RECORDING_DIR=(os.getenv('EXAM_RECORDING_DIR') or (str(Path.home()/'LearnWithHemantExamRecordings') if APP_MODE=='offline' else '')).strip()
 EXAM_RECORDING_MAX_BYTES=30*1024*1024
 EXAM_RECORDING_MAX_SECONDS=600
 
@@ -93,6 +90,10 @@ except Exception:
 
 APP_MODE=os.getenv('APP_MODE','offline').strip().lower()
 if APP_MODE not in {'offline','online'}: raise RuntimeError('APP_MODE must be offline or online')
+
+# Optional faculty-controlled video clips: writable, private storage is required.
+# For Render, EXAM_RECORDING_DIR must point to durable storage; the free filesystem is ephemeral.
+EXAM_RECORDING_DIR=(os.getenv('EXAM_RECORDING_DIR') or (str(Path.home()/'LearnWithHemantExamRecordings') if APP_MODE=='offline' else '')).strip()
 CODE_RUNNER_WORKER_MODE=os.getenv('CODE_RUNNER_WORKER_MODE','0').strip().lower() in {'1','true','yes','on'}
 
 # Student code is executed by an isolated Piston-compatible runner.  Never run
