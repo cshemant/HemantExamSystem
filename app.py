@@ -1,4 +1,4 @@
-import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re, difflib, ipaddress, threading
+import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re, difflib, ipaddress
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -175,7 +175,6 @@ else:
     # per-process defaults protect small Render and Cloud SQL instances.
     engine=create_engine(
         DATABASE_URL,pool_pre_ping=True,
-        connect_args={'connect_timeout':10},
         pool_size=max(1,int(os.getenv('DB_POOL_SIZE','2'))),
         max_overflow=max(0,int(os.getenv('DB_MAX_OVERFLOW','2'))),
         pool_timeout=max(3,int(os.getenv('DB_POOL_TIMEOUT','10'))),
@@ -1173,21 +1172,16 @@ def _configure_database_reliability():
         pass
 
 
-def _ensure_column(table_name,column_name,ddl,conn=None,known_columns=None):
-    # Used by the shared migration connection below. PostgreSQL schema introspection
-    # per *column* previously made each worker issue hundreds of database queries.
-    if conn is None:
-        with engine.begin() as connection:
-            return _ensure_column(table_name,column_name,ddl,connection,known_columns)
-    columns=known_columns if known_columns is not None else {c['name'] for c in inspect(conn).get_columns(table_name)}
+def _ensure_column(table_name,column_name,ddl):
+    columns={c['name'] for c in inspect(engine).get_columns(table_name)}
     if column_name in columns:
         return False
-    conn.execute(text(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}'))
-    columns.add(column_name)
+    with engine.begin() as conn:
+        conn.execute(text(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}'))
     return True
 
 
-def run_schema_upgrades(conn=None):
+def run_schema_upgrades():
     """Idempotent in-app migration for V2.10 enterprise columns.
 
     Existing V26 SQLite/PostgreSQL deployments can start without losing data.
@@ -1295,23 +1289,15 @@ def run_schema_upgrades(conn=None):
         ('exam_security_profiles','bulk_recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
-    if conn is None:
-        with engine.begin() as owned_connection:
-            return run_schema_upgrades(owned_connection)
-    inspector=inspect(conn)
-    column_cache={}
     for table_name,column_name,ddl in upgrades:
-        if table_name not in column_cache:
-            column_cache[table_name]={c['name'] for c in inspector.get_columns(table_name)}
-        _ensure_column(table_name,column_name,ddl,conn,column_cache[table_name])
-    # Preserve the established data migrations, but avoid writing every row
-    # on every startup if no backfill is needed.
-    conn.execute(text("UPDATE questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
-    conn.execute(text("UPDATE bank_questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
-    conn.execute(text("UPDATE answers SET answer_value=selected_answer WHERE (answer_value IS NULL OR answer_value='') AND selected_answer IS NOT NULL"))
-    # Keep calculated totals current; these statements existed before this patch.
-    conn.execute(text("UPDATE practical_registers SET default_max_marks=attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks WHERE default_max_marks IS DISTINCT FROM attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks" if DATABASE_URL.startswith('postgresql') else "UPDATE practical_registers SET default_max_marks=attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks WHERE default_max_marks IS NOT (attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks)"))
-    conn.execute(text("UPDATE practical_experiments SET max_marks=(SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) WHERE EXISTS (SELECT 1 FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) AND max_marks IS DISTINCT FROM (SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id)" if DATABASE_URL.startswith('postgresql') else "UPDATE practical_experiments SET max_marks=(SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) WHERE EXISTS (SELECT 1 FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) AND max_marks IS NOT (SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id)"))
+        _ensure_column(table_name,column_name,ddl)
+    # Backfill new answer keys from the legacy one-letter columns.
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
+        conn.execute(text("UPDATE bank_questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
+        conn.execute(text("UPDATE answers SET answer_value=selected_answer WHERE (answer_value IS NULL OR answer_value='') AND selected_answer IS NOT NULL"))
+        conn.execute(text("UPDATE practical_registers SET default_max_marks=attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks"))
+        conn.execute(text("UPDATE practical_experiments SET max_marks=(SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) WHERE EXISTS (SELECT 1 FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id)"))
 
 
 def get_exam_security_profile(s,exam_id,create=False):
@@ -3276,23 +3262,13 @@ def init_db():
         # remains serialized across Gunicorn workers, but there is no final
         # schema transaction COMMIT for psycopg to mis-handle.
         with engine.connect().execution_options(isolation_level='AUTOCOMMIT') as schema_conn:
-            # Bounded, non-blocking lock acquisition: a stale connection cannot
-            # freeze application startup indefinitely. Lock applies to *all*
-            # schema upgrades, not just create_all().
-            acquired=False
-            for _ in range(15):
-                acquired=bool(schema_conn.exec_driver_sql('SELECT pg_try_advisory_lock(250503)').scalar_one())
-                if acquired:break
-                time.sleep(1)
-            if not acquired:raise RuntimeError('Database schema migration lock unavailable after 15 seconds')
+            schema_conn.exec_driver_sql('SELECT pg_advisory_lock(250503)').scalar_one()
             try:
-                schema_conn.exec_driver_sql("SET lock_timeout = '8s'")
-                schema_conn.exec_driver_sql("SET statement_timeout = '30s'")
                 Base.metadata.create_all(schema_conn)
-                run_schema_upgrades(schema_conn)
             finally:
                 schema_conn.exec_driver_sql('SELECT pg_advisory_unlock(250503)').scalar_one()
         _configure_database_reliability()
+        run_schema_upgrades()
     else:
         Base.metadata.create_all(engine)
         _configure_database_reliability()
@@ -3990,45 +3966,9 @@ def clear_student_session_for_ip_conflict():
     if device_token:web_session['_student_device_token']=device_token
     flash('You have already logged in with a roll number for this session.','error')
 
-# Online deployment: do not block Gunicorn app import on schema migrations.
-# Render must be able to bind its port promptly even when PostgreSQL is slow.
-# All DB-dependent requests fail closed with HTTP 503 until init succeeds.
-# Offline setup keeps the existing synchronous one-click initialization.
-_DB_STARTUP_READY=threading.Event()
-_DB_STARTUP_ERROR=''
-
-def _initialize_database_background():
-    global _DB_STARTUP_ERROR
-    for attempt_number in range(1,4):
-        try:
-            app.logger.info('Database startup initialization attempt %s',attempt_number)
-            init_db()
-            DB.remove()
-            _DB_STARTUP_ERROR=''
-            _DB_STARTUP_READY.set()
-            app.logger.info('Database startup initialization complete')
-            return
-        except Exception as exc:
-            _DB_STARTUP_ERROR=f'{type(exc).__name__}: {exc}'
-            app.logger.exception('Database initialization failed (attempt %s of 3)',attempt_number)
-            DB.remove()
-            engine.dispose()
-            if attempt_number<3:time.sleep(5*attempt_number)
-    app.logger.error('Database unavailable. Startup completed but requests will return HTTP 503 until service is restarted.')
-
-if APP_MODE=='online' and not CODE_RUNNER_WORKER_MODE:
-    threading.Thread(target=_initialize_database_background,name='exam-database-init',daemon=True).start()
-else:
-    init_db()
-    _DB_STARTUP_READY.set()
-
-@app.before_request
-def require_startup_database():
-    if not _DB_STARTUP_READY.is_set():
-        # Keep the app listening so Render reports real startup errors rather
-        # than an opaque port-scan timeout. Never expose DB error details to users.
-        return Response('Exam service is preparing its database. Please retry shortly.',
-                        status=503,mimetype='text/plain',headers={'Retry-After':'5','Cache-Control':'no-store'})
+# Initialize only after the V2.20 exam/security helper functions above are
+# defined; the startup migration uses them to backfill existing practical exams.
+init_db()
 
 
 def attempt_question_ids(s,attempt):
