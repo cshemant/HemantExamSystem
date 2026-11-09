@@ -4049,6 +4049,53 @@ def finalize_attempt(s,attempt,reason='SYSTEM_FINALIZE'):
         except Exception:pass
     return attempt
 
+def reconcile_expired_exam_attempts(s, exam_id):
+    """Close timed-out attempts even if students never revisit the exam page.
+
+    Admin settings previously counted all status='in_progress' rows, even
+    after the server-side clock had passed. Do not use heartbeat absence as
+    proof of expiry: compare authoritative exam/attempt deadlines instead.
+    """
+    exam=s.get(Exam,exam_id)
+    if not exam:return 0
+    checked_at=now_dt()
+    open_attempts=s.scalars(select(Attempt).where(
+        Attempt.exam_id==exam_id,Attempt.status=='in_progress'
+    ).order_by(Attempt.id)).all()
+    expired=0
+    for attempt in open_attempts:
+        try:
+            deadline=parse_dt(attempt.end_at)
+            # The scheduled window may have been shortened since the attempt
+            # was created. Respect whichever deadline is earlier.
+            window=resolved_exam_window_for_student(s,attempt.student_id,exam)
+            scheduled_end=window.get('end')
+            if scheduled_end:
+                if scheduled_end.tzinfo is None:
+                    scheduled_end=scheduled_end.replace(tzinfo=DISPLAY_TZ)
+                deadline=min(deadline,scheduled_end)
+        except (TypeError,ValueError,OverflowError) as exc:
+            app.logger.warning('Invalid exam deadline for attempt %s: %s',attempt.id,exc)
+            continue
+        if checked_at < deadline:continue
+        try:
+            # Existing submission pathway recalculates scores, records a
+            # reason, and synchronizes the practical assessment (if relevant).
+            finalize_attempt(s,attempt,'TIME_EXPIRED')
+            expired+=1
+        except Exception:
+            s.rollback()
+            app.logger.exception('Could not finalize expired attempt %s',attempt.id)
+    return expired
+
+def exam_recording_storage_is_temporary():
+    """A writable /tmp directory is not persistent storage on Render."""
+    if not EXAM_RECORDING_DIR:return False
+    try:
+        root=Path(EXAM_RECORDING_DIR).expanduser().resolve()
+        return root==Path('/tmp') or Path('/tmp') in root.parents or root==Path('/var/tmp') or Path('/var/tmp') in root.parents
+    except (OSError,ValueError):return False
+
 def canonical_difficulty(value):
     v=(value or 'Medium').strip().lower()
     return {'easy':'Easy','medium':'Medium','hard':'Hard'}.get(v,'Medium')
@@ -8329,6 +8376,7 @@ def exam_security_profile_admin(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
     if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    reconcile_expired_exam_attempts(s,exam_id)
     profile=get_exam_security_profile(s,exam_id,create=True)
     cfg=get_exam_config(s,exam_id,create=True)
     attempt_count=int(s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)
@@ -8360,7 +8408,7 @@ def exam_security_profile_admin(exam_id):
         s.commit();flash('Security profile saved. Test protected modes before activating this exam.')
         return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
     return render_template('exam_security_profile.html',exam=exam,profile=profile,attempt_count=attempt_count,
-                           dependencies=ai_proctor_dependencies(include_phone=True),recording_available=bool(_exam_video_storage_root()),active_attempt_count=int(s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id,Attempt.status=='in_progress')) or 0),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
+                           dependencies=ai_proctor_dependencies(include_phone=True),recording_available=bool(_exam_video_storage_root()),recording_temporary=exam_recording_storage_is_temporary(),active_attempt_count=int(s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id,Attempt.status=='in_progress')) or 0),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
 
 
 @app.route('/admin/exam/<int:exam_id>/ai-settings',methods=['POST'])
@@ -8369,6 +8417,7 @@ def exam_ai_settings_admin(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
     if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    reconcile_expired_exam_attempts(s,exam_id)
     profile=get_exam_security_profile(s,exam_id,create=True)
     active=int(s.scalar(select(func.count()).select_from(Attempt).where(
         Attempt.exam_id==exam_id,Attempt.status=='in_progress')) or 0)
@@ -8734,6 +8783,7 @@ def exam_integrity_dashboard(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
     if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    reconcile_expired_exam_attempts(s,exam_id)
     _reconcile_exam_video_records(s,exam_id)
     attempts=s.scalars(select(Attempt).where(Attempt.exam_id==exam_id).order_by(Attempt.id.desc()).limit(200)).all()
     rows=[]
@@ -8792,6 +8842,7 @@ def exam_integrity_dashboard(exam_id):
         row['video_clips']=clips_by_attempt.get(row['attempt'].id,[])
     return render_template('exam_integrity_dashboard.html',exam=exam,rows=rows,
                            recording_enabled=bool(profile and profile.recording_enabled),
+                           recording_temporary=exam_recording_storage_is_temporary(),
                            bulk_recording_enabled=bool(profile and profile.bulk_recording_enabled),
                            active_attempt_count=sum(1 for r in rows if r['attempt'].status=='in_progress'),
                            recording_available=bool(_exam_video_storage_root()),

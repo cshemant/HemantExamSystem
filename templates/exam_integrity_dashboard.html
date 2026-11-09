@@ -1,7 +1,8 @@
 {% extends 'base.html' %}{% block content %}
 <div class="page-head"><div><a href="{{ url_for('exam_builder',exam_id=exam.id) }}">← Exam Blueprint</a><h1>Security Review Dashboard</h1><p>{{ exam.title }} · Most recent {{ rows|length }} attempts (maximum 200)</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('exam_security_profile_admin',exam_id=exam.id) }}">Security Settings</a></div></div>
 <p class="mini-meta">ML: {{ 'On' if ml_enabled else 'Off' }} · Webcam: {{ 'On' if webcam_enabled else 'Off' }} · Phone DL: {{ 'On' if phone_enabled else 'Off' }}{% if ml_enabled %} · ML baseline: {{ ml_baseline_count }}/25{% endif %} · Signals are for faculty review.</p>
-{% if webcam_enabled %}<p class="mini-meta">On-demand video: {{ 'Enabled' if recording_enabled else 'Disabled' }} · {{ 'Storage ready' if recording_available else 'Private storage required' }} · <a href="{{ url_for('exam_security_profile_admin',exam_id=exam.id) }}">Recording settings</a></p>{% endif %}
+{% if webcam_enabled %}<p class="mini-meta">On-demand video: {{ 'Enabled' if recording_enabled else 'Disabled' }} · {{ 'Temporary storage (not durable)' if recording_temporary else ('Storage configured' if recording_available else 'Private storage required') }} · <a href="{{ url_for('exam_security_profile_admin',exam_id=exam.id) }}">Recording settings</a></p>
+{% if recording_temporary %}<p class="mini-meta">Video storage is temporary. Saved clips can disappear after a Render restart or deployment. Use a persistent disk or private object storage for real exams.</p>{% endif %}{% endif %}
 <div class="card"><h2>Student Attempts</h2>
 {% if webcam_enabled and recording_enabled and recording_available %}
 <div class="actions" style="margin:12px 0;gap:12px;flex-wrap:wrap;align-items:center">
@@ -24,7 +25,7 @@
       {% if exists %}
         <a class="btn small secondary" href="{{ url_for('admin_download_attempt_video',attempt_id=row.attempt.id,clip_id=clip.id) }}">{{ 'Download clip' if clip.status=='saved' else 'Download partial (unverified)' }}</a>
         <form method="post" action="{{ url_for('admin_delete_attempt_video',attempt_id=row.attempt.id,clip_id=clip.id) }}" onsubmit="return confirm('Delete this video clip?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="btn small secondary">Delete</button></form>
-      {% else %}<span class="mini-meta">Clip #{{ clip.id }} missing from storage</span>{% endif %}
+      {% else %}<span class="mini-meta">Clip #{{ clip.id }} unavailable — the stored file is missing. A restart/redeploy may have removed temporary storage.</span>{% endif %}
     </div>
   {% endfor %}
 {% endif %}

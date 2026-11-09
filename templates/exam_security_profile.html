@@ -43,10 +43,11 @@
 
 <div class="card">
   <h2>On-demand webcam recording</h2>
-  <p class="mini-meta">{{ 'Storage ready' if recording_available else 'Storage not configured' }} · {{ 'Enabled' if profile.recording_enabled else 'Disabled' }} · Faculty-controlled: individual or Record All</p>
+  <p class="mini-meta">{{ 'Temporary storage (not durable)' if recording_temporary else ('Storage configured' if recording_available else 'Storage not configured') }} · {{ 'Enabled' if profile.recording_enabled else 'Disabled' }} · Faculty-controlled: individual or Record All</p>
   <form method="post" action="{{ url_for('exam_recording_policy_admin',exam_id=exam.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label class="checkline"><input type="checkbox" name="enable_video_recording" {% if profile.recording_enabled %}checked{% endif %} {% if not profile.webcam_enabled or (not recording_available and not profile.recording_enabled) %}disabled{% endif %}> Enable faculty-controlled video recording</label>
+    {% if recording_temporary %}<p class="mini-meta">Testing only: recordings under /tmp may disappear after a Render restart or deployment. Use durable private storage for actual exams.</p>{% endif %}
     {% if not recording_available %}<p class="mini-meta">Configure private persistent storage using EXAM_RECORDING_DIR before enabling recordings.</p>{% endif %}
     {% if not profile.webcam_enabled %}<p class="mini-meta">Webcam proctoring must be enabled for this exam.</p>{% endif %}
     <div class="actions">
