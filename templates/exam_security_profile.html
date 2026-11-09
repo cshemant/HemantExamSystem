@@ -31,19 +31,11 @@
       <div class="integrity-options">
         <label class="checkline"><input type="checkbox" name="enable_ml" {% if profile.ml_enabled %}checked{% endif %}> <strong>1. Machine Learning anomaly detection</strong> — completed-attempt analysis</label>
         <label class="checkline"><input type="checkbox" name="enable_webcam" {% if profile.webcam_enabled %}checked{% endif %}> <strong>2. Webcam face monitoring</strong> — requires camera verification</label>
-        <label class="checkline"><input type="checkbox" name="enable_phone" {% if profile.phone_detection_enabled %}checked{% endif %} {% if not dependencies.phone and not profile.phone_detection_enabled %}disabled{% endif %}> <strong>3. Deep Learning mobile phone detection</strong> — phones and laptops in webcam view</label>
-      </div>
-      <div style="margin:12px 0 16px;max-width:660px">
-        <label for="phone_response_mode"><strong>When a phone or supported electronic device is detected</strong></label>
-        <select id="phone_response_mode" name="phone_response_mode" style="max-width:100%;width:100%">
-          <option value="review" {% if profile.phone_response_mode != 'halt' %}selected{% endif %}>Flag for faculty review (exam continues)</option>
-          <option value="halt" {% if profile.phone_response_mode == 'halt' %}selected{% endif %}>Halt exam immediately for faculty review</option>
-        </select>
-        <p class="mini-meta">Halt locks answering/navigation and pauses the timer. Faculty must explicitly resume. High-confidence or repeated detections trigger a hold; alerts can be mistaken.</p>
+        <label class="checkline"><input type="checkbox" name="enable_phone" {% if profile.phone_detection_enabled %}checked{% endif %} {% if not dependencies.phone and not profile.phone_detection_enabled %}disabled{% endif %}> <strong>3. Deep Learning mobile phone detection</strong> — visible phones, review-only</label>
       </div>
       <p class="mini-meta">ML: {{ 'Ready' if dependencies.ml else 'Not installed' }} · Webcam: {{ 'Ready' if dependencies.cv else 'Not installed' }} · Phone detector: {{ 'Ready' if dependencies.phone else 'Model missing or unavailable' }}.</p>
       {% if not dependencies.phone %}<p class="mini-meta">Provide a licensed COCO-80 YOLOv8n ONNX model at <code>models/phone_detector.onnx</code> or set <code>EXAM_PHONE_MODEL_PATH</code>. No model downloads occur during exams.</p>{% endif %}
-      <p class="mini-meta">Device alerts are estimates, not proof of misconduct. No camera photos are stored by detection.</p>
+      <p class="mini-meta">Phone alerts indicate a possibly visible device, not proven cheating. No camera photos are stored by detection.</p>
       <button class="btn" type="submit">Save AI settings</button>
     </fieldset>
   </form>
