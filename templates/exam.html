@@ -8,10 +8,10 @@
   <aside class="webcam-exam-sidebar" aria-label="Webcam monitoring">
 {% endif %}
 {% if webcam_proctor_enabled %}
-<section id="webcam-proctor-panel" class="card soft" style="margin:0;padding:15px;" data-exam-id="{{ exam.id }}" data-frame-url="{{ url_for('student_proctor_frame') }}" data-status-url="{{ url_for('student_proctor_status') }}" data-lease-url="{{ url_for('v189_proctor_lease',exam_id=exam.id) }}" data-record-control-url="{{ url_for('student_proctor_video_control') }}" data-record-chunk-url="{{ url_for('student_proctor_video_chunk') }}" data-record-finish-url="{{ url_for('student_proctor_video_finish') }}">
+<section id="webcam-proctor-panel" class="card soft" style="margin:0;padding:15px;" data-exam-id="{{ exam.id }}" data-device-response="{{ phone_response_mode if phone_proctor_enabled else 'review' }}" data-frame-url="{{ url_for('student_proctor_frame') }}" data-status-url="{{ url_for('student_proctor_status') }}" data-lease-url="{{ url_for('v189_proctor_lease',exam_id=exam.id) }}" data-record-control-url="{{ url_for('student_proctor_video_control') }}" data-record-chunk-url="{{ url_for('student_proctor_video_chunk') }}" data-record-finish-url="{{ url_for('student_proctor_video_finish') }}">
   <h3>Mandatory Webcam Monitoring</h3>
   <p id="webcam-video-notice" class="mini-meta" role="status" aria-live="polite">Camera required · Face-count checks · No video stored</p>
-  {% if phone_proctor_enabled %}<p class="mini-meta">AI mobile-phone detection active · Review-only alerts · No detection photos stored</p>{% endif %}
+  {% if phone_proctor_enabled %}<p class="mini-meta">AI phone/laptop detection active · {{ 'Exam halts for faculty review' if phone_response_mode == 'halt' else 'Review-only alerts' }} · No detection photos stored</p>{% endif %}
   <div class="actions"><button type="button" class="btn secondary" id="proctor-start" hidden>Reconnect Camera</button><span id="proctor-status" class="mini-meta" role="status" aria-live="polite">Starting webcam monitoring…</span></div>
   <video id="proctor-preview" autoplay muted playsinline aria-label="Live webcam preview" style="display:none;width:100%;max-width:240px;border-radius:8px;transform:scaleX(-1)"></video>
 </section>
@@ -22,7 +22,7 @@
     <button id="v189-camera-retry" type="button" class="btn">Retry Camera</button>
   </div>
 </div>
-<script defer src="{{ url_for('static',filename='exam_proctor_v189.js') }}?v=189"></script>
+<script defer src="{{ url_for('static',filename='exam_proctor_v189.js') }}?v={{ app_version }}"></script>
 {% endif %}
 {% if webcam_proctor_enabled %}
   </aside>

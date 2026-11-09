@@ -1,4 +1,4 @@
-import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re, difflib, ipaddress
+import os, csv, io, random, socket, secrets, sys, json, math, sqlite3, tempfile, shutil, base64, time, hashlib, hmac, re, difflib, ipaddress, threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -27,7 +27,7 @@ from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
 from exam_integrity_v185 import validate_seb_config_hash, security_event_weight, visibility_allowed_question
-from exam_ai_proctor_v186 import count_faces_in_jpeg, score_exam_outliers, ai_proctor_dependencies, detect_phone_in_jpeg
+from exam_ai_proctor_v186 import count_faces_in_jpeg, score_exam_outliers, ai_proctor_dependencies, detect_device_in_jpeg
 from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
 from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, generate_subject_context_questions, generate_placement_questions, AIProviderError
 from public_content import PUBLIC_GUIDES, discover_public_updates, get_public_guide, public_update_by_slug, related_updates, public_sitemap_paths
@@ -175,6 +175,7 @@ else:
     # per-process defaults protect small Render and Cloud SQL instances.
     engine=create_engine(
         DATABASE_URL,pool_pre_ping=True,
+        connect_args={'connect_timeout':10},
         pool_size=max(1,int(os.getenv('DB_POOL_SIZE','2'))),
         max_overflow=max(0,int(os.getenv('DB_MAX_OVERFLOW','2'))),
         pool_timeout=max(3,int(os.getenv('DB_POOL_TIMEOUT','10'))),
@@ -778,6 +779,7 @@ class ExamSecurityProfile(Base):
     ml_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     webcam_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     phone_detection_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    phone_response_mode:Mapped[str]=mapped_column(String(12),nullable=False,default='review')  # review | halt
     recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     bulk_recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
@@ -812,6 +814,10 @@ class ExamProctorSummary(Base):
     consecutive_phone_detected:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     phone_error_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     last_phone_confidence:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
+    device_halt_at:Mapped[str]=mapped_column(String,nullable=False,default='')
+    device_halt_reason:Mapped[str]=mapped_column(String(40),nullable=False,default='')
+    device_halt_confidence:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
+    device_pause_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     last_sample_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     last_camera_error_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
@@ -1167,16 +1173,21 @@ def _configure_database_reliability():
         pass
 
 
-def _ensure_column(table_name,column_name,ddl):
-    columns={c['name'] for c in inspect(engine).get_columns(table_name)}
+def _ensure_column(table_name,column_name,ddl,conn=None,known_columns=None):
+    # Used by the shared migration connection below. PostgreSQL schema introspection
+    # per *column* previously made each worker issue hundreds of database queries.
+    if conn is None:
+        with engine.begin() as connection:
+            return _ensure_column(table_name,column_name,ddl,connection,known_columns)
+    columns=known_columns if known_columns is not None else {c['name'] for c in inspect(conn).get_columns(table_name)}
     if column_name in columns:
         return False
-    with engine.begin() as conn:
-        conn.execute(text(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}'))
+    conn.execute(text(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}'))
+    columns.add(column_name)
     return True
 
 
-def run_schema_upgrades():
+def run_schema_upgrades(conn=None):
     """Idempotent in-app migration for V2.10 enterprise columns.
 
     Existing V26 SQLite/PostgreSQL deployments can start without losing data.
@@ -1270,6 +1281,11 @@ def run_schema_upgrades():
         ('exam_security_profiles','ml_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_profiles','webcam_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_profiles','phone_detection_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_profiles','phone_response_mode',"VARCHAR(12) NOT NULL DEFAULT 'review'"),
+        ('exam_proctor_summaries','device_halt_at',"VARCHAR NOT NULL DEFAULT ''"),
+        ('exam_proctor_summaries','device_halt_reason',"VARCHAR(40) NOT NULL DEFAULT ''"),
+        ('exam_proctor_summaries','device_halt_confidence',"FLOAT NOT NULL DEFAULT 0.0"),
+        ('exam_proctor_summaries','device_pause_seconds',"INTEGER NOT NULL DEFAULT 0"),
         ('exam_proctor_summaries','phone_sample_count',"INTEGER NOT NULL DEFAULT 0"),
         ('exam_proctor_summaries','phone_detected_count',"INTEGER NOT NULL DEFAULT 0"),
         ('exam_proctor_summaries','consecutive_phone_detected',"INTEGER NOT NULL DEFAULT 0"),
@@ -1279,15 +1295,23 @@ def run_schema_upgrades():
         ('exam_security_profiles','bulk_recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
+    if conn is None:
+        with engine.begin() as owned_connection:
+            return run_schema_upgrades(owned_connection)
+    inspector=inspect(conn)
+    column_cache={}
     for table_name,column_name,ddl in upgrades:
-        _ensure_column(table_name,column_name,ddl)
-    # Backfill new answer keys from the legacy one-letter columns.
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
-        conn.execute(text("UPDATE bank_questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
-        conn.execute(text("UPDATE answers SET answer_value=selected_answer WHERE (answer_value IS NULL OR answer_value='') AND selected_answer IS NOT NULL"))
-        conn.execute(text("UPDATE practical_registers SET default_max_marks=attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks"))
-        conn.execute(text("UPDATE practical_experiments SET max_marks=(SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) WHERE EXISTS (SELECT 1 FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id)"))
+        if table_name not in column_cache:
+            column_cache[table_name]={c['name'] for c in inspector.get_columns(table_name)}
+        _ensure_column(table_name,column_name,ddl,conn,column_cache[table_name])
+    # Preserve the established data migrations, but avoid writing every row
+    # on every startup if no backfill is needed.
+    conn.execute(text("UPDATE questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
+    conn.execute(text("UPDATE bank_questions SET answer_key=correct_answer WHERE (answer_key IS NULL OR answer_key='') AND correct_answer IS NOT NULL"))
+    conn.execute(text("UPDATE answers SET answer_value=selected_answer WHERE (answer_value IS NULL OR answer_value='') AND selected_answer IS NOT NULL"))
+    # Keep calculated totals current; these statements existed before this patch.
+    conn.execute(text("UPDATE practical_registers SET default_max_marks=attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks WHERE default_max_marks IS DISTINCT FROM attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks" if DATABASE_URL.startswith('postgresql') else "UPDATE practical_registers SET default_max_marks=attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks WHERE default_max_marks IS NOT (attendance_max_marks+record_max_marks+performance_max_marks+viva_max_marks)"))
+    conn.execute(text("UPDATE practical_experiments SET max_marks=(SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) WHERE EXISTS (SELECT 1 FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) AND max_marks IS DISTINCT FROM (SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id)" if DATABASE_URL.startswith('postgresql') else "UPDATE practical_experiments SET max_marks=(SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) WHERE EXISTS (SELECT 1 FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id) AND max_marks IS NOT (SELECT default_max_marks FROM practical_registers WHERE practical_registers.id=practical_experiments.register_id)"))
 
 
 def get_exam_security_profile(s,exam_id,create=False):
@@ -2643,7 +2667,11 @@ def exam_access_for_student(s,student_id,exam):
     if start and now<start:
         return False,f'Scheduled for {start.strftime("%d %b, %I:%M %p")}',matched
     if end and now>end:
-        return False,'Exam window closed',matched
+        # Faculty-approved resumed attempts retain the time spent on a device hold.
+        existing=get_attempt(s,student_id,exam.id)
+        held=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==existing.id)) if existing and existing.status=='in_progress' else None
+        permitted_extension=bool(existing and held and (held.device_halt_at or int(held.device_pause_seconds or 0)>0) and now_dt()<parse_dt(existing.end_at))
+        if not permitted_extension:return False,'Exam window closed',matched
     if security and security.strict_start_window and start:
         attempt=get_attempt(s,student_id,exam.id)
         grace=max(0,int(security.start_grace_minutes or 0))
@@ -3248,13 +3276,23 @@ def init_db():
         # remains serialized across Gunicorn workers, but there is no final
         # schema transaction COMMIT for psycopg to mis-handle.
         with engine.connect().execution_options(isolation_level='AUTOCOMMIT') as schema_conn:
-            schema_conn.exec_driver_sql('SELECT pg_advisory_lock(250503)').scalar_one()
+            # Bounded, non-blocking lock acquisition: a stale connection cannot
+            # freeze application startup indefinitely. Lock applies to *all*
+            # schema upgrades, not just create_all().
+            acquired=False
+            for _ in range(15):
+                acquired=bool(schema_conn.exec_driver_sql('SELECT pg_try_advisory_lock(250503)').scalar_one())
+                if acquired:break
+                time.sleep(1)
+            if not acquired:raise RuntimeError('Database schema migration lock unavailable after 15 seconds')
             try:
+                schema_conn.exec_driver_sql("SET lock_timeout = '8s'")
+                schema_conn.exec_driver_sql("SET statement_timeout = '30s'")
                 Base.metadata.create_all(schema_conn)
+                run_schema_upgrades(schema_conn)
             finally:
                 schema_conn.exec_driver_sql('SELECT pg_advisory_unlock(250503)').scalar_one()
         _configure_database_reliability()
-        run_schema_upgrades()
     else:
         Base.metadata.create_all(engine)
         _configure_database_reliability()
@@ -3952,9 +3990,45 @@ def clear_student_session_for_ip_conflict():
     if device_token:web_session['_student_device_token']=device_token
     flash('You have already logged in with a roll number for this session.','error')
 
-# Initialize only after the V2.20 exam/security helper functions above are
-# defined; the startup migration uses them to backfill existing practical exams.
-init_db()
+# Online deployment: do not block Gunicorn app import on schema migrations.
+# Render must be able to bind its port promptly even when PostgreSQL is slow.
+# All DB-dependent requests fail closed with HTTP 503 until init succeeds.
+# Offline setup keeps the existing synchronous one-click initialization.
+_DB_STARTUP_READY=threading.Event()
+_DB_STARTUP_ERROR=''
+
+def _initialize_database_background():
+    global _DB_STARTUP_ERROR
+    for attempt_number in range(1,4):
+        try:
+            app.logger.info('Database startup initialization attempt %s',attempt_number)
+            init_db()
+            DB.remove()
+            _DB_STARTUP_ERROR=''
+            _DB_STARTUP_READY.set()
+            app.logger.info('Database startup initialization complete')
+            return
+        except Exception as exc:
+            _DB_STARTUP_ERROR=f'{type(exc).__name__}: {exc}'
+            app.logger.exception('Database initialization failed (attempt %s of 3)',attempt_number)
+            DB.remove()
+            engine.dispose()
+            if attempt_number<3:time.sleep(5*attempt_number)
+    app.logger.error('Database unavailable. Startup completed but requests will return HTTP 503 until service is restarted.')
+
+if APP_MODE=='online' and not CODE_RUNNER_WORKER_MODE:
+    threading.Thread(target=_initialize_database_background,name='exam-database-init',daemon=True).start()
+else:
+    init_db()
+    _DB_STARTUP_READY.set()
+
+@app.before_request
+def require_startup_database():
+    if not _DB_STARTUP_READY.is_set():
+        # Keep the app listening so Render reports real startup errors rather
+        # than an opaque port-scan timeout. Never expose DB error details to users.
+        return Response('Exam service is preparing its database. Please retry shortly.',
+                        status=503,mimetype='text/plain',headers={'Retry-After':'5','Cache-Control':'no-store'})
 
 
 def attempt_question_ids(s,attempt):
@@ -4064,6 +4138,9 @@ def reconcile_expired_exam_attempts(s, exam_id):
     ).order_by(Attempt.id)).all()
     expired=0
     for attempt in open_attempts:
+        # A faculty hold freezes examination time until faculty explicitly resumes.
+        if _active_device_hold(s,attempt):
+            continue
         try:
             deadline=parse_dt(attempt.end_at)
             # The scheduled window may have been shortened since the attempt
@@ -4073,6 +4150,9 @@ def reconcile_expired_exam_attempts(s, exam_id):
             if scheduled_end:
                 if scheduled_end.tzinfo is None:
                     scheduled_end=scheduled_end.replace(tzinfo=DISPLAY_TZ)
+                summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id))
+                if summary and summary.device_pause_seconds:
+                    scheduled_end+=timedelta(seconds=int(summary.device_pause_seconds))
                 deadline=min(deadline,scheduled_end)
         except (TypeError,ValueError,OverflowError) as exc:
             app.logger.warning('Invalid exam deadline for attempt %s: %s',attempt.id,exc)
@@ -8427,6 +8507,10 @@ def exam_ai_settings_admin(exam_id):
     ml=request.form.get('enable_ml')=='on'
     webcam=request.form.get('enable_webcam')=='on'
     phone=request.form.get('enable_phone')=='on'
+    phone_response=(request.form.get('phone_response_mode') or 'review').strip().lower()
+    if phone_response not in {'review','halt'}:
+        flash('Choose a valid device detection response.','error')
+        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
     ready=ai_proctor_dependencies(include_phone=True)
     if phone and not webcam:
         flash('Mobile phone detection requires webcam monitoring.','error')
@@ -8435,12 +8519,13 @@ def exam_ai_settings_admin(exam_id):
         flash('One selected AI feature is not ready on this server. Check the dependency/model status.','error')
         return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
     profile.ml_enabled=ml;profile.webcam_enabled=webcam;profile.phone_detection_enabled=phone
+    profile.phone_response_mode=phone_response if phone else 'review'
     if not webcam:
         profile.recording_enabled=False
         profile.bulk_recording_enabled=False
     profile.updated_at=now_iso()
     audit_event(s,'exam_ai_settings_saved','exam',exam_id,
-                f'ml={ml}; webcam={webcam}; phone={phone}')
+                f'ml={ml}; webcam={webcam}; phone={phone}; device_response={profile.phone_response_mode}')
     s.commit()
     flash('AI proctoring settings saved for future exam activity.')
     return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
@@ -8817,6 +8902,7 @@ def exam_integrity_dashboard(exam_id):
     for index,row in enumerate(rows):
         summary=summaries.get(row['attempt'].id)
         row['camera']=summary
+        row['device_halt']=bool(summary and summary.device_halt_at)
         row['camera_flags']=flag_map.get(row['attempt'].id,[])[:5]
         row['ml_signal']='Off' if not ml_enabled else 'Collecting baseline'
         if row['attempt'].status=='submitted':
@@ -8846,7 +8932,8 @@ def exam_integrity_dashboard(exam_id):
                            bulk_recording_enabled=bool(profile and profile.bulk_recording_enabled),
                            active_attempt_count=sum(1 for r in rows if r['attempt'].status=='in_progress'),
                            recording_available=bool(_exam_video_storage_root()),
-                           webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,phone_enabled=phone_enabled,ml_baseline_count=len(vectors))
+                           webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,phone_enabled=phone_enabled,
+                           phone_response=profile.phone_response_mode if profile else 'review',ml_baseline_count=len(vectors))
 
 
 @app.route('/admin/exam/<int:exam_id>/student-access')
@@ -10818,7 +10905,7 @@ def v188_webcam_preflight(exam_id):
         response=app.make_response(render_template('exam_webcam_preflight_v188.html',exam=exam,next_url=next_url,nonce=nonce,student=student,cv_ready=ai_proctor_dependencies(include_phone=True)['cv'],phone_proctor_enabled=bool(profile.phone_detection_enabled)))
         response.headers['Cache-Control']='no-store, no-cache, must-revalidate'
         return response
-    if request.content_length is not None and request.content_length>115000:return jsonify(ok=False,error='Frame too large.'),413
+    if request.content_length is not None and request.content_length>175000:return jsonify(ok=False,error='Frame too large.'),413
     data=request.get_json(silent=True) or {}
     challenge=(web_session.get('_v188_camera_challenges') or {}).get(str(exam_id)) or {}
     nonce=data.get('nonce')
@@ -10830,7 +10917,7 @@ def v188_webcam_preflight(exam_id):
     except (ValueError,TypeError):fresh=False;bound=False
     if not fresh or not bound:return jsonify(ok=False,error='Camera setup expired. Refresh this page.'),403
     encoded=data.get('frame')
-    if not isinstance(encoded,str) or len(encoded)>108000 or not encoded.startswith('data:image/jpeg;base64,'):
+    if not isinstance(encoded,str) or len(encoded)>165000 or not encoded.startswith('data:image/jpeg;base64,'):
         return jsonify(ok=False,error='Camera has not provided a valid sample.'),400
     try:
         jpeg=base64.b64decode(encoded.split(',',1)[1],validate=True)
@@ -10865,12 +10952,54 @@ def v189_camera_enforced(s,exam_id):
     profile=get_exam_security_profile(s,exam_id,False)
     return bool(profile and profile.webcam_enabled)
 
+def _active_device_hold(s,attempt):
+    if not attempt or attempt.status!='in_progress':return None
+    summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id))
+    return summary if summary and summary.device_halt_at else None
+
+
+def _device_hold_payload(summary):
+    return {'halted':True,'reason':(summary.device_halt_reason or 'electronic device'),
+            'notice':'Exam paused after a possible electronic device detection. An invigilator must review and resume your attempt.'}
+
+
+@app.route('/admin/attempt/<int:attempt_id>/device-hold/release',methods=['POST'])
+@staff_required
+def admin_release_device_hold(attempt_id):
+    s=DB();attempt=s.get(Attempt,attempt_id)
+    if not attempt:abort(404)
+    if not may_manage_own_exam(s,attempt.exam_id,'edit'):abort(403)
+    summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id).with_for_update())
+    if not summary or not summary.device_halt_at or attempt.status!='in_progress':
+        flash('No active device hold was found.','error')
+        return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+    try:hold_seconds=max(0,int((now_dt()-parse_dt(summary.device_halt_at)).total_seconds()))
+    except (ValueError,TypeError):hold_seconds=0
+    # Compensate only for the stopped time. Never reset saved answers or question position.
+    attempt.end_at=(parse_dt(attempt.end_at)+timedelta(seconds=hold_seconds)).isoformat(timespec='seconds')
+    mock=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id))
+    if mock and mock.section_end_at:
+        mock.section_end_at=(parse_dt(mock.section_end_at)+timedelta(seconds=hold_seconds)).isoformat(timespec='seconds')
+    sequential=s.scalar(select(SequentialAttemptProgress).where(SequentialAttemptProgress.attempt_id==attempt.id))
+    if sequential and sequential.question_started_at:
+        sequential.question_started_at=(parse_dt(sequential.question_started_at)+timedelta(seconds=hold_seconds)).isoformat(timespec='seconds')
+    if mock and mock.question_started_at:
+        mock.question_started_at=(parse_dt(mock.question_started_at)+timedelta(seconds=hold_seconds)).isoformat(timespec='seconds')
+    summary.device_pause_seconds=int(summary.device_pause_seconds or 0)+hold_seconds
+    summary.device_halt_at='';summary.device_halt_reason='';summary.consecutive_phone_detected=0
+    audit_event(s,'device_hold_released','attempt',attempt.id,f'faculty_release; paused_seconds={hold_seconds}')
+    s.commit();flash('Device hold released. The student can resume with their remaining time.')
+    return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
+
+
 @app.route('/student/proctor/lease/<int:exam_id>',methods=['GET'])
 @student_required
 def v189_proctor_lease(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt or attempt.status=='submitted':return jsonify(ready=False),404
     if not secure_exam_device_allowed(s,attempt):return jsonify(ready=False),409
+    held=_active_device_hold(s,attempt)
+    if held:return jsonify(ready=False,**_device_hold_payload(held)),423
     ready=v189_camera_sample_fresh(s,attempt) if v189_camera_enforced(s,exam_id) else True
     response=jsonify(ready=ready,expires_in=_V189_CAMERA_FRESH_SECONDS)
     response.headers['Cache-Control']='no-store'
@@ -10883,7 +11012,7 @@ def v189_block_exam_actions_without_webcam():
     endpoints={'save_answer','next_exam_question','previous_mock_drive_question',
                'select_mock_drive_section','complete_mock_drive_section','submit_exam'}
     if request.method!='POST' or request.endpoint not in endpoints:return None
-    if request.endpoint=='submit_exam' and request.form.get('submission_reason')=='TIME_EXPIRED':return None
+    time_expired_submission=(request.endpoint=='submit_exam' and request.form.get('submission_reason')=='TIME_EXPIRED')
     if web_session.get('role')!='student' or not web_session.get('user_id'):return None
     if request.endpoint=='save_answer':
         payload=request.get_json(silent=True) or {}
@@ -10893,9 +11022,15 @@ def v189_block_exam_actions_without_webcam():
         try:exam_id=int((request.view_args or {}).get('exam_id'))
         except (ValueError,TypeError):return None
     s=DB()
-    if not v189_camera_enforced(s,exam_id):return None
     attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt or attempt.status!='in_progress':return None
+    held=_active_device_hold(s,attempt)
+    if held:
+        if request.endpoint=='save_answer' or request.headers.get('X-Requested-With')=='XMLHttpRequest' or request.accept_mimetypes.best=='application/json':
+            return jsonify(ok=False,**_device_hold_payload(held)),423
+        return (render_template('exam_webcam_locked_v189.html',exam_id=exam_id,message=_device_hold_payload(held)['notice']),423,{'Cache-Control':'no-store'})
+    if time_expired_submission:return None
+    if not v189_camera_enforced(s,exam_id):return None
     if v189_camera_sample_fresh(s,attempt):return None
     message='Camera monitoring is not active. Restore the camera before answering or moving to another question.'
     if request.endpoint=='save_answer' or request.headers.get('X-Requested-With')=='XMLHttpRequest' or request.accept_mimetypes.best=='application/json':
@@ -11008,6 +11143,9 @@ def take_exam(exam_id):
         if cfg and cfg.secure_sequential:
             _sequential_progress(s,attempt,create=True)
         s.commit()
+    held=_active_device_hold(s,attempt)
+    if held:
+        return (render_template('exam_webcam_locked_v189.html',exam_id=exam_id,message=_device_hold_payload(held)['notice']),423,{'Cache-Control':'no-store'})
     if v189_camera_enforced(s,exam_id) and not v189_camera_sample_fresh(s,attempt):
         return render_template('exam_webcam_warmup_v189.html',exam=exam,next_url=request.url,secure_shell=request.args.get('secure_shell')=='1')
     end_dt=parse_dt(attempt.end_at)
@@ -11061,7 +11199,7 @@ def take_exam(exam_id):
         visual_watermark=f'Roll {student_ref} | Exam {exam.id} | Attempt {attempt.id}'
     else:
         visual_watermark=''
-    return render_template('exam.html',phone_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).phone_detection_enabled),webcam_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).webcam_enabled),visual_protection_mode=visual_mode,visual_watermark=visual_watermark,exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
+    return render_template('exam.html',phone_response_mode=(get_exam_security_profile(s,exam_id,False).phone_response_mode if get_exam_security_profile(s,exam_id,False) else 'review'),phone_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).phone_detection_enabled),webcam_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).webcam_enabled),visual_protection_mode=visual_mode,visual_watermark=visual_watermark,exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
 
 @app.route('/student/exam/<int:exam_id>/section/select',methods=['POST'])
 @student_required
@@ -11256,13 +11394,13 @@ def save_answer():
 @student_required
 def student_proctor_frame():
     # Limit JSON and JPEG size before decoding; images are processed in memory only.
-    if request.content_length is not None and request.content_length>115000:
+    if request.content_length is not None and request.content_length>175000:
         return jsonify(error='Frame exceeds maximum size.'),413
     data=request.get_json(silent=True) or {}
     try:exam_id=int(data.get('exam_id'))
     except (TypeError,ValueError):return jsonify(error='Invalid exam ID.'),400
     encoded=data.get('frame')
-    if not isinstance(encoded,str) or len(encoded)>108000 or not encoded.startswith('data:image/jpeg;base64,'):
+    if not isinstance(encoded,str) or len(encoded)>165000 or not encoded.startswith('data:image/jpeg;base64,'):
         return jsonify(error='Invalid JPEG frame.'),400
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     profile=get_exam_security_profile(s,exam_id,False)
@@ -11275,13 +11413,14 @@ def student_proctor_frame():
         s.add(summary);s.flush()
     if summary.last_sample_at:
         try:
-            if (now_dt()-parse_dt(summary.last_sample_at)).total_seconds()<12:
+            sample_gap=6 if profile.phone_detection_enabled and profile.phone_response_mode=='halt' else 12
+            if (now_dt()-parse_dt(summary.last_sample_at)).total_seconds()<sample_gap:
                 return jsonify(error='Wait before sampling again.'),429
         except ValueError:pass
     try:
         jpeg=base64.b64decode(encoded.split(',',1)[1],validate=True)
     except (ValueError,base64.binascii.Error):return jsonify(error='Invalid encoded JPEG.'),400
-    if len(jpeg)>80000:return jsonify(error='JPEG frame too large.'),413
+    if len(jpeg)>120000:return jsonify(error='JPEG frame too large.'),413
     try:faces=count_faces_in_jpeg(jpeg)
     except ValueError:return jsonify(error='Unreadable camera frame.'),400
     except RuntimeError:return jsonify(error='Computer vision dependency unavailable.'),503
@@ -11296,27 +11435,38 @@ def student_proctor_frame():
             s.add(ExamProctorFlag(attempt_id=attempt.id,alert_type='multiple_faces_2_samples',created_at=now_iso()))
     else:
         summary.one_face_count+=1;summary.consecutive_multiple_face=0;summary.consecutive_no_face=0
-    # This is optional review-only inference using an EXISTING camera sample.
-    # Skip the first frame to avoid delaying exam start; never re-open the camera.
-    if profile.phone_detection_enabled and summary.sample_count > 1:
+    # Device inference uses the current live frame; no images are retained.
+    # Skip startup sample to keep initial exam launch responsive.
+    if profile.phone_detection_enabled and summary.sample_count>1 and not summary.device_halt_at:
         try:
-            phone_confidence=detect_phone_in_jpeg(jpeg)
-            if phone_confidence is not None:  # Busy inference should not block the exam.
+            device=detect_device_in_jpeg(jpeg)
+            if device is not None:  # Busy detector: avoid blocking other students.
+                confidence=float(device['confidence'])
+                label=device['label']
                 summary.phone_sample_count+=1
-                summary.last_phone_confidence=round(phone_confidence,3)
-                if phone_confidence>=0.55:
+                summary.last_phone_confidence=round(confidence,3)
+                if confidence>=0.42:
                     summary.phone_detected_count+=1
                     summary.consecutive_phone_detected+=1
-                    if summary.consecutive_phone_detected==2:
-                        s.add(ExamProctorFlag(attempt_id=attempt.id,
-                               alert_type='phone_visible_2_samples',created_at=now_iso()))
+                    confirmed=confidence>=0.82 or summary.consecutive_phone_detected>=2
+                    if confirmed:
+                        s.add(ExamProctorFlag(attempt_id=attempt.id,alert_type='device_visible_confirmed',created_at=now_iso()))
+                        if profile.phone_response_mode=='halt':
+                            summary.device_halt_at=now_iso()
+                            summary.device_halt_reason=label
+                            summary.device_halt_confidence=round(confidence,3)
+                            audit_event(s,'exam_halted_device_detected','attempt',attempt.id,
+                                        f'device={label}; confidence={confidence:.3f}; faculty_review_required')
+                        summary.consecutive_phone_detected=0
                 else:
                     summary.consecutive_phone_detected=0
-        except (ValueError,RuntimeError):
+        except (ValueError,RuntimeError) as exc:
             summary.phone_error_count+=1
-            # Keep webcam/answering functional if optional inference is unavailable.
+            app.logger.warning('Device detector failed on attempt %s: %s',attempt.id,exc)
     s.commit()
-    # Never expose face imagery or biometric identity in response.
+    # Server controls both the student overlay and the answer/navigation lock.
+    if summary.device_halt_at:
+        return jsonify(accepted=True,samples=summary.sample_count,**_device_hold_payload(summary))
     return jsonify(accepted=True,status='review_only',samples=summary.sample_count)
 
 @app.route('/student/proctor/status',methods=['POST'])
