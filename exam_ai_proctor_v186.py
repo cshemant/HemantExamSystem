@@ -137,7 +137,8 @@ def detect_device_in_jpeg(jpeg):
     """Return a possible visible device's label/confidence, 0 when absent,
     or None when another worker is already processing a frame.
 
-    Accepts YOLOv8 COCO80 raw ONNX outputs [1,84,N]/[1,N,84]. Apply
+    Accepts YOLOv8 raw ONNX outputs for COCO-80 (84 channels) or
+    a phone-specific 1-class model (5 channels). Apply
     class-specific confidence and NMS rather than requiring class 67 to be
     each proposal's top class. A single model score is not proof of misconduct.
     """
@@ -170,29 +171,43 @@ def detect_device_in_jpeg(jpeg):
     except Exception as exc:raise RuntimeError('Device detector inference failed') from exc
     finally:_PHONE_DNN_LOCK.release()
     if output.ndim!=3 or output.shape[0]!=1:
-        raise RuntimeError('Unsupported ONNX output, expected YOLOv8 COCO-80')
-    if output.shape[1]==84:rows=output[0].T
-    elif output.shape[2]==84:rows=output[0]
-    else:raise RuntimeError('Expected 84 YOLOv8 COCO-80 output channels')
-    if len(rows)==0:return {'label':'none','confidence':0.0}
-    if not np.isfinite(rows).all():raise RuntimeError('Nonfinite ONNX prediction')
-    best_label='none';best_score=0.0
-    # Only class scores corresponding to supported devices. NMS filters
-    # duplicate overlapping predictions; candidate boxes are normalized
-    # model coordinates in the 640-pixel letterbox.
-    for class_id,label in _SUPPORTED_DEVICE_CLASSES.items():
+        raise RuntimeError('Unsupported ONNX prediction output')
+    # Support both the existing COCO-80 model and a purpose-trained YOLOv8
+    # single-class phone model. Standard YOLOv8 detection outputs (4 + C)
+    # channels, with no separate objectness column.
+    if output.shape[1] in (84, 5):
+        rows=output[0].T
+    elif output.shape[2] in (84, 5):
+        rows=output[0]
+    else:
+        raise RuntimeError('Expected YOLOv8 COCO-80 (84) or phone-only (5) output channels')
+    if len(rows)==0:
+        return {'label':'none','confidence':0.0}
+    if not np.isfinite(rows).all():
+        raise RuntimeError('Nonfinite ONNX prediction')
+    class_names={0:'mobile phone'} if rows.shape[1]==5 else _SUPPORTED_DEVICE_CLASSES
+    best_label='none'; best_score=0.0
+    # The dashboard should retain the actual low confidence, rather than
+    # reporting zero simply because all candidates fell below the threshold.
+    raw_max=max(float(np.max(rows[:,4+class_id])) for class_id in class_names)
+    for class_id,label in class_names.items():
         scores=rows[:,4+class_id]
         mask=scores>=0.15
-        if not mask.any():continue
-        candidates=rows[mask,:4]
+        if not mask.any():
+            continue
         candidate_scores=scores[mask].astype(float)
         boxes=[]
-        for cx,cy,bw,bh in candidates:
+        for cx,cy,bw,bh in rows[mask,:4]:
             boxes.append([float(cx-bw/2),float(cy-bh/2),float(bw),float(bh)])
         retained=cv2.dnn.NMSBoxes(boxes,candidate_scores.tolist(),0.15,0.45)
-        if retained is None or len(retained)==0:continue
+        if retained is None or len(retained)==0:
+            continue
         highest=max(float(candidate_scores[int(i)]) for i in np.asarray(retained).reshape(-1))
-        if highest>best_score:best_label=label;best_score=highest
+        if highest>best_score:
+            best_label=label;best_score=highest
+    if best_label=='none':
+        # Telemetry only: never turn an unconfirmed raw score into an exam halt.
+        return {'label':'none','confidence':min(raw_max,0.149)}
     return {'label':best_label,'confidence':min(1.0,best_score)}
 
 
