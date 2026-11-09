@@ -139,6 +139,7 @@ function startTimer(endEpoch,serverNowEpoch){
     const elapsed=monotonicStart&&window.performance?Math.max(0,(performance.now()-monotonicStart)/1000):0;
     const left=Math.max(0,Math.ceil(initialLeft-elapsed));
     const h=Math.floor(left/3600),m=Math.floor((left%3600)/60),s=left%60;
+    if(window.__deviceHold===true){if(timer)timer.textContent='Paused';return;}
     if(timer) timer.textContent=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
     if(left<=0){
       if(handle)clearInterval(handle);
@@ -163,6 +164,7 @@ function startSectionTimer(endEpoch,serverNowEpoch,expiryUrl){
   const tick=()=>{
     const elapsed=started&&window.performance?Math.max(0,(performance.now()-started)/1000):0;
     const left=Math.max(0,Math.ceil(initialLeft-elapsed)),h=Math.floor(left/3600),m=Math.floor((left%3600)/60),s=left%60;
+    if(window.__deviceHold===true){if(timer)timer.textContent='Paused';return;}
     if(timer)timer.textContent=`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
     if(left<=0&&!expired){
       expired=true;if(handle)clearInterval(handle);

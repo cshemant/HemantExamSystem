@@ -9,18 +9,20 @@ const recordingNotice=document.getElementById('webcam-video-notice');
 const video=document.getElementById('proctor-preview'), status=document.getElementById('proctor-status');
 const retry=document.getElementById('v189-camera-retry'), legacyRetry=document.getElementById('proctor-start');
 const lock=document.getElementById('v189-camera-lock'), lockMsg=document.getElementById('v189-camera-lock-msg');
-let stream=null,interval=null,lastOk=0,starting=false,uploading=false,ended=false;
+let stream=null,interval=null,lastOk=0,starting=false,uploading=false,ended=false,deviceHalted=false;
+const haltMode=panel.dataset.deviceResponse==='halt';
 let recordingPoll=null, recorder=null, recordingId=null, recordingIndex=0, chunkQueue=Promise.resolve(), recordingError=false;
 let recordingFinishPending=null, endingExamRecording=false;
 const csrf=()=>document.querySelector('meta[name="csrf-token"]')?.content||'';
 const message=s=>{status.textContent=s;if(lockMsg)lockMsg.textContent=s;};
 const block=s=>{if(lock)lock.style.display='flex';if(s)message(s);};
-const unblock=()=>{if(lock)lock.style.display='none';};
+const unblock=()=>{if(!deviceHalted&&lock)lock.style.display='none';};
+function deviceHold(text){deviceHalted=true;window.__deviceHold=true;block(text||'Exam halted after a possible device detection. Wait for faculty review.');if(lock){const heading=lock.querySelector('h2');if(heading)heading.textContent='Exam paused for faculty review';}if(retry)retry.style.display='none';}
 async function post(url,payload){
  const r=await fetch(url,{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({exam_id:id,...payload})});
  const body=await r.json().catch(()=>({}));if(!r.ok)throw Object.assign(Error(body.error||'Monitoring server unavailable'),{httpStatus:r.status});return body;
 }
-async function verifiedLease(){try{const r=await fetch(leaseUrl,{credentials:'same-origin',cache:'no-store'});const data=await r.json();return r.ok&&data.ready===true;}catch(_){return false;}}
+async function verifiedLease(){try{const r=await fetch(leaseUrl,{credentials:'same-origin',cache:'no-store'});const data=await r.json();if(data.halted){deviceHold(data.notice);return false;}if(deviceHalted&&!data.halted&&r.ok){location.reload();return false;}return r.ok&&data.ready===true;}catch(_){return false;}}
 function cameraLive(){return !!(stream&&stream.getVideoTracks()[0]&&stream.getVideoTracks()[0].readyState==='live'&&video.videoWidth>=64);}
 function videoNotice(text){
  if(!recordingNotice)return;
@@ -137,16 +139,21 @@ async function frame(){
  if(!cameraLive()){block('Webcam is disconnected. Reconnect to continue.');return false;}
  uploading=true;
  try{
-  const canvas=document.createElement('canvas');canvas.width=320;canvas.height=240;
-  canvas.getContext('2d',{alpha:false}).drawImage(video,0,0,320,240);
-  const image=canvas.toDataURL('image/jpeg',0.55);canvas.width=canvas.height=0;
+  const canvas=document.createElement('canvas');
+  const width=haltMode?480:320,height=haltMode?360:240;
+  canvas.width=width;canvas.height=height;
+  canvas.getContext('2d',{alpha:false}).drawImage(video,0,0,width,height);
+  let image=canvas.toDataURL('image/jpeg',haltMode?0.52:0.55);
+  if(image.length>108000)image=canvas.toDataURL('image/jpeg',0.38);
+  canvas.width=canvas.height=0;
   if(image.length>108000)throw Error('Camera image too large');
-  try{await post(frameUrl,{frame:image});}
+  try{const result=await post(frameUrl,{frame:image});if(result.halted){deviceHold(result.notice);lastOk=Date.now();return true;}}
   catch(e){if(e.httpStatus!==429||!await verifiedLease())throw e;}
   lastOk=Date.now();unblock();message('Camera active · monitoring samples are being verified');if(nextUrl){location.replace(nextUrl);}return true;
  }catch(e){
   // One late monitoring response is not a camera disconnection. The server still
   // enforces its fresh-sample lease independently of this display.
+  if(deviceHalted){return false;}
   if(lastOk&&Date.now()-lastOk<45000&&cameraLive()){
    status.textContent='Checking webcam connection…';
   }else{block('Monitoring connection failed. Reconnect camera or contact your invigilator.');}
@@ -168,9 +175,10 @@ function scheduleSamples(){
  if(interval)clearInterval(interval);
  interval=setInterval(()=>{
   if(ended)return;
+  if(deviceHalted){void verifiedLease();return;}
   if(!cameraLive()||(lastOk&&Date.now()-lastOk>52000))block('Camera validation expired. Please reconnect.');
   void frame();
- },20000);
+ },haltMode?8000:20000);
 }
 async function start(){
  if(starting||ended)return;starting=true;
@@ -184,7 +192,7 @@ async function start(){
  try{
   if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia)throw Error('Webcam requires localhost or HTTPS.');
   await permissionBegin();
-  try{stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{width:{ideal:320},height:{ideal:240},facingMode:'user'}});}
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{width:{ideal:haltMode?640:320},height:{ideal:haltMode?480:240},facingMode:'user'}});}
   finally{permissionEnd();}
   const track=stream.getVideoTracks()[0];if(!track||track.readyState!=='live')throw Error('Camera unavailable');
   track.addEventListener('ended',()=>{if(ended)return;stopRecording();block('Webcam disconnected. Click Retry Camera.');void report('camera_interrupted');});

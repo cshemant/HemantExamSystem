@@ -127,23 +127,31 @@ def phone_detector_ready():
     except RuntimeError:
         return False
 
-def detect_phone_in_jpeg(jpeg):
-    """Highest COCO-80 cell-phone confidence, or None if inference is busy.
+# COCO classes supported by the supplied 80-class ONNX model. Tablets may
+# appear as either class, but many devices are outside this model's vocabulary.
+_SUPPORTED_DEVICE_CLASSES = {67: 'mobile phone', 63: 'laptop or tablet'}
 
-    Supports YOLOv8 detect ONNX outputs [1,84,N] or [1,N,84]. Does not
-    retain images, identify people, or decide whether cheating occurred.
+
+def detect_device_in_jpeg(jpeg):
+    """Return a possible visible device's label/confidence, 0 when absent,
+    or None when another worker is already processing a frame.
+
+    Accepts YOLOv8 COCO80 raw ONNX outputs [1,84,N]/[1,N,84]. Apply
+    class-specific confidence and NMS rather than requiring class 67 to be
+    each proposal's top class. A single model score is not proof of misconduct.
     """
     if not isinstance(jpeg, bytes) or not 100 <= len(jpeg) <= 80000 or not jpeg.startswith(b'\xff\xd8'):
-        raise ValueError('Invalid phone-analysis JPEG')
+        raise ValueError('Invalid device-analysis JPEG')
     try:
         import cv2
         import numpy as np
+        from PIL import Image
     except ImportError as exc:
-        raise RuntimeError('OpenCV and NumPy required') from exc
-    with __import__('PIL.Image', fromlist=['Image']).open(BytesIO(jpeg)) as image:
-        w, h = image.size
-        if image.format != 'JPEG' or min(w,h) < 64 or max(w,h) > 640 or w*h > 307200:
-            raise ValueError('Invalid phone-analysis JPEG dimensions')
+        raise RuntimeError('OpenCV, Pillow and NumPy required') from exc
+    with Image.open(BytesIO(jpeg)) as image:
+        w,h=image.size
+        if image.format!='JPEG' or min(w,h)<64 or max(w,h)>640 or w*h>307200:
+            raise ValueError('Unsupported camera frame dimensions')
     frame=cv2.imdecode(np.frombuffer(jpeg,dtype=np.uint8),cv2.IMREAD_COLOR)
     if frame is None:raise ValueError('JPEG decode failed')
     h,w=frame.shape[:2];scale=min(640/w,640/h)
@@ -152,29 +160,42 @@ def detect_phone_in_jpeg(jpeg):
     x,y=(640-nw)//2,(640-nh)//2
     padded[y:y+nh,x:x+nw]=cv2.resize(frame,(nw,nh),interpolation=cv2.INTER_LINEAR)
     blob=cv2.dnn.blobFromImage(padded,scalefactor=1/255.0,size=(640,640),swapRB=True,crop=False)
-    if not _PHONE_DNN_LOCK.acquire(blocking=False):
-        return None  # Do not queue expensive inference under high concurrency.
+    if not _PHONE_DNN_LOCK.acquire(blocking=False):return None
     try:
         net=_phone_net()
         net.setInput(blob)
         output=np.asarray(net.forward())
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError('Phone detector inference failed') from exc
-    finally:
-        _PHONE_DNN_LOCK.release()
-    if output.ndim != 3 or output.shape[0] != 1:
-        raise RuntimeError('Unsupported ONNX output shape; expected YOLOv8 COCO-80')
-    if output.shape[1] == 84:
-        rows=output[0].T
-    elif output.shape[2] == 84:
-        rows=output[0]
-    else:
-        raise RuntimeError('Expected 84 YOLOv8 COCO-80 output channels')
-    if rows.shape[0] == 0:return 0.0
-    scores=rows[:,4:]
-    class_ids=np.argmax(scores,axis=1)
-    best=np.max(scores,axis=1)
-    phone=best[class_ids==_PHONE_CLASS_COCO80]
-    return float(np.max(phone)) if phone.size else 0.0
+    except RuntimeError:raise
+    except Exception as exc:raise RuntimeError('Device detector inference failed') from exc
+    finally:_PHONE_DNN_LOCK.release()
+    if output.ndim!=3 or output.shape[0]!=1:
+        raise RuntimeError('Unsupported ONNX output, expected YOLOv8 COCO-80')
+    if output.shape[1]==84:rows=output[0].T
+    elif output.shape[2]==84:rows=output[0]
+    else:raise RuntimeError('Expected 84 YOLOv8 COCO-80 output channels')
+    if len(rows)==0:return {'label':'none','confidence':0.0}
+    if not np.isfinite(rows).all():raise RuntimeError('Nonfinite ONNX prediction')
+    best_label='none';best_score=0.0
+    # Only class scores corresponding to supported devices. NMS filters
+    # duplicate overlapping predictions; candidate boxes are normalized
+    # model coordinates in the 640-pixel letterbox.
+    for class_id,label in _SUPPORTED_DEVICE_CLASSES.items():
+        scores=rows[:,4+class_id]
+        mask=scores>=0.15
+        if not mask.any():continue
+        candidates=rows[mask,:4]
+        candidate_scores=scores[mask].astype(float)
+        boxes=[]
+        for cx,cy,bw,bh in candidates:
+            boxes.append([float(cx-bw/2),float(cy-bh/2),float(bw),float(bh)])
+        retained=cv2.dnn.NMSBoxes(boxes,candidate_scores.tolist(),0.15,0.45)
+        if retained is None or len(retained)==0:continue
+        highest=max(float(candidate_scores[int(i)]) for i in np.asarray(retained).reshape(-1))
+        if highest>best_score:best_label=label;best_score=highest
+    return {'label':best_label,'confidence':min(1.0,best_score)}
+
+
+def detect_phone_in_jpeg(jpeg):
+    """Backward-compatible confidence-only interface used by old modules."""
+    result=detect_device_in_jpeg(jpeg)
+    return float(result['confidence']) if result is not None else None
