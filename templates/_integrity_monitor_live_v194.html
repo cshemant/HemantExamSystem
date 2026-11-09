@@ -1,0 +1,19 @@
+<div class="integrity-monitor-metrics">
+  <div class="card"><span>Online attempts</span><strong>{{ active_count }}</strong></div>
+  <div class="card"><span>Review signals</span><strong>{{ review_count }}</strong></div>
+  <div class="card"><span>Camera issues</span><strong>{{ camera_count }}</strong></div>
+</div>
+<div class="card integrity-monitor-results"><div class="integrity-monitor-section-head"><h2>Student attempts</h2><span class="mini-meta">{{ rows|length }} displayed · latest {{ recent_count }} considered · {{ refreshed_at }}</span></div>
+{% if rows %}<div class="table-wrap"><table class="integrity-monitor-table"><thead><tr><th>Student</th><th>Exam</th><th>Attempt</th><th>Connection</th><th>Signals</th><th>ML</th><th>Review</th></tr></thead><tbody>
+{% for row in rows %}<tr>
+<td><strong>{{ row.student.roll_no if row.student else 'Unknown' }}</strong><div class="mini-meta">{{ row.student.name if row.student else '' }}</div></td>
+<td>{{ row.exam.title }}</td>
+<td>#{{ row.attempt.id }}<div class="mini-meta">{{ row.attempt.status|replace('_',' ') }}</div></td>
+<td>{% if row.running %}<span class="monitor-pill monitor-pill-live">Online</span>{% elif row.attempt.status=='submitted' %}<span class="monitor-pill">Finished</span>{% else %}<span class="monitor-pill">{{ row.heartbeat|capitalize }}</span>{% endif %}</td>
+<td>{% if row.signals %}{% for label in row.signals %}<span class="monitor-pill monitor-pill-alert">{{ label }}</span>{% endfor %}{% else %}<span class="mini-meta">No current signals</span>{% endif %}{% if row.camera_problem %}<div class="mini-meta">{{ row.camera_count }} camera alerts</div>{% endif %}{% if row.phone_alerts %}<div class="mini-meta">{{ row.phone_alerts }} phone-review alert(s)</div>{% endif %}{% if row.focus %}<div class="mini-meta">{{ row.focus }} focus event(s)</div>{% endif %}</td>
+<td>{{ row.ml }}</td>
+<td><a class="btn small secondary" href="{{ url_for('attempt_audit',attempt_id=row.attempt.id) }}">Audit</a> <a class="mini-meta" href="{{ url_for('exam_integrity_dashboard',exam_id=row.exam.id) }}">Exam review</a></td>
+</tr>{% endfor %}
+</tbody></table></div>{% else %}<p class="mini-meta">No attempts match these filters.</p>{% endif %}
+</div>
+<p class="mini-meta">Review signals require faculty verification; a flag alone is not proof of misconduct. Counts cover the 250 most recent accessible attempts.</p>

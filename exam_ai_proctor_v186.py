@@ -5,18 +5,23 @@ presence is fallible; anomalous response patterns require human review.
 """
 from functools import lru_cache
 from io import BytesIO
+from pathlib import Path
+import os
+import threading
 
 
-@lru_cache(maxsize=1)
-def ai_proctor_dependencies():
-    """Check installed packages without importing the heavy ML model on exam start.
+@lru_cache(maxsize=2)
+def ai_proctor_dependencies(include_phone=False):
+    """Lightweight package checks for exam startup; model loading is admin-only.
 
-    Full model and OpenCV imports occur only when their actual operations run.
-    A package check is advisory; frame processing still fails closed if CV is broken.
+    Only the AI settings page/save verifies the ONNX model. Ordinary webcam
+    preflight never loads a Deep Learning model or imports scikit-learn.
     """
     from importlib.util import find_spec
-    return {'cv': find_spec('cv2') is not None and find_spec('numpy') is not None,
-            'ml': find_spec('sklearn') is not None}
+    cv=find_spec('cv2') is not None and find_spec('numpy') is not None
+    ml=find_spec('sklearn') is not None
+    phone=phone_detector_ready() if include_phone and cv else False
+    return {'cv':cv,'ml':ml,'phone':phone}
 
 
 @lru_cache(maxsize=1)
@@ -90,3 +95,86 @@ def score_exam_outliers(vectors, minimum_samples=25):
     model = IsolationForest(n_estimators=100, contamination=0.08, random_state=42, n_jobs=1)
     labels = model.fit_predict(array)
     return ['Review' if label == -1 else 'Typical' for label in labels]
+
+
+# COCO-80 object detector, class 67 = cell phone. This is Deep Learning inference
+# using OpenCV DNN and a separately provided YOLOv8n ONNX model. The model must
+# be operator-installed and licensed; no weights are downloaded in exam traffic.
+_PHONE_DNN_LOCK = threading.Lock()
+_PHONE_CLASS_COCO80 = 67
+
+def phone_model_path():
+    fallback = Path(__file__).resolve().parent / 'models' / 'phone_detector.onnx'
+    return Path(os.getenv('EXAM_PHONE_MODEL_PATH') or fallback).expanduser().resolve()
+
+@lru_cache(maxsize=1)
+def _phone_net():
+    path = phone_model_path()
+    if not path.is_file() or path.stat().st_size < 1_000_000:
+        raise RuntimeError('A COCO-80 YOLOv8 ONNX phone model is not configured')
+    try:
+        import cv2
+        return cv2.dnn.readNetFromONNX(str(path))
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError('OpenCV DNN is unavailable') from exc
+    except Exception as exc:
+        raise RuntimeError('The phone ONNX model cannot be loaded') from exc
+
+def phone_detector_ready():
+    try:
+        _phone_net()
+        return True
+    except RuntimeError:
+        return False
+
+def detect_phone_in_jpeg(jpeg):
+    """Highest COCO-80 cell-phone confidence, or None if inference is busy.
+
+    Supports YOLOv8 detect ONNX outputs [1,84,N] or [1,N,84]. Does not
+    retain images, identify people, or decide whether cheating occurred.
+    """
+    if not isinstance(jpeg, bytes) or not 100 <= len(jpeg) <= 80000 or not jpeg.startswith(b'\xff\xd8'):
+        raise ValueError('Invalid phone-analysis JPEG')
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError('OpenCV and NumPy required') from exc
+    with __import__('PIL.Image', fromlist=['Image']).open(BytesIO(jpeg)) as image:
+        w, h = image.size
+        if image.format != 'JPEG' or min(w,h) < 64 or max(w,h) > 640 or w*h > 307200:
+            raise ValueError('Invalid phone-analysis JPEG dimensions')
+    frame=cv2.imdecode(np.frombuffer(jpeg,dtype=np.uint8),cv2.IMREAD_COLOR)
+    if frame is None:raise ValueError('JPEG decode failed')
+    h,w=frame.shape[:2];scale=min(640/w,640/h)
+    nw,nh=max(1,round(w*scale)),max(1,round(h*scale))
+    padded=np.full((640,640,3),114,dtype=np.uint8)
+    x,y=(640-nw)//2,(640-nh)//2
+    padded[y:y+nh,x:x+nw]=cv2.resize(frame,(nw,nh),interpolation=cv2.INTER_LINEAR)
+    blob=cv2.dnn.blobFromImage(padded,scalefactor=1/255.0,size=(640,640),swapRB=True,crop=False)
+    if not _PHONE_DNN_LOCK.acquire(blocking=False):
+        return None  # Do not queue expensive inference under high concurrency.
+    try:
+        net=_phone_net()
+        net.setInput(blob)
+        output=np.asarray(net.forward())
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError('Phone detector inference failed') from exc
+    finally:
+        _PHONE_DNN_LOCK.release()
+    if output.ndim != 3 or output.shape[0] != 1:
+        raise RuntimeError('Unsupported ONNX output shape; expected YOLOv8 COCO-80')
+    if output.shape[1] == 84:
+        rows=output[0].T
+    elif output.shape[2] == 84:
+        rows=output[0]
+    else:
+        raise RuntimeError('Expected 84 YOLOv8 COCO-80 output channels')
+    if rows.shape[0] == 0:return 0.0
+    scores=rows[:,4:]
+    class_ids=np.argmax(scores,axis=1)
+    best=np.max(scores,axis=1)
+    phone=best[class_ids==_PHONE_CLASS_COCO80]
+    return float(np.max(phone)) if phone.size else 0.0

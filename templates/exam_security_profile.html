@@ -17,15 +17,28 @@
   <input id="seb-key" type="password" name="seb_config_key" autocomplete="off" minlength="64" maxlength="64" pattern="[0-9A-Fa-f]{64}" placeholder="Paste the saved SEB Config Key here">
   <div class="mini-meta">Key status: {% if profile.seb_config_key %}Configured (ends in …{{ profile.seb_config_key[-6:] }}){% else %}Not configured{% endif %}. Never paste the key in public screenshots or share a configuration file that exposes it.</div>
   <label class="checkline"><input type="checkbox" name="clear_seb_key"> Clear saved key (only if reverting to Standard)</label>
-  <h3>Optional AI / Webcam Monitoring (independent switches)</h3>
-  <div class="integrity-options">
-    <label class="checkline"><input type="checkbox" name="enable_ml" {% if profile.ml_enabled %}checked{% endif %}> <strong>ML anomaly review</strong> (25 completed attempts required)</label>
-    <label class="checkline"><input type="checkbox" name="enable_webcam" {% if profile.webcam_enabled %}checked{% endif %}> <strong>Webcam proctoring</strong> (camera verification required)</label>
-  </div>
-  <p class="mini-meta">ML: {{ 'Ready' if dependencies.ml else 'Unavailable' }} · Computer Vision: {{ 'Ready' if dependencies.cv else 'Unavailable' }} · Settings lock after the first attempt.</p>
-  <p class="mini-meta">Monitoring alerts require human review. Provide camera-access alternatives through the invigilator.</p>
   <div class="actions"><button>Save security profile</button><a class="btn secondary" href="{{ url_for('exam_integrity_dashboard',exam_id=exam.id) }}">Review integrity events</a></div>
 </fieldset></form>
+</div>
+
+<div class="card">
+  <h2>AI Proctoring Settings</h2>
+  <p class="mini-meta">Three independent analysis controls. Phone detection requires the existing webcam, but does not require ML anomaly detection.</p>
+  {% if active_attempt_count %}<p class="integrity-banner">{{ active_attempt_count }} exam attempt(s) are active. Changes are paused until they finish.</p>{% endif %}
+  <form method="post" action="{{ url_for('exam_ai_settings_admin',exam_id=exam.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <fieldset {% if active_attempt_count %}disabled{% endif %}>
+      <div class="integrity-options">
+        <label class="checkline"><input type="checkbox" name="enable_ml" {% if profile.ml_enabled %}checked{% endif %}> <strong>1. Machine Learning anomaly detection</strong> — completed-attempt analysis</label>
+        <label class="checkline"><input type="checkbox" name="enable_webcam" {% if profile.webcam_enabled %}checked{% endif %}> <strong>2. Webcam face monitoring</strong> — requires camera verification</label>
+        <label class="checkline"><input type="checkbox" name="enable_phone" {% if profile.phone_detection_enabled %}checked{% endif %} {% if not dependencies.phone and not profile.phone_detection_enabled %}disabled{% endif %}> <strong>3. Deep Learning mobile phone detection</strong> — visible phones, review-only</label>
+      </div>
+      <p class="mini-meta">ML: {{ 'Ready' if dependencies.ml else 'Not installed' }} · Webcam: {{ 'Ready' if dependencies.cv else 'Not installed' }} · Phone detector: {{ 'Ready' if dependencies.phone else 'Model missing or unavailable' }}.</p>
+      {% if not dependencies.phone %}<p class="mini-meta">Provide a licensed COCO-80 YOLOv8n ONNX model at <code>models/phone_detector.onnx</code> or set <code>EXAM_PHONE_MODEL_PATH</code>. No model downloads occur during exams.</p>{% endif %}
+      <p class="mini-meta">Phone alerts indicate a possibly visible device, not proven cheating. No camera photos are stored by detection.</p>
+      <button class="btn" type="submit">Save AI settings</button>
+    </fieldset>
+  </form>
 </div>
 
 <div class="card">

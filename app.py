@@ -27,7 +27,7 @@ from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
 from exam_integrity_v185 import validate_seb_config_hash, security_event_weight, visibility_allowed_question
-from exam_ai_proctor_v186 import count_faces_in_jpeg, score_exam_outliers, ai_proctor_dependencies
+from exam_ai_proctor_v186 import count_faces_in_jpeg, score_exam_outliers, ai_proctor_dependencies, detect_phone_in_jpeg
 from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
 from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, generate_subject_context_questions, generate_placement_questions, AIProviderError
 from public_content import PUBLIC_GUIDES, discover_public_updates, get_public_guide, public_update_by_slug, related_updates, public_sitemap_paths
@@ -777,6 +777,7 @@ class ExamSecurityProfile(Base):
     seb_config_key:Mapped[str]=mapped_column(String(64),nullable=False,default='')
     ml_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     webcam_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
+    phone_detection_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     bulk_recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
@@ -806,6 +807,11 @@ class ExamProctorSummary(Base):
     camera_error_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     consecutive_no_face:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     consecutive_multiple_face:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    phone_sample_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    phone_detected_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    consecutive_phone_detected:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    phone_error_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
+    last_phone_confidence:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
     last_sample_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     last_camera_error_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
@@ -1263,6 +1269,12 @@ def run_schema_upgrades():
         ('faculty_roles','institution_id',"INTEGER"),
         ('exam_security_profiles','ml_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_profiles','webcam_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_security_profiles','phone_detection_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
+        ('exam_proctor_summaries','phone_sample_count',"INTEGER NOT NULL DEFAULT 0"),
+        ('exam_proctor_summaries','phone_detected_count',"INTEGER NOT NULL DEFAULT 0"),
+        ('exam_proctor_summaries','consecutive_phone_detected',"INTEGER NOT NULL DEFAULT 0"),
+        ('exam_proctor_summaries','phone_error_count',"INTEGER NOT NULL DEFAULT 0"),
+        ('exam_proctor_summaries','last_phone_confidence',"FLOAT NOT NULL DEFAULT 0.0"),
         ('exam_security_profiles','recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_profiles','bulk_recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
@@ -4379,7 +4391,7 @@ def integrity_monitor_v194():
     state=(request.args.get('state') or 'all').lower()
     if state not in {'all','active','submitted'}:state='all'
     signal=(request.args.get('signal') or 'all').lower()
-    if signal not in {'all','review','camera','focus','timing','ml'}:signal='all'
+    if signal not in {'all','review','camera','phone','focus','timing','ml'}:signal='all'
     query=(request.args.get('q') or '').strip().lower()[:70]
     attempts=(s.scalars(select(Attempt).where(Attempt.exam_id.in_(requested_exam_ids))
                         .order_by(Attempt.id.desc()).limit(250)).all() if requested_exam_ids else [])
@@ -4425,7 +4437,8 @@ def integrity_monitor_v194():
         running=(attempt.status=='in_progress' and heartbeat=='online')
         camera=summary_map.get(attempt.id)
         camera_events=camera_flags.get(attempt.id,[])
-        camera_count=sum(c for _,c in camera_events)
+        phone_alerts=sum(c for kind,c in camera_events if kind=='phone_visible_2_samples')
+        camera_count=sum(c for kind,c in camera_events if kind!='phone_visible_2_samples')
         camera_error=int(camera.camera_error_count or 0) if camera else 0
         focus=focus_by_attempt.get(attempt.id,0)
         fast,answered,changes=time_by_attempt.get(attempt.id,(0,0,0))
@@ -4436,6 +4449,7 @@ def integrity_monitor_v194():
         row={'attempt':attempt,'exam':exam_map[attempt.exam_id],'student':student,
              'running':running,'heartbeat':heartbeat,'camera':camera,'camera_problem':camera_problem,
              'camera_events':camera_events,'camera_count':camera_count,'camera_error':camera_error,
+             'phone_alerts':phone_alerts,'phone_enabled':bool(profiles.get(attempt.exam_id) and profiles[attempt.exam_id].phone_detection_enabled),
              'focus':focus,'fast':fast,'answered':answered,'changes':changes,
              'ml':'Off' if not (profiles.get(attempt.exam_id) and profiles[attempt.exam_id].ml_enabled) else 'Insufficient data'}
         rows.append(row)
@@ -4451,10 +4465,11 @@ def integrity_monitor_v194():
         for (row,_),outcome in zip(group,outcomes):row['ml']=outcome
     for row in rows:
         row['timing_review']=bool(row['answered']>=3 and row['fast']>=3)
-        row['review']=bool(row['camera_problem'] or row['focus']>0 or row['ml']=='Review'
+        row['review']=bool(row['camera_problem'] or row['phone_alerts']>0 or row['focus']>0 or row['ml']=='Review'
                            or row['timing_review'])
         row['signals']=[]
         if row['camera_problem']:row['signals'].append('Camera')
+        if row['phone_alerts']:row['signals'].append('Possible phone')
         if row['focus']:row['signals'].append('Focus')
         if row['timing_review']:row['signals'].append('Timing')
         if row['ml']=='Review':row['signals'].append('ML')
@@ -4466,6 +4481,7 @@ def integrity_monitor_v194():
     elif state=='submitted':rows=[row for row in rows if row['attempt'].status=='submitted']
     if signal=='review':rows=[row for row in rows if row['review']]
     elif signal=='camera':rows=[row for row in rows if row['camera_problem']]
+    elif signal=='phone':rows=[row for row in rows if row['phone_alerts']>0]
     elif signal=='focus':rows=[row for row in rows if row['focus']>0]
     elif signal=='timing':rows=[row for row in rows if row['timing_review']]
     elif signal=='ml':rows=[row for row in rows if row['ml']=='Review']
@@ -8334,31 +8350,51 @@ def exam_security_profile_admin(exam_id):
             s.rollback()
             flash('Cannot enable protected mode until EXAM_SEB_EXTERNAL_ORIGIN is set and a valid SEB Config Key is saved.','error')
             return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-        enable_ml=request.form.get('enable_ml')=='on'
-        enable_webcam=request.form.get('enable_webcam')=='on'
-        deps=ai_proctor_dependencies()
-        if enable_ml and not deps['ml']:
-            s.rollback();flash('Install requirements-ai-proctor.txt on the staging server before enabling ML.','error')
-            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-        if enable_webcam and not deps['cv']:
-            s.rollback();flash('Install requirements-ai-proctor.txt on the staging server before enabling webcam CV.','error')
-            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-        profile.ml_enabled=enable_ml
-        profile.webcam_enabled=enable_webcam
-        if not enable_webcam:
-            profile.recording_enabled=False
-            profile.bulk_recording_enabled=False
         profile.mode=mode;profile.require_seb=require_seb;profile.updated_at=now_iso()
         if require_seb:
             cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.updated_at=now_iso()
             legacy_policy=get_exam_security_policy(s,exam_id,create=True)
             legacy_policy.auto_submit_on_integrity_limit=False
             legacy_policy.updated_at=now_iso()
-        audit_event(s,'exam_security_profile_saved','exam',exam_id,f'mode={mode}; seb_required={require_seb}; ml={enable_ml}; webcam={enable_webcam}')
-        s.commit();flash('V185 security profile saved. Test the SEB configuration on staging before activating this exam.')
+        audit_event(s,'exam_security_profile_saved','exam',exam_id,f'mode={mode}; seb_required={require_seb}')
+        s.commit();flash('Security profile saved. Test protected modes before activating this exam.')
         return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
     return render_template('exam_security_profile.html',exam=exam,profile=profile,attempt_count=attempt_count,
-                           dependencies=ai_proctor_dependencies(),recording_available=bool(_exam_video_storage_root()),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
+                           dependencies=ai_proctor_dependencies(include_phone=True),recording_available=bool(_exam_video_storage_root()),active_attempt_count=int(s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id,Attempt.status=='in_progress')) or 0),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
+
+
+@app.route('/admin/exam/<int:exam_id>/ai-settings',methods=['POST'])
+@staff_required
+def exam_ai_settings_admin(exam_id):
+    s=DB();exam=s.get(Exam,exam_id)
+    if not exam:abort(404)
+    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
+    profile=get_exam_security_profile(s,exam_id,create=True)
+    active=int(s.scalar(select(func.count()).select_from(Attempt).where(
+        Attempt.exam_id==exam_id,Attempt.status=='in_progress')) or 0)
+    if active:
+        flash('AI settings cannot change while any student is taking this exam.','error')
+        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+    ml=request.form.get('enable_ml')=='on'
+    webcam=request.form.get('enable_webcam')=='on'
+    phone=request.form.get('enable_phone')=='on'
+    ready=ai_proctor_dependencies(include_phone=True)
+    if phone and not webcam:
+        flash('Mobile phone detection requires webcam monitoring.','error')
+        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+    if (ml and not ready['ml']) or (webcam and not ready['cv']) or (phone and not ready['phone']):
+        flash('One selected AI feature is not ready on this server. Check the dependency/model status.','error')
+        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+    profile.ml_enabled=ml;profile.webcam_enabled=webcam;profile.phone_detection_enabled=phone
+    if not webcam:
+        profile.recording_enabled=False
+        profile.bulk_recording_enabled=False
+    profile.updated_at=now_iso()
+    audit_event(s,'exam_ai_settings_saved','exam',exam_id,
+                f'ml={ml}; webcam={webcam}; phone={phone}')
+    s.commit()
+    flash('AI proctoring settings saved for future exam activity.')
+    return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
 
 
 @app.route('/admin/exam/<int:exam_id>/recording-policy',methods=['POST'])
@@ -8720,6 +8756,7 @@ def exam_integrity_dashboard(exam_id):
     profile=get_exam_security_profile(s,exam_id,create=False)
     webcam_enabled=bool(profile and profile.webcam_enabled)
     ml_enabled=bool(profile and profile.ml_enabled)
+    phone_enabled=bool(profile and profile.phone_detection_enabled)
     # One query for summaries / flags, not one query per attempt.
     ids=[r['attempt'].id for r in rows]
     summaries={x.attempt_id:x for x in s.scalars(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id.in_(ids))).all()} if ids else {}
@@ -8758,7 +8795,7 @@ def exam_integrity_dashboard(exam_id):
                            bulk_recording_enabled=bool(profile and profile.bulk_recording_enabled),
                            active_attempt_count=sum(1 for r in rows if r['attempt'].status=='in_progress'),
                            recording_available=bool(_exam_video_storage_root()),
-                           webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,ml_baseline_count=len(vectors))
+                           webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,phone_enabled=phone_enabled,ml_baseline_count=len(vectors))
 
 
 @app.route('/admin/exam/<int:exam_id>/student-access')
@@ -10727,7 +10764,7 @@ def v188_webcam_preflight(exam_id):
         challenges=web_session.get('_v188_camera_challenges') or {}
         challenges[str(exam_id)]={'nonce':nonce,'issued_at':int(time.time()),'student_id':student.id}
         web_session['_v188_camera_challenges']=challenges
-        response=app.make_response(render_template('exam_webcam_preflight_v188.html',exam=exam,next_url=next_url,nonce=nonce,student=student,cv_ready=ai_proctor_dependencies()['cv']))
+        response=app.make_response(render_template('exam_webcam_preflight_v188.html',exam=exam,next_url=next_url,nonce=nonce,student=student,cv_ready=ai_proctor_dependencies(include_phone=True)['cv'],phone_proctor_enabled=bool(profile.phone_detection_enabled)))
         response.headers['Cache-Control']='no-store, no-cache, must-revalidate'
         return response
     if request.content_length is not None and request.content_length>115000:return jsonify(ok=False,error='Frame too large.'),413
@@ -10973,7 +11010,7 @@ def take_exam(exam_id):
         visual_watermark=f'Roll {student_ref} | Exam {exam.id} | Attempt {attempt.id}'
     else:
         visual_watermark=''
-    return render_template('exam.html',webcam_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).webcam_enabled),visual_protection_mode=visual_mode,visual_watermark=visual_watermark,exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
+    return render_template('exam.html',phone_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).phone_detection_enabled),webcam_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).webcam_enabled),visual_protection_mode=visual_mode,visual_watermark=visual_watermark,exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
 
 @app.route('/student/exam/<int:exam_id>/section/select',methods=['POST'])
 @student_required
@@ -11208,6 +11245,25 @@ def student_proctor_frame():
             s.add(ExamProctorFlag(attempt_id=attempt.id,alert_type='multiple_faces_2_samples',created_at=now_iso()))
     else:
         summary.one_face_count+=1;summary.consecutive_multiple_face=0;summary.consecutive_no_face=0
+    # This is optional review-only inference using an EXISTING camera sample.
+    # Skip the first frame to avoid delaying exam start; never re-open the camera.
+    if profile.phone_detection_enabled and summary.sample_count > 1:
+        try:
+            phone_confidence=detect_phone_in_jpeg(jpeg)
+            if phone_confidence is not None:  # Busy inference should not block the exam.
+                summary.phone_sample_count+=1
+                summary.last_phone_confidence=round(phone_confidence,3)
+                if phone_confidence>=0.55:
+                    summary.phone_detected_count+=1
+                    summary.consecutive_phone_detected+=1
+                    if summary.consecutive_phone_detected==2:
+                        s.add(ExamProctorFlag(attempt_id=attempt.id,
+                               alert_type='phone_visible_2_samples',created_at=now_iso()))
+                else:
+                    summary.consecutive_phone_detected=0
+        except (ValueError,RuntimeError):
+            summary.phone_error_count+=1
+            # Keep webcam/answering functional if optional inference is unavailable.
     s.commit()
     # Never expose face imagery or biometric identity in response.
     return jsonify(accepted=True,status='review_only',samples=summary.sample_count)

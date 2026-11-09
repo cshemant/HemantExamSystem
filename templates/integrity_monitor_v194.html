@@ -1,0 +1,15 @@
+{% extends 'base.html' %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('static',filename='integrity_monitor_v194.css') }}?v=194">
+<div class="page-head"><div><h1>AI Exam Integrity Monitor</h1><p>Recent examination activity across permitted exams</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('exams') }}">Exams</a></div></div>
+<form class="integrity-monitor-filters card" method="get" action="{{ url_for('integrity_monitor_v194') }}" aria-label="Filter integrity monitor">
+  <label>Exam<select name="exam_id"><option value="">All permitted exams</option>{% for e in exams %}<option value="{{ e.id }}" {% if selected_exam_id == e.id %}selected{% endif %}>{{ e.title }} (#{{ e.id }})</option>{% endfor %}</select></label>
+  <label>Status<select name="state"><option value="all" {% if state=='all' %}selected{% endif %}>All</option><option value="active" {% if state=='active' %}selected{% endif %}>Active</option><option value="submitted" {% if state=='submitted' %}selected{% endif %}>Submitted</option></select></label>
+  <label>Signal<select name="signal"><option value="all" {% if signal=='all' %}selected{% endif %}>All</option><option value="review" {% if signal=='review' %}selected{% endif %}>Needs review</option><option value="camera" {% if signal=='camera' %}selected{% endif %}>Camera</option><option value="phone" {% if signal=='phone' %}selected{% endif %}>Possible phone</option><option value="focus" {% if signal=='focus' %}selected{% endif %}>Focus</option><option value="timing" {% if signal=='timing' %}selected{% endif %}>Timing</option><option value="ml" {% if signal=='ml' %}selected{% endif %}>ML</option></select></label>
+  <label>Find student<input type="search" name="q" maxlength="70" placeholder="Roll or name" value="{{ query }}"></label>
+  <button type="submit" class="btn">Filter</button>
+</form>
+<div class="monitor-toolbar"><span class="mini-meta">Auto-refresh every 45 seconds</span><button type="button" class="btn secondary small" id="integrity-monitor-refresh">Refresh now</button><button type="button" class="btn secondary small" id="integrity-monitor-pause" aria-pressed="false">Pause updates</button><span class="mini-meta" id="integrity-monitor-connection" role="status" aria-live="polite"></span></div>
+<div id="integrity-monitor-live" aria-label="Current integrity monitoring results">{% include '_integrity_monitor_live_v194.html' %}</div>
+<script defer src="{{ url_for('static',filename='integrity_monitor_v194.js') }}?v=194"></script>
+{% endblock %}
