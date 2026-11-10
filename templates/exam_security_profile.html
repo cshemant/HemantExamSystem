@@ -20,10 +20,8 @@
   <div class="actions"><button>Save security profile</button><a class="btn secondary" href="{{ url_for('exam_integrity_dashboard',exam_id=exam.id) }}">Review integrity events</a></div>
 </fieldset></form>
 </div>
-
 <div class="card">
   <h2>AI Proctoring Settings</h2>
-  <p class="mini-meta">Three independent analysis controls. Phone detection requires the existing webcam, but does not require ML anomaly detection.</p>
   {% if active_attempt_count %}<p class="integrity-banner">{{ active_attempt_count }} exam attempt(s) are active. Changes are paused until they finish.</p>{% endif %}
   <form method="post" action="{{ url_for('exam_ai_settings_admin',exam_id=exam.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -33,22 +31,18 @@
         <label class="checkline"><input type="checkbox" name="enable_webcam" {% if profile.webcam_enabled %}checked{% endif %}> <strong>2. Webcam face monitoring</strong> — requires camera verification</label>
         <label class="checkline"><input type="checkbox" name="enable_phone" {% if profile.phone_detection_enabled %}checked{% endif %} {% if not dependencies.phone and not profile.phone_detection_enabled %}disabled{% endif %}> <strong>3. Deep Learning mobile phone detection</strong> — phones and laptops in webcam view</label>
       </div>
-      <div style="margin:12px 0 16px;max-width:660px">
-        <label for="phone_response_mode"><strong>When a phone or supported electronic device is detected</strong></label>
+      <div style="margin:16px 0 14px;max-width:660px">
+        <label for="phone_response_mode"><strong>Device detection response</strong></label>
         <select id="phone_response_mode" name="phone_response_mode" style="max-width:100%;width:100%">
           <option value="review" {% if profile.phone_response_mode != 'halt' %}selected{% endif %}>Flag for faculty review (exam continues)</option>
           <option value="halt" {% if profile.phone_response_mode == 'halt' %}selected{% endif %}>Halt exam immediately for faculty review</option>
         </select>
-        <p class="mini-meta">Halt locks answering/navigation and pauses the timer. Faculty must explicitly resume. High-confidence or repeated detections trigger a hold; alerts can be mistaken.</p>
       </div>
-      <p class="mini-meta">ML: {{ 'Ready' if dependencies.ml else 'Not installed' }} · Webcam: {{ 'Ready' if dependencies.cv else 'Not installed' }} · Phone model: {{ 'Configured (validation occurs during sampling)' if dependencies.phone else 'Missing model/dependency' }}.</p>
-      {% if not dependencies.phone %}<p class="mini-meta">Provide a licensed COCO-80 YOLOv8n ONNX model at <code>models/phone_detector.onnx</code> or set <code>EXAM_PHONE_MODEL_PATH</code>. No model downloads occur during exams.</p>{% endif %}
-      <p class="mini-meta">Device alerts are estimates, not proof of misconduct. No camera photos are stored by detection.</p>
+      {% if not dependencies.phone %}<p class="mini-meta">Phone detection unavailable. Check the configured detector model.</p>{% endif %}
       <button class="btn" type="submit">Save AI settings</button>
     </fieldset>
   </form>
 </div>
-
 <div class="card">
   <h2>On-demand webcam recording</h2>
   <p class="mini-meta">{{ 'Temporary storage (not durable)' if recording_temporary else ('Storage configured' if recording_available else 'Storage not configured') }} · {{ 'Enabled' if profile.recording_enabled else 'Disabled' }} · Faculty-controlled: individual or Record All</p>
