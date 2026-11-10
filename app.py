@@ -2652,11 +2652,8 @@ def exam_access_for_student(s,student_id,exam):
         # question-based duration and remain available like regular exams.
     if start and now<start:
         return False,f'Scheduled for {start.strftime("%d %b, %I:%M %p")}',matched
-    if end and now>end:
-        existing=get_attempt(s,student_id,exam.id)
-        held=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==existing.id)) if existing and existing.status=='in_progress' else None
-        permitted_extension=bool(existing and held and (held.device_halt_at or int(held.device_pause_seconds or 0)>0) and now_dt()<parse_dt(existing.end_at))
-        if not permitted_extension:return False,'Exam window closed',matched
+    if end and now>=end:
+        return False,'Exam window closed',matched
     if security and security.strict_start_window and start:
         attempt=get_attempt(s,student_id,exam.id)
         grace=max(0,int(security.start_grace_minutes or 0))
@@ -4077,28 +4074,25 @@ def reconcile_expired_exam_attempts(s, exam_id):
     ).order_by(Attempt.id)).all()
     expired=0
     for attempt in open_attempts:
-        if _active_device_hold(s,attempt):
-            continue
         try:
             deadline=parse_dt(attempt.end_at)
-            # The scheduled window may have been shortened since the attempt
-            # was created. Respect whichever deadline is earlier.
+            # An exam's scheduled end is a hard stop, even if an AI device
+            # alert has paused this attempt. A hold must not keep a finished
+            # exam indefinitely in progress or block faculty settings.
             window=resolved_exam_window_for_student(s,attempt.student_id,exam)
             scheduled_end=window.get('end')
             if scheduled_end:
                 if scheduled_end.tzinfo is None:
                     scheduled_end=scheduled_end.replace(tzinfo=DISPLAY_TZ)
-                summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id))
-                if summary and summary.device_pause_seconds:
-                    scheduled_end+=timedelta(seconds=int(summary.device_pause_seconds))
                 deadline=min(deadline,scheduled_end)
         except (TypeError,ValueError,OverflowError) as exc:
             app.logger.warning('Invalid exam deadline for attempt %s: %s',attempt.id,exc)
             continue
         if checked_at < deadline:continue
         try:
-            # Existing submission pathway recalculates scores, records a
-            # reason, and synchronizes the practical assessment (if relevant).
+            # Device holds do not exempt an attempt from its final deadline.
+            # The existing finalizer saves scores, submission diagnostics and
+            # practical marks, so students need not revisit their exam page.
             finalize_attempt(s,attempt,'TIME_EXPIRED')
             expired+=1
         except Exception:
@@ -8842,7 +8836,7 @@ def exam_integrity_dashboard(exam_id):
     for index,row in enumerate(rows):
         summary=summaries.get(row['attempt'].id)
         row['camera']=summary
-        row['device_halt']=bool(summary and summary.device_halt_at)
+        row['device_halt']=bool(row['attempt'].status=='in_progress' and summary and summary.device_halt_at)
         row['camera_flags']=flag_map.get(row['attempt'].id,[])[:5]
         row['ml_signal']='Off' if not ml_enabled else 'Collecting baseline'
         if row['attempt'].status=='submitted':
