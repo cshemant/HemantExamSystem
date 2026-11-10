@@ -17,7 +17,6 @@
     <div class="login-card"><h3>Faculty / Admin Login</h3><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="login_type" value="admin"><div class="grid"><div><label>Username</label><input name="username" autocomplete="username" required></div><div><label>Password</label><input name="password" type="password" autocomplete="current-password" required></div></div><button>Login as Faculty / Admin</button></form></div>
   </div>
 </div></section>
-
 <section class="public-seo-section" id="exam-system-features" aria-labelledby="features-title">
   <div class="container">
     <div class="public-section-heading">
@@ -33,7 +32,6 @@
     </div>
   </div>
 </section>
-
 <section class="public-seo-section public-seo-soft" aria-labelledby="workflow-title">
   <div class="container public-workflow-layout">
     <div class="public-section-heading">
@@ -49,7 +47,39 @@
     </ol>
   </div>
 </section>
-
+<!-- Security section: reuse existing public-section and feature-card styles; no new assets or routes. -->
+<section class="public-seo-section" id="exam-security" aria-labelledby="security-title">
+  <div class="container">
+    <div class="public-section-heading">
+      <div class="eyebrow">Multi-layer exam integrity</div>
+      <h2 id="security-title">Smarter monitoring. Stronger exam integrity.</h2>
+      <p>Learn with Hemant combines configurable AI-assisted proctoring with practical exam controls. Faculty can review suspicious activity and choose an appropriate response, while students get a focused examination experience.</p>
+    </div>
+    <div class="public-feature-grid">
+      <article class="public-feature-card">
+        <span class="public-feature-number">01 · Computer Vision</span>
+        <h3>Webcam face monitoring</h3>
+        <p>When enabled, camera checks can flag missing or multiple faces during an exam for faculty review.</p>
+      </article>
+      <article class="public-feature-card">
+        <span class="public-feature-number">02 · Machine Learning</span>
+        <h3>Anomaly detection</h3>
+        <p>Completed-attempt analysis looks for unusual response patterns and integrity signals to support faculty investigation.</p>
+      </article>
+      <article class="public-feature-card">
+        <span class="public-feature-number">03 · Deep Learning</span>
+        <h3>Visible mobile-phone detection</h3>
+        <p>An AI object-detection model checks sampled webcam frames for visible phones. Administrators can configure alerts or exam halts for supported detections.</p>
+      </article>
+      <article class="public-feature-card">
+        <span class="public-feature-number">04 · OCR-Aware Safeguards</span>
+        <h3>Question-content protection</h3>
+        <p>Question watermarks, randomized papers and one-question navigation help discourage copying and OCR-assisted answer sharing.</p>
+      </article>
+    </div>
+    <p class="muted" style="margin-top:20px">Additional controls include rotating PINs, device-access rules, fullscreen and focus-event monitoring, and audit logs, depending on exam configuration. Automated alerts are not proof of misconduct, and no online exam system can guarantee prevention of every cheating method.</p>
+  </div>
+</section>
 <section class="public-seo-section" aria-labelledby="faq-title">
   <div class="container public-faq-layout">
     <div class="public-section-heading">
