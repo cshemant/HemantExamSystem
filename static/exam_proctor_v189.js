@@ -7,7 +7,7 @@ const id=Number(panel.dataset.examId), frameUrl=panel.dataset.frameUrl, statusUr
 const recordingControlUrl=panel.dataset.recordControlUrl, recordingChunkUrl=panel.dataset.recordChunkUrl, recordingFinishUrl=panel.dataset.recordFinishUrl;
 const recordingNotice=document.getElementById('webcam-video-notice');
 const video=document.getElementById('proctor-preview'), status=document.getElementById('proctor-status');
-const retry=document.getElementById('v189-camera-retry'), legacyRetry=document.getElementById('proctor-start');
+const retry=document.getElementById('v189-camera-retry');
 const lock=document.getElementById('v189-camera-lock'), lockMsg=document.getElementById('v189-camera-lock-msg');
 let stream=null,interval=null,lastOk=0,starting=false,uploading=false,ended=false,deviceHalted=false;
 const haltMode=panel.dataset.deviceResponse==='halt';
@@ -26,7 +26,10 @@ async function verifiedLease(){try{const r=await fetch(leaseUrl,{credentials:'sa
 function cameraLive(){return !!(stream&&stream.getVideoTracks()[0]&&stream.getVideoTracks()[0].readyState==='live'&&video.videoWidth>=64);}
 function videoNotice(text){
  if(!recordingNotice)return;
- recordingNotice.textContent=text;
+ // Hide only the routine no-recording message; preserve active-recording and error notices.
+ const routine=!text||text==='Camera required · Face-count checks · No video stored';
+ recordingNotice.textContent=routine?'':text;
+ recordingNotice.style.display=routine?'none':'block';
  const active=text.startsWith('● Video recording');
  recordingNotice.style.color=active?'#b91c1c':'';
  recordingNotice.style.fontWeight=active?'700':'';
@@ -150,7 +153,7 @@ async function frame(){
   if(image.length>165000)throw Error('Camera image too large');
   try{const result=await post(frameUrl,{frame:image});if(result.halted){deviceHold(result.notice);lastOk=Date.now();return true;}}
   catch(e){if(e.httpStatus!==429||!await verifiedLease())throw e;}
-  lastOk=Date.now();unblock();message('Camera active · monitoring samples are being verified');if(nextUrl){location.replace(nextUrl);}return true;
+  lastOk=Date.now();unblock();message('Camera active');if(nextUrl){location.replace(nextUrl);}return true;
  }catch(e){
   // One late monitoring response is not a camera disconnection. The server still
   // enforces its fresh-sample lease independently of this display.
@@ -224,7 +227,7 @@ window.__examProctorVerifyNow=async()=>{
  if(uploading){return await verifiedLease();}
  return await frame();
 };
-retry?.addEventListener('click',()=>void start());legacyRetry?.addEventListener('click',()=>void start());
+retry?.addEventListener('click',()=>void start());
 window.addEventListener('pagehide',stop,{once:true});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&Date.now()-lastOk>52000)block('Camera connection needs verification.');});
 // V188 preflight already collected consent; keep this gate active regardless of sessionStorage.
