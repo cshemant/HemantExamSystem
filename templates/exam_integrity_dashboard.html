@@ -1,8 +1,5 @@
 {% extends 'base.html' %}{% block content %}
 <div class="page-head"><div><a href="{{ url_for('exam_builder',exam_id=exam.id) }}">← Exam Blueprint</a><h1>Security Review Dashboard</h1><p>{{ exam.title }} · Most recent {{ rows|length }} attempts (maximum 200)</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('exam_security_profile_admin',exam_id=exam.id) }}">Security Settings</a></div></div>
-<p class="mini-meta">ML: {{ 'On' if ml_enabled else 'Off' }} · Webcam: {{ 'On' if webcam_enabled else 'Off' }} · Phone DL: {{ 'On' if phone_enabled else 'Off' }}{% if ml_enabled %} · ML baseline: {{ ml_baseline_count }}/25{% endif %} · Device response: {{ phone_response|title }} · Alerts require faculty review.</p>
-{% if webcam_enabled %}<p class="mini-meta">On-demand video: {{ 'Enabled' if recording_enabled else 'Disabled' }} · {{ 'Temporary storage (not durable)' if recording_temporary else ('Storage configured' if recording_available else 'Private storage required') }} · <a href="{{ url_for('exam_security_profile_admin',exam_id=exam.id) }}">Recording settings</a></p>
-{% if recording_temporary %}<p class="mini-meta">Video storage is temporary. Saved clips can disappear after a Render restart or deployment. Use a persistent disk or private object storage for real exams.</p>{% endif %}{% endif %}
 <div class="card"><h2>Student Attempts</h2>
 {% if webcam_enabled and recording_enabled and recording_available %}
 <div class="actions" style="margin:12px 0;gap:12px;flex-wrap:wrap;align-items:center">
@@ -13,7 +10,7 @@
   {% else %}
   <form method="post" action="{{ url_for('admin_start_all_exam_video',exam_id=exam.id) }}" onsubmit="return confirm('Start recording all active students and students who join later? Students will see a recording notice. Video storage is required.')">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn" type="submit">Record All Students</button>
-  </form><span class="mini-meta">{{ active_attempt_count }} active attempt(s) · individual controls remain available</span>
+  </form><span class="mini-meta">{{ active_attempt_count }} active attempt{{ '' if active_attempt_count == 1 else 's' }}</span>
   {% endif %}
 </div>
 {% endif %}
