@@ -18,7 +18,7 @@
   <div class="mock-entry-or" role="separator"><span>OR</span></div>
   <section class="inline-csv-import">
     <h3 id="mock-csv-import-title">{% if cfg and cfg.exam_type=='mock_drive' %}Selected Section CSV Import{% else %}Question CSV Import{% endif %}</h3>
-    <div class="actions" style="margin-bottom:12px;flex-wrap:wrap">{% for key,label in question_type_labels.items() %}<a class="btn small secondary" href="{{ url_for('download_question_csv_template',exam_id=exam.id,question_type=key) }}">{{ label }} template</a>{% endfor %}</div>
+    <div class="actions" style="margin-bottom:12px;flex-wrap:wrap">{% for key,label in question_type_labels.items() %}<a class="btn small secondary" href="{{ url_for('download_question_csv_template',exam_id=exam.id,question_type=key) }}">{{ label }} template</a>{% endfor %}<a class="btn small secondary" href="{{ url_for('download_question_csv_template',exam_id=exam.id,question_type='mixed') }}">Mixed Question Types template</a></div>
     <form method="post" action="{{ url_for('import_questions',exam_id=exam.id) }}" enctype="multipart/form-data" id="question-csv-import-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% if cfg and cfg.exam_type=='mock_drive' %}<input type="hidden" name="mock_section" data-mock-section-target>{% endif %}<input type="file" name="csv_file" accept=".csv" required><button>Import CSV</button></form>
     <p class="muted" style="margin-top:12px">Every imported question will be saved directly in the selected Mock Drive section.</p>
   </section>

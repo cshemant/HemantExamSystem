@@ -27,7 +27,7 @@ from security_core import generate_totp_secret, verify_totp, totp_uri
 from edge_package import seal_envelope, open_sealed_envelope
 from audit_core import audit_event_hash, verify_audit_rows
 from exam_integrity_v185 import validate_seb_config_hash, security_event_weight, visibility_allowed_question
-from exam_ai_proctor_v186 import count_faces_in_jpeg, score_exam_outliers, ai_proctor_dependencies, detect_device_in_jpeg
+from exam_ai_proctor_v186 import count_faces_in_jpeg, score_exam_outliers, ai_proctor_dependencies
 from practical_core import parse_roster_bytes, parse_experiment_bytes, parse_experiment_text, normalize_experiment_sequence, normalize_experiment_code, practical_scan_auto_match, extract_practical_scan_fields
 from ai_curriculum import ai_status, analyze_syllabus, extract_upload_text, generate_questions, generate_subject_context_questions, generate_placement_questions, AIProviderError
 from public_content import PUBLIC_GUIDES, discover_public_updates, get_public_guide, public_update_by_slug, related_updates, public_sitemap_paths
@@ -285,7 +285,6 @@ class Attempt(Base):
     total_marks:Mapped[int|None]=mapped_column(Integer,nullable=True)
     grading_status:Mapped[str]=mapped_column(String,nullable=False,default='complete')
     question_order:Mapped[str]=mapped_column(String,nullable=False)
-    bulk_recording_opt_out:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
 
 class Answer(Base):
     __tablename__='answers'
@@ -777,10 +776,6 @@ class ExamSecurityProfile(Base):
     seb_config_key:Mapped[str]=mapped_column(String(64),nullable=False,default='')
     ml_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     webcam_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
-    phone_detection_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
-    phone_response_mode:Mapped[str]=mapped_column(String(12),nullable=False,default='review')  # review | halt
-    recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
-    bulk_recording_enabled:Mapped[bool]=mapped_column(Boolean,nullable=False,default=False)
     updated_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
 class ExamQuestionTelemetry(Base):
@@ -808,15 +803,6 @@ class ExamProctorSummary(Base):
     camera_error_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     consecutive_no_face:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     consecutive_multiple_face:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
-    phone_sample_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
-    phone_detected_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
-    consecutive_phone_detected:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
-    phone_error_count:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
-    last_phone_confidence:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
-    device_halt_at:Mapped[str]=mapped_column(String,nullable=False,default='')
-    device_halt_reason:Mapped[str]=mapped_column(String(40),nullable=False,default='')
-    device_halt_confidence:Mapped[float]=mapped_column(Float,nullable=False,default=0.0)
-    device_pause_seconds:Mapped[int]=mapped_column(Integer,nullable=False,default=0)
     last_sample_at:Mapped[str]=mapped_column(String,nullable=False,default='')
     last_camera_error_at:Mapped[str]=mapped_column(String,nullable=False,default='')
 
@@ -1200,7 +1186,6 @@ def run_schema_upgrades():
         ('answers','graded_by',"VARCHAR NOT NULL DEFAULT ''"),
         ('answers','graded_at',"VARCHAR NOT NULL DEFAULT ''"),
         ('attempts','grading_status',"VARCHAR NOT NULL DEFAULT 'complete'"),
-        ('attempts','bulk_recording_opt_out',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('bank_questions','answer_key',"TEXT NOT NULL DEFAULT ''"),
         ('bank_questions','answer_tolerance',"VARCHAR NOT NULL DEFAULT ''"),
         ('bank_questions','answer_case_sensitive',"BOOLEAN NOT NULL DEFAULT FALSE"),
@@ -1274,19 +1259,6 @@ def run_schema_upgrades():
         ('faculty_roles','institution_id',"INTEGER"),
         ('exam_security_profiles','ml_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('exam_security_profiles','webcam_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
-        ('exam_security_profiles','phone_detection_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
-        ('exam_security_profiles','phone_response_mode',"VARCHAR(12) NOT NULL DEFAULT 'review'"),
-        ('exam_proctor_summaries','device_halt_at',"VARCHAR NOT NULL DEFAULT ''"),
-        ('exam_proctor_summaries','device_halt_reason',"VARCHAR(40) NOT NULL DEFAULT ''"),
-        ('exam_proctor_summaries','device_halt_confidence',"FLOAT NOT NULL DEFAULT 0.0"),
-        ('exam_proctor_summaries','device_pause_seconds',"INTEGER NOT NULL DEFAULT 0"),
-        ('exam_proctor_summaries','phone_sample_count',"INTEGER NOT NULL DEFAULT 0"),
-        ('exam_proctor_summaries','phone_detected_count',"INTEGER NOT NULL DEFAULT 0"),
-        ('exam_proctor_summaries','consecutive_phone_detected',"INTEGER NOT NULL DEFAULT 0"),
-        ('exam_proctor_summaries','phone_error_count',"INTEGER NOT NULL DEFAULT 0"),
-        ('exam_proctor_summaries','last_phone_confidence',"FLOAT NOT NULL DEFAULT 0.0"),
-        ('exam_security_profiles','recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
-        ('exam_security_profiles','bulk_recording_enabled',"BOOLEAN NOT NULL DEFAULT FALSE"),
         ('code_run_jobs','runner_claim_token',"VARCHAR(64) NOT NULL DEFAULT ''"),
     )
     for table_name,column_name,ddl in upgrades:
@@ -2653,11 +2625,7 @@ def exam_access_for_student(s,student_id,exam):
     if start and now<start:
         return False,f'Scheduled for {start.strftime("%d %b, %I:%M %p")}',matched
     if end and now>end:
-        # Faculty-approved resumed attempts retain the time spent on a device hold.
-        existing=get_attempt(s,student_id,exam.id)
-        held=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==existing.id)) if existing and existing.status=='in_progress' else None
-        permitted_extension=bool(existing and held and (held.device_halt_at or int(held.device_pause_seconds or 0)>0) and now_dt()<parse_dt(existing.end_at))
-        if not permitted_extension:return False,'Exam window closed',matched
+        return False,'Exam window closed',matched
     if security and security.strict_start_window and start:
         attempt=get_attempt(s,student_id,exam.id)
         grace=max(0,int(security.start_grace_minutes or 0))
@@ -3458,7 +3426,7 @@ def security_headers(response):
     # Only camera-enabled exam documents (including the same-origin PIN shell)
     # receive camera permission; the browser still requires student consent.
     camera_proctor_page=False
-    if endpoint in {'take_exam','verify_student_exam_pin','v188_webcam_preflight'}:
+    if endpoint in {'take_exam','verify_student_exam_pin'}:
         target_id=(request.view_args or {}).get('exam_id')
         if target_id:
             _profile=get_exam_security_profile(DB(),int(target_id),False)
@@ -4063,59 +4031,6 @@ def finalize_attempt(s,attempt,reason='SYSTEM_FINALIZE'):
         except Exception:pass
     return attempt
 
-def reconcile_expired_exam_attempts(s, exam_id):
-    """Close timed-out attempts even if students never revisit the exam page.
-
-    Admin settings previously counted all status='in_progress' rows, even
-    after the server-side clock had passed. Do not use heartbeat absence as
-    proof of expiry: compare authoritative exam/attempt deadlines instead.
-    """
-    exam=s.get(Exam,exam_id)
-    if not exam:return 0
-    checked_at=now_dt()
-    open_attempts=s.scalars(select(Attempt).where(
-        Attempt.exam_id==exam_id,Attempt.status=='in_progress'
-    ).order_by(Attempt.id)).all()
-    expired=0
-    for attempt in open_attempts:
-        # A faculty hold freezes examination time until faculty explicitly resumes.
-        if _active_device_hold(s,attempt):
-            continue
-        try:
-            deadline=parse_dt(attempt.end_at)
-            # The scheduled window may have been shortened since the attempt
-            # was created. Respect whichever deadline is earlier.
-            window=resolved_exam_window_for_student(s,attempt.student_id,exam)
-            scheduled_end=window.get('end')
-            if scheduled_end:
-                if scheduled_end.tzinfo is None:
-                    scheduled_end=scheduled_end.replace(tzinfo=DISPLAY_TZ)
-                summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id))
-                if summary and summary.device_pause_seconds:
-                    scheduled_end+=timedelta(seconds=int(summary.device_pause_seconds))
-                deadline=min(deadline,scheduled_end)
-        except (TypeError,ValueError,OverflowError) as exc:
-            app.logger.warning('Invalid exam deadline for attempt %s: %s',attempt.id,exc)
-            continue
-        if checked_at < deadline:continue
-        try:
-            # Existing submission pathway recalculates scores, records a
-            # reason, and synchronizes the practical assessment (if relevant).
-            finalize_attempt(s,attempt,'TIME_EXPIRED')
-            expired+=1
-        except Exception:
-            s.rollback()
-            app.logger.exception('Could not finalize expired attempt %s',attempt.id)
-    return expired
-
-def exam_recording_storage_is_temporary():
-    """A writable /tmp directory is not persistent storage on Render."""
-    if not EXAM_RECORDING_DIR:return False
-    try:
-        root=Path(EXAM_RECORDING_DIR).expanduser().resolve()
-        return root==Path('/tmp') or Path('/tmp') in root.parents or root==Path('/var/tmp') or Path('/var/tmp') in root.parents
-    except (OSError,ValueError):return False
-
 def canonical_difficulty(value):
     v=(value or 'Medium').strip().lower()
     return {'easy':'Easy','medium':'Medium','hard':'Hard'}.get(v,'Medium')
@@ -4458,7 +4373,7 @@ def integrity_monitor_v194():
     state=(request.args.get('state') or 'all').lower()
     if state not in {'all','active','submitted'}:state='all'
     signal=(request.args.get('signal') or 'all').lower()
-    if signal not in {'all','review','camera','phone','focus','timing','ml'}:signal='all'
+    if signal not in {'all','review','camera','focus','timing','ml'}:signal='all'
     query=(request.args.get('q') or '').strip().lower()[:70]
     attempts=(s.scalars(select(Attempt).where(Attempt.exam_id.in_(requested_exam_ids))
                         .order_by(Attempt.id.desc()).limit(250)).all() if requested_exam_ids else [])
@@ -4504,8 +4419,7 @@ def integrity_monitor_v194():
         running=(attempt.status=='in_progress' and heartbeat=='online')
         camera=summary_map.get(attempt.id)
         camera_events=camera_flags.get(attempt.id,[])
-        phone_alerts=sum(c for kind,c in camera_events if kind=='phone_visible_2_samples')
-        camera_count=sum(c for kind,c in camera_events if kind!='phone_visible_2_samples')
+        camera_count=sum(c for _,c in camera_events)
         camera_error=int(camera.camera_error_count or 0) if camera else 0
         focus=focus_by_attempt.get(attempt.id,0)
         fast,answered,changes=time_by_attempt.get(attempt.id,(0,0,0))
@@ -4516,7 +4430,6 @@ def integrity_monitor_v194():
         row={'attempt':attempt,'exam':exam_map[attempt.exam_id],'student':student,
              'running':running,'heartbeat':heartbeat,'camera':camera,'camera_problem':camera_problem,
              'camera_events':camera_events,'camera_count':camera_count,'camera_error':camera_error,
-             'phone_alerts':phone_alerts,'phone_enabled':bool(profiles.get(attempt.exam_id) and profiles[attempt.exam_id].phone_detection_enabled),
              'focus':focus,'fast':fast,'answered':answered,'changes':changes,
              'ml':'Off' if not (profiles.get(attempt.exam_id) and profiles[attempt.exam_id].ml_enabled) else 'Insufficient data'}
         rows.append(row)
@@ -4532,11 +4445,10 @@ def integrity_monitor_v194():
         for (row,_),outcome in zip(group,outcomes):row['ml']=outcome
     for row in rows:
         row['timing_review']=bool(row['answered']>=3 and row['fast']>=3)
-        row['review']=bool(row['camera_problem'] or row['phone_alerts']>0 or row['focus']>0 or row['ml']=='Review'
+        row['review']=bool(row['camera_problem'] or row['focus']>0 or row['ml']=='Review'
                            or row['timing_review'])
         row['signals']=[]
         if row['camera_problem']:row['signals'].append('Camera')
-        if row['phone_alerts']:row['signals'].append('Possible phone')
         if row['focus']:row['signals'].append('Focus')
         if row['timing_review']:row['signals'].append('Timing')
         if row['ml']=='Review':row['signals'].append('ML')
@@ -4548,7 +4460,6 @@ def integrity_monitor_v194():
     elif state=='submitted':rows=[row for row in rows if row['attempt'].status=='submitted']
     if signal=='review':rows=[row for row in rows if row['review']]
     elif signal=='camera':rows=[row for row in rows if row['camera_problem']]
-    elif signal=='phone':rows=[row for row in rows if row['phone_alerts']>0]
     elif signal=='focus':rows=[row for row in rows if row['focus']>0]
     elif signal=='timing':rows=[row for row in rows if row['timing_review']]
     elif signal=='ml':rows=[row for row in rows if row['ml']=='Review']
@@ -8396,7 +8307,6 @@ def exam_security_profile_admin(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
     if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
-    reconcile_expired_exam_attempts(s,exam_id)
     profile=get_exam_security_profile(s,exam_id,create=True)
     cfg=get_exam_config(s,exam_id,create=True)
     attempt_count=int(s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id)) or 0)
@@ -8418,158 +8328,28 @@ def exam_security_profile_admin(exam_id):
             s.rollback()
             flash('Cannot enable protected mode until EXAM_SEB_EXTERNAL_ORIGIN is set and a valid SEB Config Key is saved.','error')
             return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+        enable_ml=request.form.get('enable_ml')=='on'
+        enable_webcam=request.form.get('enable_webcam')=='on'
+        deps=ai_proctor_dependencies()
+        if enable_ml and not deps['ml']:
+            s.rollback();flash('Install requirements-ai-proctor.txt on the staging server before enabling ML.','error')
+            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+        if enable_webcam and not deps['cv']:
+            s.rollback();flash('Install requirements-ai-proctor.txt on the staging server before enabling webcam CV.','error')
+            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
+        profile.ml_enabled=enable_ml
+        profile.webcam_enabled=enable_webcam
         profile.mode=mode;profile.require_seb=require_seb;profile.updated_at=now_iso()
         if require_seb:
             cfg.randomize_questions=True;cfg.shuffle_options=True;cfg.updated_at=now_iso()
             legacy_policy=get_exam_security_policy(s,exam_id,create=True)
             legacy_policy.auto_submit_on_integrity_limit=False
             legacy_policy.updated_at=now_iso()
-        audit_event(s,'exam_security_profile_saved','exam',exam_id,f'mode={mode}; seb_required={require_seb}')
-        s.commit();flash('Security profile saved. Test protected modes before activating this exam.')
+        audit_event(s,'exam_security_profile_saved','exam',exam_id,f'mode={mode}; seb_required={require_seb}; ml={enable_ml}; webcam={enable_webcam}')
+        s.commit();flash('V185 security profile saved. Test the SEB configuration on staging before activating this exam.')
         return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
     return render_template('exam_security_profile.html',exam=exam,profile=profile,attempt_count=attempt_count,
-                           dependencies=ai_proctor_dependencies(include_phone=True),recording_available=bool(_exam_video_storage_root()),recording_temporary=exam_recording_storage_is_temporary(),active_attempt_count=int(s.scalar(select(func.count()).select_from(Attempt).where(Attempt.exam_id==exam_id,Attempt.status=='in_progress')) or 0),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
-
-
-@app.route('/admin/exam/<int:exam_id>/ai-settings',methods=['POST'])
-@staff_required
-def exam_ai_settings_admin(exam_id):
-    s=DB();exam=s.get(Exam,exam_id)
-    if not exam:abort(404)
-    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
-    reconcile_expired_exam_attempts(s,exam_id)
-    profile=get_exam_security_profile(s,exam_id,create=True)
-    active=int(s.scalar(select(func.count()).select_from(Attempt).where(
-        Attempt.exam_id==exam_id,Attempt.status=='in_progress')) or 0)
-    if active:
-        flash('AI settings cannot change while any student is taking this exam.','error')
-        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-    ml=request.form.get('enable_ml')=='on'
-    webcam=request.form.get('enable_webcam')=='on'
-    phone=request.form.get('enable_phone')=='on'
-    phone_response=(request.form.get('phone_response_mode') or 'review').strip().lower()
-    if phone_response not in {'review','halt'}:
-        flash('Choose a valid device detection response.','error')
-        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-    ready=ai_proctor_dependencies(include_phone=True)
-    if phone and not webcam:
-        flash('Mobile phone detection requires webcam monitoring.','error')
-        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-    if (ml and not ready['ml']) or (webcam and not ready['cv']) or (phone and not ready['phone']):
-        flash('One selected AI feature is not ready on this server. Check the dependency/model status.','error')
-        return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-    profile.ml_enabled=ml;profile.webcam_enabled=webcam;profile.phone_detection_enabled=phone
-    profile.phone_response_mode=phone_response if phone else 'review'
-    if not webcam:
-        profile.recording_enabled=False
-        profile.bulk_recording_enabled=False
-    profile.updated_at=now_iso()
-    audit_event(s,'exam_ai_settings_saved','exam',exam_id,
-                f'ml={ml}; webcam={webcam}; phone={phone}; device_response={profile.phone_response_mode}')
-    s.commit()
-    flash('AI proctoring settings saved for future exam activity.')
-    return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-
-
-@app.route('/admin/exam/<int:exam_id>/recording-policy',methods=['POST'])
-@staff_required
-def exam_recording_policy_admin(exam_id):
-    s=DB();exam=s.get(Exam,exam_id)
-    if not exam:abort(404)
-    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
-    profile=get_exam_security_profile(s,exam_id,create=True)
-    enabled=request.form.get('enable_video_recording')=='on'
-    if enabled:
-        if not profile.webcam_enabled:
-            flash('Enable webcam proctoring before enabling video recording.','error')
-            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-        if _exam_video_storage_root() is None:
-            flash('Recording is unavailable. Configure private persistent storage (EXAM_RECORDING_DIR) first.','error')
-            return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-    profile.recording_enabled=enabled
-    if not enabled:profile.bulk_recording_enabled=False
-    profile.updated_at=now_iso()
-    if not enabled:
-        # Gracefully stop requested or ongoing recordings for this exam.
-        attempt_ids=select(Attempt.id).where(Attempt.exam_id==exam_id)
-        active=s.scalars(select(ExamVideoRecording).where(
-            ExamVideoRecording.attempt_id.in_(attempt_ids),
-            ExamVideoRecording.status.in_(['requested','recording'])
-        )).all()
-        for clip in active:
-            clip.status='cancelled' if clip.status=='requested' else 'stopping'
-            clip.stopped_at=now_iso()
-    audit_event(s,'exam_video_recording_policy_changed','exam',exam_id,f'enabled={enabled}')
-    s.commit()
-    flash('Faculty-controlled video recording '+('enabled.' if enabled else 'disabled.'))
-    return redirect(url_for('exam_security_profile_admin',exam_id=exam_id))
-
-
-def _exam_bulk_video_access(s,exam_id):
-    exam=s.get(Exam,exam_id)
-    if not exam:abort(404)
-    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
-    profile=get_exam_security_profile(s,exam_id,create=False)
-    if not profile or not profile.webcam_enabled or not profile.recording_enabled:
-        flash('Enable webcam monitoring and video recording in Security Settings first.','error')
-        return exam,None
-    if _exam_video_storage_root() is None:
-        flash('Private video storage is not available.','error')
-        return exam,None
-    return exam,profile
-
-
-def _queue_exam_video(s,attempt,requested_by):
-    """Queue exactly one clip for an active attempt. Caller holds its DB row lock."""
-    if attempt.status!='in_progress' or now_dt()>=parse_dt(attempt.end_at):return False
-    latest=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id)
-                    .order_by(ExamVideoRecording.id.desc()).limit(1))
-    if latest and latest.status in {'requested','recording','stopping'}:return False
-    if latest and latest.status=='failed':return False  # require explicit faculty retry
-    s.add(ExamVideoRecording(attempt_id=attempt.id,status='requested',
-                             requested_by=requested_by,requested_at=now_iso()))
-    return True
-
-
-@app.route('/admin/exam/<int:exam_id>/video/start-all',methods=['POST'])
-@staff_required
-def admin_start_all_exam_video(exam_id):
-    s=DB();exam,profile=_exam_bulk_video_access(s,exam_id)
-    if profile is None:return redirect(url_for('exam_integrity_dashboard',exam_id=exam_id))
-    # Preserve the bulk policy for students who start after this button is clicked.
-    profile=s.scalar(select(ExamSecurityProfile).where(ExamSecurityProfile.id==profile.id).with_for_update())
-    profile.bulk_recording_enabled=True;profile.updated_at=now_iso()
-    attempts=s.scalars(select(Attempt).where(Attempt.exam_id==exam_id,Attempt.status=='in_progress')
-                       .with_for_update()).all()
-    queued=0
-    for attempt in attempts:
-        attempt.bulk_recording_opt_out=False
-        if _queue_exam_video(s,attempt,'Bulk exam recording'):queued+=1
-    audit_event(s,'exam_bulk_video_started','exam',exam_id,f'active={len(attempts)}; requested={queued}; future_joiners=yes')
-    s.commit()
-    flash(f'Record All enabled. {queued} recording request(s) queued. New students will also be included.')
-    return redirect(url_for('exam_integrity_dashboard',exam_id=exam_id))
-
-
-@app.route('/admin/exam/<int:exam_id>/video/stop-all',methods=['POST'])
-@staff_required
-def admin_stop_all_exam_video(exam_id):
-    s=DB();exam=s.get(Exam,exam_id)
-    if not exam:abort(404)
-    if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
-    profile=get_exam_security_profile(s,exam_id,False)
-    if profile:
-        profile.bulk_recording_enabled=False;profile.updated_at=now_iso()
-    clips=s.scalars(select(ExamVideoRecording).join(Attempt,Attempt.id==ExamVideoRecording.attempt_id)
-                    .where(Attempt.exam_id==exam_id,ExamVideoRecording.status.in_(['requested','recording']))
-                    .with_for_update()).all()
-    for clip in clips:
-        clip.status='cancelled' if clip.status=='requested' else 'stopping'
-        clip.stopped_at=now_iso()
-    audit_event(s,'exam_bulk_video_stopped','exam',exam_id,f'clips_stop_requested={len(clips)}')
-    s.commit()
-    flash(f'Stop All requested for {len(clips)} clip(s). Wait for uploads to finish before downloading.')
-    return redirect(url_for('exam_integrity_dashboard',exam_id=exam_id))
+                           dependencies=ai_proctor_dependencies(),seb_origin=EXAM_SEB_EXTERNAL_ORIGIN,pool_count=int(s.scalar(select(func.count()).select_from(Question).where(Question.exam_id==exam_id)) or 0),cfg=cfg)
 
 
 def _exam_video_storage_root():
@@ -8603,10 +8383,6 @@ def _exam_recording_access(s, attempt_id):
 @staff_required
 def admin_start_attempt_video(attempt_id):
     s=DB();attempt=_exam_recording_access(s,attempt_id)
-    profile=get_exam_security_profile(s,attempt.exam_id,False)
-    if not profile or not profile.recording_enabled:
-        flash('Enable faculty-controlled recording in Exam Security Profile first.','error')
-        return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
     root=_exam_video_storage_root()
     if root is None:
         flash('Video storage is not configured. Set EXAM_RECORDING_DIR to a private persistent directory.','error')
@@ -8618,7 +8394,6 @@ def admin_start_attempt_video(attempt_id):
     if latest and latest.status in {'requested','recording','stopping'}:
         flash('A recording request already exists for this attempt.')
         return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
-    attempt.bulk_recording_opt_out=False
     row=ExamVideoRecording(attempt_id=attempt.id,status='requested',requested_by=actor_label(s),requested_at=now_iso())
     s.add(row);s.flush()
     audit_event(s,'exam_video_recording_requested','attempt',attempt.id,f'clip={row.id}')
@@ -8631,14 +8406,10 @@ def admin_start_attempt_video(attempt_id):
 def admin_stop_attempt_video(attempt_id):
     s=DB();attempt=_exam_recording_access(s,attempt_id)
     row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id).order_by(ExamVideoRecording.id.desc()).limit(1))
-    # Individual Stop remains authoritative even during Record All.
-    attempt.bulk_recording_opt_out=True
     if row and row.status in {'requested','recording'}:
-        row.status='cancelled' if row.status=='requested' else 'stopping'
-        row.stopped_at=now_iso()
+        row.status='stopping';row.stopped_at=now_iso()
         audit_event(s,'exam_video_recording_stop_requested','attempt',attempt.id,f'clip={row.id}')
         s.commit();flash('Video stop requested. Waiting for the final recording chunk.')
-    else:s.commit()
     return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
 
 
@@ -8647,7 +8418,7 @@ def admin_stop_attempt_video(attempt_id):
 def admin_download_attempt_video(attempt_id,clip_id):
     s=DB();attempt=_exam_recording_access(s,attempt_id)
     row=s.get(ExamVideoRecording,clip_id)
-    if not row or row.attempt_id!=attempt.id or row.status not in {'saved','interrupted'}:abort(404)
+    if not row or row.attempt_id!=attempt.id or row.status!='saved':abort(404)
     root=_exam_video_storage_root()
     if root is None:abort(503)
     path=_exam_video_path(row,root)
@@ -8680,38 +8451,21 @@ def admin_delete_attempt_video(attempt_id,clip_id):
 def student_proctor_video_control():
     exam_id=request.args.get('exam_id',type=int)
     if exam_id is None:return jsonify(error='Invalid exam.'),400
-    s=DB()
-    # Lock this attempt to avoid duplicate bulk requests from overlapping polls.
-    attempt=s.scalar(select(Attempt).where(Attempt.student_id==web_session['user_id'],
-                        Attempt.exam_id==exam_id).with_for_update())
+    s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     profile=get_exam_security_profile(s,exam_id,False)
     if not attempt or not profile or not profile.webcam_enabled:return jsonify(error='Monitoring not available.'),404
     if not secure_exam_device_allowed(s,attempt):return jsonify(error='Device lock.'),409
     if attempt.status!='in_progress' or now_dt()>=parse_dt(attempt.end_at):
         return jsonify(record=False,recording_id=None)
-    row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id)
-                 .order_by(ExamVideoRecording.id.desc()).limit(1))
-    if not profile.recording_enabled and row and row.status in {'requested','recording'}:
-        row.status='cancelled' if row.status=='requested' else 'stopping'
-        row.stopped_at=now_iso();s.commit()
-    # The current upload format is limited to ten minutes per clip. A bulk session
-    # continues with a new clip only after the previous one has been saved.
-    if row and row.status in {'recording','requested'} and row.started_at:
+    row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id).order_by(ExamVideoRecording.id.desc()).limit(1))
+    if not row:return jsonify(record=False,recording_id=None)
+    # An active recording may not run beyond 10 minutes per faculty command.
+    if row.status in {'recording','requested'} and row.started_at:
         try:
             if (now_dt()-parse_dt(row.started_at)).total_seconds()>EXAM_RECORDING_MAX_SECONDS:
                 row.status='stopping';row.stopped_at=now_iso();s.commit()
         except (ValueError,TypeError):pass
-    if (profile.recording_enabled and profile.bulk_recording_enabled and
-            not attempt.bulk_recording_opt_out and _exam_video_storage_root() is not None and
-            (row is None or row.status=='saved')):
-        if _queue_exam_video(s,attempt,'Bulk exam recording'):
-            s.commit()
-            row=s.scalar(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id==attempt.id)
-                         .order_by(ExamVideoRecording.id.desc()).limit(1))
-    if not row:return jsonify(record=False,recording_id=None)
-    active=row.status in {'requested','recording'}
-    return jsonify(record=active,recording_id=row.id if row.status in {'requested','recording','stopping'} else None,
-                   recording_status=row.status)
+    return jsonify(record=row.status in {'requested','recording'},recording_id=row.id if row.status in {'requested','recording','stopping'} else None,recording_status=row.status)
 
 
 @app.route('/student/proctor/video/chunk',methods=['POST'])
@@ -8775,41 +8529,12 @@ def student_proctor_video_finish():
     s.commit();return jsonify(saved=row.status=='saved',status=row.status)
 
 
-def _reconcile_exam_video_records(s, exam_id):
-    """Resolve abandoned stop requests; never mislabel unfinalized video as saved."""
-    clips=s.scalars(select(ExamVideoRecording).join(Attempt,Attempt.id==ExamVideoRecording.attempt_id)
-                    .where(Attempt.exam_id==exam_id,
-                           ExamVideoRecording.status.in_(['requested','recording','stopping']))).all()
-    changed=False
-    for clip in clips:
-        attempt=s.get(Attempt,clip.attempt_id)
-        if not attempt:continue
-        # Give the client enough time to upload its final chunk after Stop/Submit.
-        stalled=clip.status=='stopping' or attempt.status=='submitted'
-        if not stalled:continue
-        timestamp=(clip.stopped_at if clip.status=='stopping' else attempt.submitted_at) or clip.requested_at
-        try:
-            if (now_dt()-parse_dt(timestamp)).total_seconds()<90:continue
-        except (ValueError,TypeError):continue
-        root=_exam_video_storage_root()
-        path=_exam_video_path(clip,root) if root else None
-        has_data=bool(path and path.is_file() and path.stat().st_size>0 and clip.byte_count>0)
-        clip.status='interrupted' if has_data else 'failed'
-        clip.stopped_at=now_iso()
-        audit_event(s,'exam_video_recording_unfinished','attempt',attempt.id,
-                    f'clip={clip.id}; status={clip.status}; bytes={clip.byte_count}')
-        changed=True
-    if changed:s.commit()
-
-
 @app.route('/admin/exam/<int:exam_id>/integrity-dashboard')
 @staff_required
 def exam_integrity_dashboard(exam_id):
     s=DB();exam=s.get(Exam,exam_id)
     if not exam:abort(404)
     if not may_manage_own_exam(s,exam_id,'edit'):abort(403)
-    reconcile_expired_exam_attempts(s,exam_id)
-    _reconcile_exam_video_records(s,exam_id)
     attempts=s.scalars(select(Attempt).where(Attempt.exam_id==exam_id).order_by(Attempt.id.desc()).limit(200)).all()
     rows=[]
     for attempt in attempts:
@@ -8831,7 +8556,6 @@ def exam_integrity_dashboard(exam_id):
     profile=get_exam_security_profile(s,exam_id,create=False)
     webcam_enabled=bool(profile and profile.webcam_enabled)
     ml_enabled=bool(profile and profile.ml_enabled)
-    phone_enabled=bool(profile and profile.phone_detection_enabled)
     # One query for summaries / flags, not one query per attempt.
     ids=[r['attempt'].id for r in rows]
     summaries={x.attempt_id:x for x in s.scalars(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id.in_(ids))).all()} if ids else {}
@@ -8842,7 +8566,6 @@ def exam_integrity_dashboard(exam_id):
     for index,row in enumerate(rows):
         summary=summaries.get(row['attempt'].id)
         row['camera']=summary
-        row['device_halt']=bool(summary and summary.device_halt_at)
         row['camera_flags']=flag_map.get(row['attempt'].id,[])[:5]
         row['ml_signal']='Off' if not ml_enabled else 'Collecting baseline'
         if row['attempt'].status=='submitted':
@@ -8855,25 +8578,14 @@ def exam_integrity_dashboard(exam_id):
     if ml_enabled:
         results=score_exam_outliers(vectors)
         for index,signal in zip(completed_indices,results):rows[index]['ml_signal']=signal
-    recording_map={}; clips_by_attempt={}
-    root=_exam_video_storage_root()
+    recording_map={}
     if ids:
         for clip in s.scalars(select(ExamVideoRecording).where(ExamVideoRecording.attempt_id.in_(ids)).order_by(ExamVideoRecording.id.desc())).all():
             recording_map.setdefault(clip.attempt_id,clip)
-            if clip.status in {'saved','interrupted'}:
-                exists=bool(root and _exam_video_path(clip,root).is_file())
-                clips_by_attempt.setdefault(clip.attempt_id,[]).append((clip,exists))
-    for row in rows:
-        row['video_recording']=recording_map.get(row['attempt'].id)
-        row['video_clips']=clips_by_attempt.get(row['attempt'].id,[])
+    for row in rows:row['video_recording']=recording_map.get(row['attempt'].id)
     return render_template('exam_integrity_dashboard.html',exam=exam,rows=rows,
-                           recording_enabled=bool(profile and profile.recording_enabled),
-                           recording_temporary=exam_recording_storage_is_temporary(),
-                           bulk_recording_enabled=bool(profile and profile.bulk_recording_enabled),
-                           active_attempt_count=sum(1 for r in rows if r['attempt'].status=='in_progress'),
                            recording_available=bool(_exam_video_storage_root()),
-                           webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,phone_enabled=phone_enabled,
-                           phone_response=profile.phone_response_mode if profile else 'review',ml_baseline_count=len(vectors))
+                           webcam_enabled=webcam_enabled,ml_enabled=ml_enabled,ml_baseline_count=len(vectors))
 
 
 @app.route('/admin/exam/<int:exam_id>/student-access')
@@ -8988,8 +8700,9 @@ def questions(exam_id):
 @staff_required
 def download_question_csv_template(exam_id,question_type):
     if not DB().get(Exam,exam_id):abort(404)
-    qtype=canonical_question_type(question_type)
-    if qtype not in QUESTION_TYPE_LABELS:abort(404)
+    is_mixed=question_type=='mixed'
+    qtype=canonical_question_type(question_type) if not is_mixed else 'mixed'
+    if not is_mixed and qtype not in QUESTION_TYPE_LABELS:abort(404)
     examples={
         'single_choice':['Which option is correct?','Option A','Option B','Option C','Option D','A','','0','0','1'],
         'multiple_select':['Select every correct option.','Option A','Option B','Option C','Option D','','A,C','0','0','1'],
@@ -8998,8 +8711,15 @@ def download_question_csv_template(exam_id,question_type):
         'short_text':['Enter the short answer.','','','','','','sample answer','0','1','1'],
         'essay':['Explain your answer.','','','','','','','0','0','5'],
     }
-    output=io.StringIO();writer=csv.writer(output);writer.writerow(['question_type','question','option_a','option_b','option_c','option_d','correct_answer','answer_key','answer_tolerance','answer_case_sensitive','marks']);writer.writerow([qtype]+examples[qtype])
-    return Response(output.getvalue(),mimetype='text/csv',headers={'Content-Disposition':f'attachment; filename={qtype}_questions_template.csv'})
+    output=io.StringIO();writer=csv.writer(output)
+    writer.writerow(['question_type','question','option_a','option_b','option_c','option_d','correct_answer','answer_key','answer_tolerance','answer_case_sensitive','marks'])
+    if is_mixed:
+        for row_type,example in examples.items():
+            writer.writerow([row_type]+example)
+    else:
+        writer.writerow([qtype]+examples[qtype])
+    filename='mixed_question_types_template.csv' if is_mixed else f'{qtype}_questions_template.csv'
+    return Response(output.getvalue(),mimetype='text/csv',headers={'Content-Disposition':f'attachment; filename={filename}'})
 
 @app.route('/admin/exam/<int:exam_id>/questions/sections',methods=['POST'])
 @staff_required
@@ -10823,8 +10543,6 @@ def v188_camera_gate_required(s, exam_id, student_id):
     return not v188_webcam_ready(exam_id,student_id)
 
 
-@app.route('/student/exam/<int:exam_id>/camera-preflight',methods=['GET','POST'])
-@student_required
 def v188_webcam_preflight(exam_id):
     s=DB();exam=s.scalar(select(Exam).where(Exam.id==exam_id,Exam.is_active==True));student=s.get(Student,web_session['user_id'])
     if not exam or not student:abort(404)
@@ -10842,10 +10560,10 @@ def v188_webcam_preflight(exam_id):
         challenges=web_session.get('_v188_camera_challenges') or {}
         challenges[str(exam_id)]={'nonce':nonce,'issued_at':int(time.time()),'student_id':student.id}
         web_session['_v188_camera_challenges']=challenges
-        response=app.make_response(render_template('exam_webcam_preflight_v188.html',exam=exam,next_url=next_url,nonce=nonce,student=student,cv_ready=ai_proctor_dependencies(include_phone=True)['cv'],phone_proctor_enabled=bool(profile.phone_detection_enabled)))
+        response=app.make_response(render_template('exam_webcam_preflight_v188.html',exam=exam,next_url=next_url,nonce=nonce,student=student,cv_ready=ai_proctor_dependencies()['cv']))
         response.headers['Cache-Control']='no-store, no-cache, must-revalidate'
         return response
-    if request.content_length is not None and request.content_length>175000:return jsonify(ok=False,error='Frame too large.'),413
+    if request.content_length is not None and request.content_length>115000:return jsonify(ok=False,error='Frame too large.'),413
     data=request.get_json(silent=True) or {}
     challenge=(web_session.get('_v188_camera_challenges') or {}).get(str(exam_id)) or {}
     nonce=data.get('nonce')
@@ -10857,7 +10575,7 @@ def v188_webcam_preflight(exam_id):
     except (ValueError,TypeError):fresh=False;bound=False
     if not fresh or not bound:return jsonify(ok=False,error='Camera setup expired. Refresh this page.'),403
     encoded=data.get('frame')
-    if not isinstance(encoded,str) or len(encoded)>165000 or not encoded.startswith('data:image/jpeg;base64,'):
+    if not isinstance(encoded,str) or len(encoded)>108000 or not encoded.startswith('data:image/jpeg;base64,'):
         return jsonify(ok=False,error='Camera has not provided a valid sample.'),400
     try:
         jpeg=base64.b64decode(encoded.split(',',1)[1],validate=True)
@@ -10892,54 +10610,12 @@ def v189_camera_enforced(s,exam_id):
     profile=get_exam_security_profile(s,exam_id,False)
     return bool(profile and profile.webcam_enabled)
 
-def _active_device_hold(s,attempt):
-    if not attempt or attempt.status!='in_progress':return None
-    summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id))
-    return summary if summary and summary.device_halt_at else None
-
-
-def _device_hold_payload(summary):
-    return {'halted':True,'reason':(summary.device_halt_reason or 'electronic device'),
-            'notice':'Exam paused after a possible electronic device detection. An invigilator must review and resume your attempt.'}
-
-
-@app.route('/admin/attempt/<int:attempt_id>/device-hold/release',methods=['POST'])
-@staff_required
-def admin_release_device_hold(attempt_id):
-    s=DB();attempt=s.get(Attempt,attempt_id)
-    if not attempt:abort(404)
-    if not may_manage_own_exam(s,attempt.exam_id,'edit'):abort(403)
-    summary=s.scalar(select(ExamProctorSummary).where(ExamProctorSummary.attempt_id==attempt.id).with_for_update())
-    if not summary or not summary.device_halt_at or attempt.status!='in_progress':
-        flash('No active device hold was found.','error')
-        return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
-    try:hold_seconds=max(0,int((now_dt()-parse_dt(summary.device_halt_at)).total_seconds()))
-    except (ValueError,TypeError):hold_seconds=0
-    # Compensate only for the stopped time. Never reset saved answers or question position.
-    attempt.end_at=(parse_dt(attempt.end_at)+timedelta(seconds=hold_seconds)).isoformat(timespec='seconds')
-    mock=s.scalar(select(MockDriveProgress).where(MockDriveProgress.attempt_id==attempt.id))
-    if mock and mock.section_end_at:
-        mock.section_end_at=(parse_dt(mock.section_end_at)+timedelta(seconds=hold_seconds)).isoformat(timespec='seconds')
-    sequential=s.scalar(select(SequentialAttemptProgress).where(SequentialAttemptProgress.attempt_id==attempt.id))
-    if sequential and sequential.question_started_at:
-        sequential.question_started_at=(parse_dt(sequential.question_started_at)+timedelta(seconds=hold_seconds)).isoformat(timespec='seconds')
-    if mock and mock.question_started_at:
-        mock.question_started_at=(parse_dt(mock.question_started_at)+timedelta(seconds=hold_seconds)).isoformat(timespec='seconds')
-    summary.device_pause_seconds=int(summary.device_pause_seconds or 0)+hold_seconds
-    summary.device_halt_at='';summary.device_halt_reason='';summary.consecutive_phone_detected=0
-    audit_event(s,'device_hold_released','attempt',attempt.id,f'faculty_release; paused_seconds={hold_seconds}')
-    s.commit();flash('Device hold released. The student can resume with their remaining time.')
-    return redirect(url_for('exam_integrity_dashboard',exam_id=attempt.exam_id))
-
-
 @app.route('/student/proctor/lease/<int:exam_id>',methods=['GET'])
 @student_required
 def v189_proctor_lease(exam_id):
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt or attempt.status=='submitted':return jsonify(ready=False),404
     if not secure_exam_device_allowed(s,attempt):return jsonify(ready=False),409
-    held=_active_device_hold(s,attempt)
-    if held:return jsonify(ready=False,**_device_hold_payload(held)),423
     ready=v189_camera_sample_fresh(s,attempt) if v189_camera_enforced(s,exam_id) else True
     response=jsonify(ready=ready,expires_in=_V189_CAMERA_FRESH_SECONDS)
     response.headers['Cache-Control']='no-store'
@@ -10952,7 +10628,7 @@ def v189_block_exam_actions_without_webcam():
     endpoints={'save_answer','next_exam_question','previous_mock_drive_question',
                'select_mock_drive_section','complete_mock_drive_section','submit_exam'}
     if request.method!='POST' or request.endpoint not in endpoints:return None
-    time_expired_submission=(request.endpoint=='submit_exam' and request.form.get('submission_reason')=='TIME_EXPIRED')
+    if request.endpoint=='submit_exam' and request.form.get('submission_reason')=='TIME_EXPIRED':return None
     if web_session.get('role')!='student' or not web_session.get('user_id'):return None
     if request.endpoint=='save_answer':
         payload=request.get_json(silent=True) or {}
@@ -10962,15 +10638,9 @@ def v189_block_exam_actions_without_webcam():
         try:exam_id=int((request.view_args or {}).get('exam_id'))
         except (ValueError,TypeError):return None
     s=DB()
+    if not v189_camera_enforced(s,exam_id):return None
     attempt=get_attempt(s,web_session['user_id'],exam_id)
     if not attempt or attempt.status!='in_progress':return None
-    held=_active_device_hold(s,attempt)
-    if held:
-        if request.endpoint=='save_answer' or request.headers.get('X-Requested-With')=='XMLHttpRequest' or request.accept_mimetypes.best=='application/json':
-            return jsonify(ok=False,**_device_hold_payload(held)),423
-        return (render_template('exam_webcam_locked_v189.html',exam_id=exam_id,message=_device_hold_payload(held)['notice']),423,{'Cache-Control':'no-store'})
-    if time_expired_submission:return None
-    if not v189_camera_enforced(s,exam_id):return None
     if v189_camera_sample_fresh(s,attempt):return None
     message='Camera monitoring is not active. Restore the camera before answering or moving to another question.'
     if request.endpoint=='save_answer' or request.headers.get('X-Requested-With')=='XMLHttpRequest' or request.accept_mimetypes.best=='application/json':
@@ -11083,9 +10753,6 @@ def take_exam(exam_id):
         if cfg and cfg.secure_sequential:
             _sequential_progress(s,attempt,create=True)
         s.commit()
-    held=_active_device_hold(s,attempt)
-    if held:
-        return (render_template('exam_webcam_locked_v189.html',exam_id=exam_id,message=_device_hold_payload(held)['notice']),423,{'Cache-Control':'no-store'})
     if v189_camera_enforced(s,exam_id) and not v189_camera_sample_fresh(s,attempt):
         return render_template('exam_webcam_warmup_v189.html',exam=exam,next_url=request.url,secure_shell=request.args.get('secure_shell')=='1')
     end_dt=parse_dt(attempt.end_at)
@@ -11139,7 +10806,7 @@ def take_exam(exam_id):
         visual_watermark=f'Roll {student_ref} | Exam {exam.id} | Attempt {attempt.id}'
     else:
         visual_watermark=''
-    return render_template('exam.html',phone_response_mode=(get_exam_security_profile(s,exam_id,False).phone_response_mode if get_exam_security_profile(s,exam_id,False) else 'review'),phone_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).phone_detection_enabled),webcam_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).webcam_enabled),visual_protection_mode=visual_mode,visual_watermark=visual_watermark,exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
+    return render_template('exam.html',webcam_proctor_enabled=bool(get_exam_security_profile(s,exam_id,False) and get_exam_security_profile(s,exam_id,False).webcam_enabled),visual_protection_mode=visual_mode,visual_watermark=visual_watermark,exam=exam,display_title=student_exam_display_title(s,exam),questions=views,answers=answers,end_epoch=timer_end.timestamp(),server_now_epoch=now_dt().timestamp(),cfg=cfg,security=security,secure_shell=secure_shell,sequential_mode=sequential_mode,current_position=current_position,total_questions=total_questions,sequential_wait=sequential_wait,mock_drive=mock_drive,mock_active_section=mock_active_section,mock_section_label=MOCK_DRIVE_SECTIONS.get(mock_active_section,''),mock_remaining_count=len(mock_remaining),mock_section_minutes=durations.get(mock_active_section,0) if mock_active_section else 0,code_editor_languages=CODE_EDITOR_LANGUAGES)
 
 @app.route('/student/exam/<int:exam_id>/section/select',methods=['POST'])
 @student_required
@@ -11334,13 +11001,13 @@ def save_answer():
 @student_required
 def student_proctor_frame():
     # Limit JSON and JPEG size before decoding; images are processed in memory only.
-    if request.content_length is not None and request.content_length>175000:
+    if request.content_length is not None and request.content_length>115000:
         return jsonify(error='Frame exceeds maximum size.'),413
     data=request.get_json(silent=True) or {}
     try:exam_id=int(data.get('exam_id'))
     except (TypeError,ValueError):return jsonify(error='Invalid exam ID.'),400
     encoded=data.get('frame')
-    if not isinstance(encoded,str) or len(encoded)>165000 or not encoded.startswith('data:image/jpeg;base64,'):
+    if not isinstance(encoded,str) or len(encoded)>108000 or not encoded.startswith('data:image/jpeg;base64,'):
         return jsonify(error='Invalid JPEG frame.'),400
     s=DB();attempt=get_attempt(s,web_session['user_id'],exam_id)
     profile=get_exam_security_profile(s,exam_id,False)
@@ -11353,14 +11020,13 @@ def student_proctor_frame():
         s.add(summary);s.flush()
     if summary.last_sample_at:
         try:
-            sample_gap=6 if profile.phone_detection_enabled and profile.phone_response_mode=='halt' else 12
-            if (now_dt()-parse_dt(summary.last_sample_at)).total_seconds()<sample_gap:
+            if (now_dt()-parse_dt(summary.last_sample_at)).total_seconds()<12:
                 return jsonify(error='Wait before sampling again.'),429
         except ValueError:pass
     try:
         jpeg=base64.b64decode(encoded.split(',',1)[1],validate=True)
     except (ValueError,base64.binascii.Error):return jsonify(error='Invalid encoded JPEG.'),400
-    if len(jpeg)>120000:return jsonify(error='JPEG frame too large.'),413
+    if len(jpeg)>80000:return jsonify(error='JPEG frame too large.'),413
     try:faces=count_faces_in_jpeg(jpeg)
     except ValueError:return jsonify(error='Unreadable camera frame.'),400
     except RuntimeError:return jsonify(error='Computer vision dependency unavailable.'),503
@@ -11375,38 +11041,8 @@ def student_proctor_frame():
             s.add(ExamProctorFlag(attempt_id=attempt.id,alert_type='multiple_faces_2_samples',created_at=now_iso()))
     else:
         summary.one_face_count+=1;summary.consecutive_multiple_face=0;summary.consecutive_no_face=0
-    # Device inference uses the current live frame; no images are retained.
-    # Skip startup sample to keep initial exam launch responsive.
-    if profile.phone_detection_enabled and summary.sample_count>1 and not summary.device_halt_at:
-        try:
-            device=detect_device_in_jpeg(jpeg)
-            if device is not None:  # Busy detector: avoid blocking other students.
-                confidence=float(device['confidence'])
-                label=device['label']
-                summary.phone_sample_count+=1
-                summary.last_phone_confidence=round(confidence,3)
-                if confidence>=0.42:
-                    summary.phone_detected_count+=1
-                    summary.consecutive_phone_detected+=1
-                    confirmed=confidence>=0.82 or summary.consecutive_phone_detected>=2
-                    if confirmed:
-                        s.add(ExamProctorFlag(attempt_id=attempt.id,alert_type='device_visible_confirmed',created_at=now_iso()))
-                        if profile.phone_response_mode=='halt':
-                            summary.device_halt_at=now_iso()
-                            summary.device_halt_reason=label
-                            summary.device_halt_confidence=round(confidence,3)
-                            audit_event(s,'exam_halted_device_detected','attempt',attempt.id,
-                                        f'device={label}; confidence={confidence:.3f}; faculty_review_required')
-                        summary.consecutive_phone_detected=0
-                else:
-                    summary.consecutive_phone_detected=0
-        except (ValueError,RuntimeError) as exc:
-            summary.phone_error_count+=1
-            app.logger.warning('Device detector failed on attempt %s: %s',attempt.id,exc)
     s.commit()
-    # Server controls both the student overlay and the answer/navigation lock.
-    if summary.device_halt_at:
-        return jsonify(accepted=True,samples=summary.sample_count,**_device_hold_payload(summary))
+    # Never expose face imagery or biometric identity in response.
     return jsonify(accepted=True,status='review_only',samples=summary.sample_count)
 
 @app.route('/student/proctor/status',methods=['POST'])
